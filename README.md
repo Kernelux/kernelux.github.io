@@ -1,8 +1,8 @@
-Personnal website based on jekyll and the minimal mistakes theme.
+# Personnal website based on jekyll and the minimal mistakes theme.
 
-# [Minimal Mistakes Jekyll Theme](https://mmistakes.github.io/minimal-mistakes/)
+### [Minimal Mistakes Jekyll Theme](https://mmistakes.github.io/minimal-mistakes/)
 
-## License
+### License
 
 The MIT License (MIT)
 
