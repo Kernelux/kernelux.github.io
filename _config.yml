@@ -7,10 +7,10 @@
 
 # Site Settings
 locale                   : "en"
-title                    : "Such Website, Many cool, much awesome"
+title                    : "BeWaKe"
 title_separator          : "-"
-name                     : "Your Name"
-description              : "An amazing website."
+name                     : "Bekhtaoui Walid a.k.a Kernelux"
+description              : "Misc thoughts and tips"
 url                      : "https://kernelux.github.io" # the base hostname & protocol for your site e.g. "https://mmistakes.github.io"
 baseurl                  : # the subpath of your site, e.g. "/blog"
 repository               : "kernelux/kernelux.github.io"# GitHub username/repo-name e.g. "mmistakes/minimal-mistakes"
