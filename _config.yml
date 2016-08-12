@@ -9,8 +9,8 @@
 locale                   : "en"
 title                    : "BeWaKe"
 title_separator          : "-"
-name                     : "Bekhtaoui Walid a.k.a Kernelux"
-description              : "Misc thoughts and tips"
+name                     : "Bekhtaoui Walid Kernelux"
+description              : "An amazing website."
 url                      : "https://kernelux.github.io" # the base hostname & protocol for your site e.g. "https://mmistakes.github.io"
 baseurl                  : # the subpath of your site, e.g. "/blog"
 repository               : "kernelux/kernelux.github.io"# GitHub username/repo-name e.g. "mmistakes/minimal-mistakes"
@@ -61,10 +61,10 @@ analytics:
 
 # Site Author
 author:
-  name             : "Walid Kernelux Bekhtaoui"
+  name             : "Bekhtaoui Walid Kernelux"
   avatar           : "bio-photo.jpg"
-  bio              : "Ninja"
-  location         : "Willy Wonka's chocolate factory"
+  bio              : "..."
+  location         : "Paris, Francee"
   email            :
   uri              :
   bitbucket        :
