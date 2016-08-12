@@ -1,4 +1,6 @@
-# Personnal website based on jekyll and the minimal mistakes theme.
+# Kernelux Blog
+
+Personnal website based on jekyll and the minimal mistakes theme.
 
 ### [Minimal Mistakes Jekyll Theme](https://mmistakes.github.io/minimal-mistakes/)
 
