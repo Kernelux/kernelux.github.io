@@ -1,7 +1,4 @@
 # main links links
 main:
-  - title: "Check Minimal Mistakes"
-    url: https://mmistakes.github.io/minimal-mistakes/docs/navigation/
-
   - title: "Home"
     url: /
