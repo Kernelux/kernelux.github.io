@@ -968,7 +968,9 @@ test('slot letters, armed text, mod labels', () => {
   assert.equal(ex.modLabel(0), '4');
   assert.equal(ex.modLabel(7), 'Rv');
   assert.equal(ex.modLabel(11), 'Ch');
-  assert.equal(ex.modLabel(12), '');
+  assert.equal(ex.modLabel(12), 'G1');
+  assert.equal(ex.modLabel(15), 'G4');
+  assert.equal(ex.modLabel(16), '');
   assert.equal(ex.modLabel(-1), '');
 });
 
@@ -1101,4 +1103,620 @@ test('selected source tab is outlined and unloaded sources are dimmed', () => {
   const colorCall = env.log[swatchIdx - 1];
   assert.equal(colorCall[0], 'set_source_rgba');
   assert.equal(colorCall[4], 0.4);
+});
+
+/* ============================================================== v2 additions */
+
+const MOD_LABELS_16 = ['4', '8', '8T', '16', '16T', '32', '64', 'Rv', 'O-', 'O+', 'Tp', 'Ch', 'G1', 'G2', 'G3', 'G4'];
+const GEST_NAMES = ['kick roll', 'swoop', 'wobble', 'rise'];
+
+/* a view whose 16-key mod zone starts at `start` (flag 8 on every zone key) */
+function modZoneView(start, over) {
+  const keys = new Array(128).fill(-1);
+  const flags = new Array(128).fill(0);
+  for (let k = 36; k < 36 + 40; k++) { keys[k] = (k >> 2) % 3; }
+  for (let i = 0; i < 16; i++) { flags[start + i] = 8; }
+  return makeView(Object.assign({
+    keys, keyFlags: flags, modStart: start, rootKey: Math.min(start, 96), selectedKey: -1
+  }, over || {}));
+}
+
+/* every v2 field on, B marks on a few pads */
+function v2View(over) {
+  const v = modZoneView(96, {
+    morph: 63, morphEdit: 1, scan: 40, gesture: 1, gestureNames: GEST_NAMES, status: 'Ready - 8 slices'
+  });
+  for (const k of [80, 81, 82, 84, 85]) { v.keys[k] = k % 16; }
+  v.keyFlags[80] = 64;
+  v.keyFlags[81] = 64 | 1 | 2 | 4;
+  v.keyFlags[82] = 64 | 16 | 32;
+  v.keyFlags[84] = 64 | 4;
+  v.keyFlags[85] = 64;
+  return Object.assign(v, over || {});
+}
+
+/* [{text, x, y}] for every show_text of the last paint (the position is the preceding move_to) */
+function textDraws(env) {
+  const res = [];
+  for (let i = 1; i < env.log.length; i++) {
+    if (env.log[i][0] === 'show_text' && env.log[i - 1][0] === 'move_to') {
+      res.push({ text: env.log[i][1], x: env.log[i - 1][1], y: env.log[i - 1][2] });
+    }
+  }
+  return res;
+}
+
+/* rgb the rectangle (x, y, w, h) was filled with, or null */
+function rectFill(env, r) {
+  for (let i = 1; i < env.log.length; i++) {
+    const c = env.log[i];
+    if (c[0] === 'rectangle' && Math.abs(c[1] - r.x) < 1e-9 && Math.abs(c[2] - r.y) < 1e-9 &&
+        Math.abs(c[3] - r.w) < 1e-9 && Math.abs(c[4] - r.h) < 1e-9 && env.log[i - 1][0] === 'set_source_rgba') {
+      return env.log[i - 1].slice(1, 4);
+    }
+  }
+  return null;
+}
+
+/* number of strokePoly(pts, color) calls: rgba, line width, move_to(pts[0..1]) ... */
+function polyStrokes(env, pts, rgb) {
+  let n = 0;
+  for (let i = 2; i < env.log.length; i++) {
+    const c = env.log[i];
+    const col = env.log[i - 2];
+    if (c[0] === 'move_to' && Math.abs(c[1] - pts[0]) < 1e-9 && Math.abs(c[2] - pts[1]) < 1e-9 &&
+        col[0] === 'set_source_rgba' && env.log[i - 1][0] === 'set_line_width' &&
+        rgb.every((v, j) => Math.abs(col[1 + j] - v) < 1e-9)) {
+      n++;
+    }
+  }
+  return n;
+}
+
+/* number of filled diamonds drawn with exactly these 4 points */
+function diamonds(env, pts) {
+  let n = 0;
+  for (let i = 1; i + 5 < env.log.length; i++) {
+    const m = env.log[i];
+    if (m[0] !== 'move_to' || Math.abs(m[1] - pts[0]) > 1e-9 || Math.abs(m[2] - pts[1]) > 1e-9 ||
+        env.log[i - 1][0] !== 'set_source_rgba') { continue; }
+    let ok = true;
+    for (let j = 1; j < 4; j++) {
+      const c = env.log[i + j];
+      ok = ok && c[0] === 'line_to' && Math.abs(c[1] - pts[2 * j]) < 1e-9 && Math.abs(c[2] - pts[2 * j + 1]) < 1e-9;
+    }
+    if (ok && env.log[i + 4][0] === 'close_path' && env.log[i + 5][0] === 'fill') { n++; }
+  }
+  return n;
+}
+
+/* ----------------------------------------------------------- normalizeView v2 */
+
+test('v2 view fields: defaults for v1 views, sanitising for garbage', () => {
+  const { ex } = load();
+  const d = plain(ex.normalizeView(null));
+  assert.equal(d.morph, 0);
+  assert.equal(d.scan, 0);
+  assert.equal(d.morphEdit, 0);
+  assert.equal(d.gesture, -1);
+  assert.deepEqual(d.gestureNames, ['', '', '', '']);
+  const v1 = plain(ex.normalizeView(makeView()));
+  assert.equal(v1.morph, 0);
+  assert.equal(v1.gesture, -1);
+
+  const g = plain(ex.normalizeView({ morph: 63, scan: 40.5, morphEdit: 1, gesture: 2, gestureNames: ['a', 'b', 'c', 'd'] }));
+  assert.equal(g.morph, 63);
+  assert.equal(g.scan, 40.5);
+  assert.equal(g.morphEdit, 1);
+  assert.equal(g.gesture, 2);
+  assert.deepEqual(g.gestureNames, ['a', 'b', 'c', 'd']);
+
+  assert.equal(plain(ex.normalizeView({ morph: 500, scan: -20 })).morph, 100);
+  assert.equal(plain(ex.normalizeView({ morph: 500, scan: -20 })).scan, 0);
+  assert.equal(plain(ex.normalizeView({ morph: 'x', scan: NaN })).morph, 0);
+  assert.equal(plain(ex.normalizeView({ morphEdit: true })).morphEdit, 1);
+  assert.equal(plain(ex.normalizeView({ morphEdit: '0' })).morphEdit, 0);
+  assert.equal(plain(ex.normalizeView({ morphEdit: '1' })).morphEdit, 1);
+  assert.equal(plain(ex.normalizeView({ morphEdit: null })).morphEdit, 0);
+  for (const bad of [-1, 4, 99, 'x', null, NaN, {}]) {
+    assert.equal(plain(ex.normalizeView({ gesture: bad })).gesture, -1, `gesture ${String(bad)}`);
+  }
+  assert.equal(plain(ex.normalizeView({ gesture: 3.9 })).gesture, 3);
+  assert.deepEqual(plain(ex.normalizeView({ gestureNames: 'abc' })).gestureNames, ['', '', '', '']);
+  assert.deepEqual(plain(ex.normalizeView({ gestureNames: ['a', null, 7, {}, 'extra'] })).gestureNames, ['a', '', '7', '']);
+  assert.equal(plain(ex.normalizeView({ keyFlags: [64, 65] })).keyFlags[1], 65, 'bit 64 survives');
+});
+
+/* ---------------------------------------------------------- 16-key mod zone */
+
+test('mod zone is 16 keys with the v2 labels', () => {
+  const { ex } = load();
+  assert.equal(ex.modLabel(11), 'Ch');
+  for (let i = 0; i < 16; i++) { assert.equal(ex.modLabel(i), MOD_LABELS_16[i], `label ${i}`); }
+  assert.equal(ex.modLabel(16), '');
+  assert.equal(ex.constants.GESTURE_COUNT, 4);
+  assert.equal(ex.constants.GESTURE_OFFSET, 12);
+
+  /* the start is derived from the lowest flagged key or taken from modStart */
+  const flags = new Array(128).fill(0);
+  for (let i = 0; i < 16; i++) { flags[100 + i] = 8; }
+  assert.equal(plain(ex.normalizeView({ keyFlags: flags })).modStart, 100);
+  assert.equal(plain(ex.normalizeView({ keyFlags: flags, modStart: 112 })).modStart, 112);
+  assert.equal(plain(ex.normalizeView({ keyFlags: flags, modStart: -1 })).modStart, -1, 'zone off');
+});
+
+test('all 16 zone keys are labelled, each on its own key', () => {
+  for (const start of [96, 112, 64, 0]) {
+    const env = load();
+    env.show(modZoneView(start, { rootKey: start }));
+    const ws = env.get('winStart');
+    assert.ok(start >= ws && start + 16 <= ws + 48, `zone ${start} visible in window ${ws}`);
+    env.paint();
+    assertSanePaint(env, `zone ${start}`);
+    const L = env.ex.computeLayout(600, 160);
+    const draws = textDraws(env);
+    for (let i = 0; i < 16; i++) {
+      const r = env.ex.keyRect(L, ws, start + i);
+      /* labels are centred: the mock measures 5 px per character */
+      const lx = r.x + r.w / 2 - MOD_LABELS_16[i].length * 2.5;
+      const hits = draws.filter((d) => d.text === MOD_LABELS_16[i] && Math.abs(d.x - lx) < 1e-9 &&
+        d.y > r.y && d.y <= r.y + r.h + 1);
+      assert.equal(hits.length, 1, `zone ${start} label ${MOD_LABELS_16[i]} on key ${start + i}`);
+    }
+    /* the gesture labels exist only on the zone keys (one draw each, no status text) */
+    for (const g of ['G1', 'G2', 'G3', 'G4']) {
+      assert.equal(draws.filter((d) => d.text === g).length, 1, `${g} once`);
+    }
+  }
+});
+
+test('zone keys without the mod flag are not labelled (12-key v1 zone still renders)', () => {
+  const env = load();
+  env.show(fullView());
+  env.paint();
+  const t = env.texts();
+  for (const lab of ['G1', 'G2', 'G3', 'G4']) { assert.ok(!t.includes(lab), `no ${lab} in a 12-key zone`); }
+  assert.ok(t.includes('Ch'));
+});
+
+test('hit testing in the 16-key zone: every zone key is selected by its own centre', () => {
+  for (const start of [96, 112]) {
+    const env = load();
+    env.show(modZoneView(start, { rootKey: start }));
+    const ws = env.get('winStart');
+    const L = env.ex.computeLayout(600, 160);
+    const view = env.ex.normalizeView(modZoneView(start));
+    env.clear();
+    const expected = [];
+    for (let i = 0; i < 16; i++) {
+      const p = env.ex.keyCenter(L, ws, start + i);
+      assert.equal(env.ex.keyAt(L, ws, p.x, p.y), start + i);
+      assert.equal(env.ex.hitTest(L, view, ws, p.x, p.y).key, start + i);
+      env.click(p.x, p.y);
+      env.release(p.x, p.y);
+      expected.push('selectkey ' + (start + i));
+    }
+    assert.deepEqual(env.msgs(), expected);
+    /* modifiers behave as on any other key */
+    env.clear();
+    const p = env.ex.keyCenter(L, ws, start + 14);
+    env.click(p.x, p.y, { cmd: true });
+    env.click(p.x, p.y, { shift: true });
+    env.release(p.x, p.y);
+    assert.deepEqual(env.msgs(), [`lock ${start + 14}`, `audition ${start + 14} 100`, `auditionoff ${start + 14}`]);
+  }
+});
+
+/* ------------------------------------------------------------------ gestures */
+
+test('active gesture key is highlighted (fill and outline) and the others are not', () => {
+  const base = load();
+  base.show(modZoneView(96, { rootKey: 96 }));
+  base.paint();
+  const L = base.ex.computeLayout(600, 160);
+  const ws = base.get('winStart');
+  const gcol = plain(base.get('COL.gesture'));
+  const noGestureFill = [];
+  for (let k = 96; k < 112; k++) { noGestureFill.push(rectFill(base, base.ex.keyRect(L, ws, k))); }
+  for (let k = 96; k < 112; k++) {
+    assert.equal(polyStrokes(base, base.ex.keyPolygon(L, ws, k), gcol), 0, `no outline on ${k} without a gesture`);
+  }
+
+  for (let g = 0; g < 4; g++) {
+    const env = load();
+    env.show(modZoneView(96, { rootKey: 96, gesture: g }));
+    env.paint();
+    assertSanePaint(env, `gesture ${g}`);
+    assert.equal(env.ex.gestureKey(env.ex.normalizeView(modZoneView(96, { gesture: g }))), 96 + 12 + g);
+    for (let k = 96; k < 112; k++) {
+      const fill = rectFill(env, env.ex.keyRect(L, ws, k));
+      const outlines = polyStrokes(env, env.ex.keyPolygon(L, ws, k), gcol);
+      if (k === 108 + g) {
+        assert.equal(outlines, 1, `gesture ${g}: key ${k} outlined`);
+        assert.notDeepEqual(fill, noGestureFill[k - 96], `gesture ${g}: key ${k} fill changed`);
+        /* the label of the highlighted key is white */
+        const lab = textDraws(env).filter((d) => d.text === 'G' + (g + 1))[0];
+        assert.ok(lab);
+        const i = env.log.findIndex((c, j) => c[0] === 'show_text' && c[1] === 'G' + (g + 1) && env.log[j - 1][0] === 'move_to' && env.log[j - 1][1] === lab.x);
+        assert.deepEqual(env.log[i - 2].slice(1, 4), [1, 1, 1]);
+      } else {
+        assert.equal(outlines, 0, `gesture ${g}: key ${k} not outlined`);
+        assert.deepEqual(fill, noGestureFill[k - 96], `gesture ${g}: key ${k} fill unchanged`);
+      }
+    }
+  }
+});
+
+test('gesture highlight: no gesture, invalid gesture, zone off, key out of the window', () => {
+  const gcol = plain(load().get('COL.gesture'));
+  const cases = [
+    ['gesture -1', modZoneView(96, { rootKey: 96, gesture: -1 })],
+    ['gesture 4', modZoneView(96, { rootKey: 96, gesture: 4 })],
+    ['gesture missing', modZoneView(96, { rootKey: 96 })],
+    ['zone off', modZoneView(96, { rootKey: 96, gesture: 1, modStart: -1, keyFlags: new Array(128).fill(0) })],
+    ['key beyond 127', modZoneView(112, { rootKey: 112, gesture: 3, modStart: 127 })]
+  ];
+  for (const [label, raw] of cases) {
+    const env = load();
+    env.show(raw);
+    env.paint();
+    assertSanePaint(env, label);
+    const L = env.ex.computeLayout(600, 160);
+    const ws = env.get('winStart');
+    for (let k = ws; k < ws + 48; k++) {
+      assert.equal(polyStrokes(env, env.ex.keyPolygon(L, ws, k), gcol), 0, `${label}: key ${k}`);
+    }
+  }
+  /* gesture key scrolled out of the window: nothing breaks, the status still names it */
+  const env = load();
+  env.show(modZoneView(96, { rootKey: 96, gesture: 2, gestureNames: GEST_NAMES }));
+  env.get('winStart = 0');
+  assert.doesNotThrow(() => env.paint());
+  assertSanePaint(env, 'gesture key not visible');
+  assert.ok(env.texts().includes('G3 wobble'));
+});
+
+test('status line names the active gesture; without names it shows just G<n>', () => {
+  const env = load();
+  env.show(modZoneView(96, { rootKey: 96, gesture: 1, gestureNames: GEST_NAMES }));
+  env.paint();
+  const t = env.texts();
+  assert.ok(t.includes('G2 swoop'));
+  for (const other of ['kick roll', 'wobble', 'rise']) { assert.ok(!t.some((s) => s.indexOf(other) >= 0), other); }
+  assert.ok(t.includes('Ready - 8 slices'), 'status text kept');
+  assert.ok(t.includes('C'), 'slot letter kept');
+
+  const env2 = load();
+  env2.show(modZoneView(96, { rootKey: 96, gesture: 2 }));
+  env2.paint();
+  /* key label + status */
+  assert.equal(env2.texts().filter((s) => s === 'G3').length, 2);
+
+  const env3 = load();
+  env3.show(modZoneView(96, { rootKey: 96, gesture: 0, gestureNames: ['G1', '', '', ''] }));
+  env3.paint();
+  assert.equal(env3.texts().filter((s) => s === 'G1').length, 2, 'name equal to the label is not repeated');
+
+  const env4 = load();
+  env4.show(modZoneView(96, { rootKey: 96, gesture: -1, gestureNames: GEST_NAMES }));
+  env4.paint();
+  assert.ok(!env4.texts().some((s) => GEST_NAMES.indexOf(s) >= 0 || /^G\d /.test(s)), 'names alone show nothing');
+});
+
+/* ----------------------------------------------------------- morph B (bit 64) */
+
+test('keyFlags bit 64 draws a diamond on the key, on white and black keys', () => {
+  const v = makeView({ selectedKey: -1 });
+  v.keyFlags[60] = 64;          /* C, white */
+  v.keyFlags[61] = 64;          /* C#, black */
+  v.keyFlags[62] = 64 | 1 | 2 | 4 | 16 | 32;  /* D with every other mark */
+  const env = load();
+  env.show(v);
+  env.paint();
+  assertSanePaint(env, 'bit 64');
+  const L = env.ex.computeLayout(600, 160);
+  const ws = env.get('winStart');
+  for (const k of [60, 61, 62]) {
+    const pts = plain(env.ex.morphMarkPoly(L, ws, k));
+    assert.equal(pts.length, 8);
+    assert.equal(diamonds(env, pts), 1, `diamond on key ${k}`);
+  }
+  /* no mark on a key without the bit, whatever else it carries */
+  for (const k of [58, 59, 63, 64, 65]) {
+    const pts = plain(env.ex.morphMarkPoly(L, ws, k));
+    assert.equal(diamonds(env, pts), 0, `no diamond on key ${k}`);
+  }
+  assert.equal(env.ex.morphMarkPoly(L, ws, ws - 1), null);
+  assert.equal(env.ex.morphMarkPoly(L, ws, ws + 48), null);
+
+  /* clearing the bit removes exactly the diamond */
+  const v2 = makeView({ selectedKey: -1 });
+  v2.keyFlags[60] = 0;
+  v2.keyFlags[61] = 0;
+  v2.keyFlags[62] = 1 | 2 | 4 | 16 | 32;
+  const env2 = load();
+  env2.show(v2);
+  env2.paint();
+  const count = (e, name) => e.log.filter((c) => c[0] === name).length;
+  assert.equal(count(env, 'close_path') - count(env2, 'close_path'), 3);
+  assert.equal(count(env, 'fill') - count(env2, 'fill'), 3);
+  assert.equal(count(env, 'arc'), count(env2, 'arc'), 'other marks unchanged');
+  assert.equal(count(env, 'stroke'), count(env2, 'stroke'));
+});
+
+test('the B diamond stays clear of black keys, the glyphs and the key edges', () => {
+  for (const [w, h] of [[300, 120], [400, 160], [600, 160], [900, 300], [1400, 200]]) {
+    const { ex } = load();
+    const L = ex.computeLayout(w, h);
+    for (const ws of [0, 36, 37, 80]) {
+      for (let k = ws; k < ws + 48; k++) {
+        const pts = plain(ex.morphMarkPoly(L, ws, k));
+        const xs = pts.filter((_, i) => i % 2 === 0);
+        const ys = pts.filter((_, i) => i % 2 === 1);
+        const x0 = Math.min(...xs); const x1 = Math.max(...xs);
+        const y1 = Math.max(...ys);
+        const r = ex.keyRect(L, ws, k);
+        const tag = `${w}x${h} ws ${ws} key ${k}`;
+        assert.ok(x0 >= r.x - 1e-9 && x1 <= r.x + r.w + 1e-9 && Math.min(...ys) >= r.y, `${tag}: inside the key`);
+        if (r.black) {
+          /* the lowered glyph column starts at +12, so its shackle top is at +9.5 */
+          assert.ok(y1 <= r.y + 9.5, `${tag}: above the glyph column`);
+        } else {
+          assert.ok(y1 < r.y + L.blackH, `${tag}: in the exposed top part`);
+          for (const nk of [k - 1, k + 1]) {
+            if (nk >= ws && nk < ws + 48 && ex.isBlackKey(nk)) {
+              const nr = ex.keyRect(L, ws, nk);
+              assert.ok(x1 <= nr.x + 1e-9 || x0 >= nr.x + nr.w - 1e-9, `${tag}: clear of black key ${nk}`);
+            }
+          }
+        }
+      }
+    }
+  }
+});
+
+test('on a black key the glyph column starts below the B diamond', () => {
+  const v = makeView({ selectedKey: -1 });
+  v.keys[61] = 1;
+  v.keyFlags[61] = 64 | 1;      /* lock glyph + B */
+  const env = load();
+  env.show(v);
+  env.paint();
+  const L = env.ex.computeLayout(600, 160);
+  const ws = env.get('winStart');
+  const r = env.ex.keyRect(L, ws, 61);
+  const pts = plain(env.ex.morphMarkPoly(L, ws, 61));
+  const lock = env.log.filter((c) => c[0] === 'rectangle' && Math.abs(c[1] - (r.x + r.w / 2 - 2.5)) < 1e-9 && c[3] === 5 && c[4] === 4);
+  assert.equal(lock.length, 1);
+  assert.ok(lock[0][2] - 2 >= Math.max(pts[1], pts[3], pts[5], pts[7]), 'shackle top is below the diamond');
+
+  /* without B the lock sits where it always did */
+  v.keyFlags[61] = 1;
+  const env2 = load();
+  env2.show(v);
+  env2.paint();
+  const lock2 = env2.log.filter((c) => c[0] === 'rectangle' && Math.abs(c[1] - (r.x + r.w / 2 - 2.5)) < 1e-9 && c[3] === 5 && c[4] === 4);
+  assert.equal(lock2[0][2], r.y + 7 - 0.5);
+});
+
+/* ------------------------------------------------------------ status line v2 */
+
+test('status indicators: absent on v1 views and for zero values', () => {
+  const { ex } = load();
+  assert.deepEqual(plain(ex.statusIndicators(ex.normalizeView(null))), []);
+  assert.deepEqual(plain(ex.statusIndicators(ex.normalizeView(makeView()))), []);
+  assert.deepEqual(plain(ex.statusIndicators(ex.normalizeView({ morph: 0, scan: 0, morphEdit: 0, gesture: -1 }))), []);
+
+  const env = load();
+  env.show(makeView({ armed: 'dup' }));
+  env.paint();
+  const t = env.texts();
+  assert.ok(!t.some((s) => /EDIT B|MORPH|SCAN/.test(s)));
+  assert.ok(t.includes('Ready - 8 slices') && t.includes('DUP: click a key') && t.includes('E1 (40)'));
+  const L = env.ex.computeLayout(600, 160);
+  assert.equal(env.log.filter((c) => c[0] === 'rectangle' && c[2] === L.status.y + 1).length, 0, 'no badge');
+
+  const env2 = load();
+  env2.show(makeView({ morph: 0, scan: 0, morphEdit: 0, gesture: -1 }));
+  env2.paint();
+  assert.ok(!env2.texts().some((s) => /EDIT B|MORPH|SCAN/.test(s)));
+});
+
+test('status indicators: EDIT B badge, MORPH nn%, SCAN nn%', () => {
+  const L0 = load().ex.computeLayout(600, 160);
+  const cases = [
+    [{ morphEdit: 1 }, ['EDIT B'], ['MORPH', 'SCAN']],
+    [{ morph: 40 }, ['MORPH 40%'], ['EDIT B', 'SCAN']],
+    [{ scan: 25 }, ['SCAN 25%'], ['EDIT B', 'MORPH']],
+    [{ morph: 100, scan: 1, morphEdit: 1 }, ['EDIT B', 'MORPH 100%', 'SCAN 1%'], []],
+    [{ morph: 0.2 }, ['MORPH 1%'], ['EDIT B']],
+    [{ morph: 63.6, scan: 99.5 }, ['MORPH 64%', 'SCAN 100%'], []]
+  ];
+  for (const [over, present, absent] of cases) {
+    const env = load();
+    env.show(makeView(Object.assign({ armed: 'layer' }, over)));
+    env.paint();
+    assertSanePaint(env, JSON.stringify(over));
+    const t = env.texts();
+    for (const p of present) { assert.ok(t.includes(p), `${JSON.stringify(over)}: ${p}`); }
+    for (const a of absent) { assert.ok(!t.some((s) => s.indexOf(a) === 0), `${JSON.stringify(over)}: no ${a}`); }
+    /* existing status content is all still there */
+    assert.ok(t.includes('Ready - 8 slices'), 'status text');
+    assert.ok(t.includes('LAYER: click a key'), 'armed');
+    assert.ok(t.includes('E1 (40)'), 'selected key');
+    assert.ok(t.includes('C') && t.includes('SLOT'), 'slot');
+    /* the badge is a filled pill in the status row, only when morph edit is on */
+    const pills = env.log.filter((c) => c[0] === 'rectangle' && c[2] === L0.status.y + 1 && c[4] === L0.status.h - 2);
+    assert.equal(pills.length, over.morphEdit ? 1 : 0);
+  }
+});
+
+test('the EDIT B badge is drawn in its own colour with the label centred inside', () => {
+  const env = load();
+  env.show(makeView({ morphEdit: 1 }));
+  env.paint();
+  const L = env.ex.computeLayout(600, 160);
+  const pill = env.log.findIndex((c) => c[0] === 'rectangle' && c[2] === L.status.y + 1 && c[4] === L.status.h - 2);
+  assert.ok(pill > 0);
+  assert.deepEqual(env.log[pill - 1].slice(1, 4), plain(env.get('COL.editB')));
+  assert.equal(env.log[pill - 1][4], 1, 'opaque');
+  const r = env.log[pill];
+  const lab = textDraws(env).filter((d) => d.text === 'EDIT B')[0];
+  assert.ok(lab && lab.x >= r[1] && lab.x + 6 * 5 <= r[1] + r[3], 'label inside the badge');
+  assert.ok(r[1] >= L.status.x && r[1] + r[3] <= L.status.x + L.status.w);
+});
+
+test('status indicators come before the status text and never overlap anything', () => {
+  const views = {
+    'badge + everything': v2View({ armed: 'layer', selectedKey: 100 }),
+    'long status': v2View({ status: 'Loaded amen_break.wav - 8 slices, 4 bars at 172 bpm' }),
+    'long gesture name': v2View({ gestureNames: ['an extremely long gesture name', 'x', 'y', 'z'], gesture: 0 }),
+    'no status text': v2View({ status: '' }),
+    'armed + key, no gesture': v2View({ armed: 'dup', selectedKey: 90, gesture: -1 })
+  };
+  for (const [label, raw] of Object.entries(views)) {
+    for (const [w, h] of [[80, 80], [120, 90], [200, 100], [300, 120], [400, 160], [600, 160], [900, 300]]) {
+      const env = load({ w, h });
+      env.show(raw);
+      env.sb.onresize(w, h);
+      env.paint();
+      assertSanePaint(env, `${label} ${w}x${h}`);
+      const L = env.ex.computeLayout(w, h);
+      const base = L.status.y + L.status.h / 2 + 3.2;
+      const boxes = [];
+      for (const d of textDraws(env)) {
+        if (Math.abs(d.y - base) > 1e-9 || d.text === 'EDIT B' || d.text === 'B') { continue; }
+        boxes.push({ name: d.text, x0: d.x, x1: d.x + 5 * d.text.length });
+      }
+      for (const c of env.log) {
+        if (c[0] === 'rectangle' && c[2] === L.status.y + 1 && c[4] === L.status.h - 2) {
+          boxes.push({ name: 'badge', x0: c[1], x1: c[1] + c[3] });
+        }
+      }
+      const tag = `${label} ${w}x${h}`;
+      for (const b of boxes) {
+        assert.ok(b.x1 <= L.status.x + L.status.w + 1e-9, `${tag}: ${b.name} inside the right edge`);
+      }
+      const inside = boxes.filter((b) => b.x0 >= L.status.x - 1e-9);
+      for (let i = 0; i < inside.length; i++) {
+        for (let j = i + 1; j < inside.length; j++) {
+          assert.ok(inside[i].x1 <= inside[j].x0 + 1e-9 || inside[j].x1 <= inside[i].x0 + 1e-9,
+            `${tag}: ${inside[i].name} overlaps ${inside[j].name}`);
+        }
+      }
+      /* an indicator other than the badge is only drawn together with the badge */
+      const names = boxes.map((b) => b.name);
+      if (names.some((n) => /^(MORPH|SCAN|G\d)/.test(n))) {
+        assert.ok(names.indexOf('badge') >= 0, `${tag}: badge has priority`);
+      }
+    }
+  }
+});
+
+test('wide status line fits everything; narrow ones drop MORPH / SCAN / gesture before the status text', () => {
+  const raw = v2View({ status: 'Ready - 8 slices' });
+  const env = load();
+  env.show(raw);
+  env.paint();
+  const all = ['EDIT B', 'MORPH 63%', 'SCAN 40%', 'G2 swoop', 'Ready - 8 slices'];
+  for (const a of all) { assert.ok(env.texts().includes(a), `600 wide: ${a}`); }
+
+  /* order on the line: badge, MORPH, SCAN, gesture, status */
+  const xs = all.map((a) => textDraws(env).filter((d) => d.text === a)[0].x);
+  for (let i = 1; i < xs.length; i++) { assert.ok(xs[i] > xs[i - 1], `${all[i]} right of ${all[i - 1]}`); }
+
+  /* narrow with a crowded right side: only the badge and (a prefix of) the status text remain */
+  const narrow = load({ w: 300, h: 120 });
+  narrow.show(Object.assign({}, raw, { armed: 'layer', selectedKey: 100 }));
+  narrow.sb.onresize(300, 120);
+  narrow.paint();
+  const t = narrow.texts();
+  assert.ok(!t.some((s) => /^(MORPH|SCAN)/.test(s)) && !t.includes('G2 swoop'), 'MORPH / SCAN / gesture dropped');
+  const L = narrow.ex.computeLayout(300, 120);
+  assert.equal(narrow.log.filter((c) => c[0] === 'rectangle' && c[2] === L.status.y + 1 && c[4] === L.status.h - 2).length, 1, 'badge kept');
+  assert.ok(t.some((s) => s.indexOf('Rea') === 0), 'status text still readable: ' + JSON.stringify(t));
+
+  /* tiny: the badge shrinks to "B" or disappears, nothing throws */
+  for (const w of [80, 100, 140]) {
+    const e = load({ w, h: 100 });
+    e.show(raw);
+    e.sb.onresize(w, 100);
+    assert.doesNotThrow(() => e.paint());
+    assertSanePaint(e, `tiny ${w}`);
+  }
+});
+
+test('transient notes still replace the status text next to the indicators', () => {
+  const env = load();
+  const v = makeView({ morphEdit: 1, morph: 10 });
+  delete v.selectedFrames;
+  env.show(v);
+  const g = waveGeometry(env);
+  env.click(g.x(0.5), g.y, { shift: true });
+  env.paint();
+  const t = env.texts();
+  assert.ok(t.some((s) => /selectedFrames/.test(s)));
+  assert.ok(t.includes('EDIT B') && t.includes('MORPH 10%'));
+  assert.ok(!t.includes('Ready - 8 slices'));
+});
+
+/* ------------------------------------------------------------ painting, v1/v2 */
+
+test('paint v1-only and v2 views at several sizes (all window positions)', () => {
+  const views = {
+    'v1 normal': makeView(),
+    'v1 full': fullView(),
+    'v1 empty': {},
+    'v2 full': v2View({ armed: 'dup', selectedKey: 110 }),
+    'v2 zone at 112': modZoneView(112, { rootKey: 112, gesture: 3, gestureNames: GEST_NAMES, morph: 5, scan: 95, morphEdit: 1 }),
+    'v2 only fields': { morph: 50, scan: 50, morphEdit: 1, gesture: 0, gestureNames: GEST_NAMES },
+    'v2 zone off': v2View({ modStart: -1, keyFlags: v2View().keyFlags.map((f) => f & ~8) })
+  };
+  for (const [label, raw] of Object.entries(views)) {
+    for (const [w, h] of [[80, 80], [160, 100], [300, 120], [600, 160], [900, 300], [1400, 200]]) {
+      const env = load({ w, h });
+      env.show(raw);
+      env.sb.onresize(w, h);
+      for (const ws of [0, 24, 36, 61, 80]) {
+        env.get('winStart = ' + ws);
+        assert.doesNotThrow(() => env.paint(), `${label} ${w}x${h} ws ${ws}`);
+        assertSanePaint(env, `${label} ${w}x${h} ws ${ws}`);
+      }
+    }
+  }
+});
+
+test('paint with odd or malformed v2 fields', () => {
+  const variants = [
+    { morph: 'a', scan: null, morphEdit: 'yes', gesture: 'b', gestureNames: 5 },
+    { morph: NaN, scan: Infinity, morphEdit: NaN, gesture: Infinity, gestureNames: [null, undefined, NaN, {}] },
+    { morph: -50, scan: 1e9, morphEdit: 7, gesture: 99, gestureNames: ['x'] },
+    { gesture: 2, modStart: 126, gestureNames: new Array(10).fill('long long name') },
+    { gesture: 0, modStart: 'x', gestureNames: ['a', 'b', 'c', 'd'] },
+    { morph: 33, keyFlags: new Array(128).fill(127), keys: new Array(128).fill(3), gesture: 3, modStart: 100 },
+    { morphEdit: true, morph: 12.5, scan: 0.4, gestureNames: ['ok', 'b', 'c', 'd'], gesture: 3 }
+  ];
+  variants.forEach((raw, i) => {
+    const env = load();
+    env.show(raw);
+    assert.doesNotThrow(() => env.paint(), `variant ${i}`);
+    assertSanePaint(env, `variant ${i}`);
+  });
+});
+
+test('v2 additions keep the file ES5 / ASCII and use only mocked mgraphics calls', () => {
+  assert.ok(/^[\x00-\x7f]*$/.test(SRC), 'ASCII only');
+  const code = SRC.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+  const used = new Set();
+  code.replace(/mgraphics\.([a-z_]+)\(/g, (m, name) => { used.add(name); return m; });
+  for (const name of used) {
+    assert.ok(MG_METHODS.indexOf(name) >= 0 || name === 'text_measure', `mgraphics.${name} is not in the mock`);
+  }
+  let acorn = null;
+  try { acorn = require('acorn'); } catch (e) { /* optional */ }
+  if (acorn) {
+    assert.doesNotThrow(() => acorn.parse(SRC, { ecmaVersion: 5 }));
+  }
+  /* no ES6+ syntax slipped into the new code: no arrows, spread, template strings, let/const */
+  assert.ok(!/=>|`|\blet\b|\bconst\b/.test(code.replace(/'(?:[^'\\\n]|\\.)*'/g, "''")));
 });
