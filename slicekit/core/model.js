@@ -10,11 +10,13 @@
 //      addSource/setSourceInfo/setSourceSettings -> 'sources'
 //      setSliceFeatures -> 'slices' (+ 'map' when the sorted layout re-lays out)
 //      setPadParam/applyParamToSource -> 'pads'
-//      setCurrentSlot/lock ops/clearKey/swapKeys/assignPad/copySlot -> 'map'
-//      setGlobal -> 'globals' (+ 'map' for layout-affecting keys)
-//      everything structural (setSlices, slice points, removeSource, shuffle,
-//      spread, duplicate, layers, similar, findBest, undo/redo ...) -> 'all'
+//      setCurrentSlot/lock ops/clearKey/swapKeys/assignPad/copySlot/applyLayout -> 'map'
+//      setGlobal -> 'globals' (+ 'map' when layout-affecting keys re-lay out auto slots)
+//      everything structural (setSlices, slice points, removeSource, undo/redo ...) -> 'all'
+//      findBest -> 'map'; duplicatePad/spread/toggleLayer/swapSimilar/shuffle -> 'all'
 //    A call that changes nothing does not notify.
+//  * shuffle: every key in scope counts as moved (a permutation may leave a pad
+//    in place by chance); `moved` is that count and flipPct applies to all of them.
 //  * Layout: a base pad that already sits on a locked key is not placed a
 //    second time (the locked key "keeps its pad"; the rest flows around it).
 //  * Undo snapshots hold pads, slots, currentSlot and, per source, its slices
@@ -147,6 +149,8 @@ function toInt(v) {
 // -> true / false, or null when v is not boolean-like
 function toBool(v) {
   if (typeof v === 'boolean') return v;
+  if (v === 'true') return true;
+  if (v === 'false') return false;
   var n = toNum(v);
   if (isNaN(n)) return null;
   return n !== 0;
@@ -393,7 +397,7 @@ function sanitizeState(raw) {
     if (pid !== numericKeys[i]) continue;
     if (!hasOwn(sliceOwner, rp.sliceId) || sliceOwner[rp.sliceId] !== rp.sourceId) continue;
     if (!claim(pid)) continue;
-    var pad = defaultPad(pid, rp.sourceId, rp.sliceId, rp.base !== false && !!rp.base);
+    var pad = defaultPad(pid, rp.sourceId, rp.sliceId, toBool(rp.base) === true);
     for (j = 0; j < PAD_PARAM_NAMES.length; j++) {
       name = PAD_PARAM_NAMES[j];
       if (hasOwn(rp, name)) {
@@ -428,9 +432,10 @@ function sanitizeState(raw) {
     var rlk = Array.isArray(rsl.locks) ? rsl.locks : [];
     for (j = 0; j < NUM_KEYS; j++) {
       dst.keys[j] = (rk[j] !== null && rk[j] !== undefined && hasOwn(st.pads, rk[j])) ? rk[j] : null;
-      dst.locks[j] = !!rlk[j];
+      dst.locks[j] = toBool(rlk[j]) === true;
     }
-    dst.auto = rsl.auto !== false;
+    v = toBool(rsl.auto);
+    dst.auto = v === null ? true : v;
   }
   v = toInt(raw.currentSlot);
   st.currentSlot = isNaN(v) ? 0 : clamp(v, 0, NUM_SLOTS - 1);

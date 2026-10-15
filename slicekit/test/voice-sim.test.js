@@ -661,6 +661,19 @@ test('repeat: off when rptdiv = 0 or the key is released; switching the phase so
   assert.equal(eventsOf(sim, 'line').length, before);
 });
 
+test('repeat: releasing the key while a hit is still sounding stops further repeats but plays the hit out', () => {
+  const spb = 22050;
+  const sim = make(rampBuffer(20000), { pstart: 1000, pend: 15000, rptdiv: 4, held: 1, playing: 1, trig: 1 });
+  sim.process(7000, hostPhase(spb, 0));
+  assert.equal(starts(sim).length, 2);
+  const startN = starts(sim)[1].n;
+  sim.set('held', 0);
+  const r = sim.process(20000, hostPhase(spb, 7000));
+  assert.equal(starts(sim).length, 2, 'no more repeats');
+  const end = firstIndex(r.active, 0, v => v === 0);
+  assert.equal(end + 7000, startN + 14000, 'the running hit plays to pend');
+});
+
 test('repeat: kill ends a waiting voice at once; unheld trigger voices still end after their hit', () => {
   const spb = 22050;
   const sim = make(rampBuffer(20000), { pstart: 1000, pend: 2000, rptdiv: 4, held: 1, playing: 1, trig: 1 });
@@ -1172,13 +1185,14 @@ function applyScript(engine, script, total, phaseFn) {
 }
 
 function parity(buffer, script, total, phaseFn, sampleRate) {
-  const sim = VoiceSim.create({ sampleRate: sampleRate || SR, buffer: buffer });
+  const sim = VoiceSim.create({ sampleRate: sampleRate || SR, buffer: buffer, log: true });
   const gen = createGenVoice(COMPILED, { sampleRate: sampleRate || SR, buffer: buffer });
   const a = applyScript(sim, script, total, phaseFn);
   const b = applyScript(gen, script, total, phaseFn);
   assert.deepEqual(Array.from(a.active), Array.from(b.active), 'active outputs identical');
   const dl = maxAbsDiff(a.left, b.left), dr = maxAbsDiff(a.right, b.right);
   assert.ok(dl < 1e-6 && dr < 1e-6, 'audio parity: ' + dl + ' / ' + dr);
+  a.events = sim.events;
   return a;
 }
 
@@ -1242,7 +1256,9 @@ test('parity: 48 kHz, mono and stereo, thru-style end beyond the buffer, tiny sl
 });
 
 test('parity: random scenarios (seeded fuzz of every parameter and event)', () => {
-  for (let seed = 1; seed <= 24; seed++) {
+  const coverage = {};
+  function count(key) { coverage[key] = (coverage[key] || 0) + 1; }
+  for (let seed = 1; seed <= 32; seed++) {
     const rnd = mulberry32(seed * 7919);
     const pick = a => a[Math.floor(rnd() * a.length)];
     const frames = 30000;
@@ -1289,6 +1305,7 @@ test('parity: random scenarios (seeded fuzz of every parameter and event)', () =
     // always have one clean start
     script.unshift({ at: 0, set: { pstart: 1000, pend: 9000, held: 1, trig: ++trigN } });
     const a = parity(buf, script, total, hostPhase(SPB, Math.floor(rnd() * SPB)), pick([44100, 48000]));
+    a.events.forEach(e => count(e.type + (e.kind ? ':' + e.kind : '') + (e.why ? ':' + e.why : '')));
     for (let i = 0; i < total; i++) {
       assert.ok(Number.isFinite(a.left[i]) && Number.isFinite(a.right[i]), 'finite output (seed ' + seed + ' at ' + i + ')');
       assert.ok(a.active[i] === 0 || a.active[i] === 1);
@@ -1296,4 +1313,9 @@ test('parity: random scenarios (seeded fuzz of every parameter and event)', () =
       assert.ok(Math.abs(a.left[i]) < 40, 'bounded output');
     }
   }
+  // the random scenarios must really visit every state-machine path
+  if (process.env.VOICE_COV) { console.log(JSON.stringify(coverage)); }
+  ['trig', 'start:1', 'start:2', 'line', 'wait', 'wrap', 'kill', 'end:pend', 'end:release', 'end:kill', 'end:wait'].forEach(key => {
+    assert.ok((coverage[key] || 0) >= (key === 'end:wait' ? 3 : 10), 'fuzz coverage of "' + key + '": ' + (coverage[key] || 0));
+  });
 });

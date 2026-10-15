@@ -575,18 +575,16 @@ test('a locked empty key is skipped by layout (reserved hole); clearKey releases
   assert.equal(m.applyLayout(0).placed, 4);
   assert.deepEqual(tags(m, 36, 41), ['a0', 'a1', 'a2', 'a3', null, null]);
   assert.equal(m.isLocked(40), true);
-  m.setLock(37, true); // 37 holds a1: it keeps it, a1 is not placed again
-  m.setLock(38, true); // 38 holds a2
-  m.clearKey(38);      // -> releases the lock
-  m.setLock(38, true); // lock the now empty key
+  m.setLock(37, true); // 37 holds a1: it keeps it and a1 is not placed a second time
+  m.setLock(38, true);
+  m.clearKey(38);      // empties 38 and releases its lock
+  m.setLock(38, true); // now 38 is a locked empty key
   const res = m.applyLayout(0);
-  assert.deepEqual(res, { placed: 2, dropped: 0 }, 'a0 and a3 flow around the locked keys; a1 stays on its locked key');
-  assert.deepEqual(tags(m, 36, 42), ['a0', 'a1', null, 'a2', null, 'a3', null].map((x, i) => (i === 3 ? tag(m, 39) : x)));
-  assert.equal(tag(m, 37), 'a1');
-  assert.equal(tag(m, 38), null);
+  assert.deepEqual(res, { placed: 3, dropped: 0 }, 'a0, a2 and a3 flow around the locked keys');
+  assert.deepEqual(tags(m, 36, 42), ['a0', 'a1', null, 'a2', null, 'a3', null]);
+  assert.equal(m.isLocked(37), true);
   assert.equal(m.isLocked(38), true);
   assert.equal(m.isLocked(40), true);
-  assert.equal(tag(m, 41), 'a3');
 });
 
 test('mod-zone keys are skipped by layout and left empty', () => {
@@ -625,7 +623,7 @@ test('overflow past key 127 is dropped and counted', () => {
   m.setGlobal('rootKey', 100);
   m.setGlobal('modZoneStart', 110);
   m.setGlobal('modZoneOn', true);
-  assert.deepEqual(m.applyLayout(0), { placed: 10 + 6, dropped: 0 }.placed === 16 ? { placed: 12, dropped: 0 } : null);
+  assert.deepEqual(m.applyLayout(0), { placed: 12, dropped: 0 });
   assert.deepEqual(tags(m, 100, 111), Array.from({ length: 10 }, (_, i) => 'a' + i).concat([null, null]));
   assert.deepEqual(tags(m, 122, 123), ['a10', 'a11']);
 });
@@ -761,7 +759,8 @@ test('reslice to fewer slices merges former-base pads; all sources keep their ow
   assert.equal(JSON.stringify(bPads), bJson, 'other source untouched');
   assert.deepEqual(tags(m, 36, 40), ['a0', 'a1', 'b0', 'b1', 'b2']);
   const aPads = Object.keys(m.state.pads).map((k) => m.state.pads[k]).filter((p) => p.sourceId === a.id);
-  assert.equal(aPads.length, 6);
+  // every slot is auto, so the former-base pads that lost their slice are on no key any more: collected
+  assert.equal(aPads.length, 2);
   assert.equal(aPads.filter((p) => p.base).length, 2);
   checkInvariants(m);
 });
@@ -877,8 +876,10 @@ test('removeSource deletes its pads, clears keys in all slots, re-lays out auto 
     if (pid !== null) assert.ok(m.getPad(pid) && m.getPad(pid).sourceId !== b.id);
   }));
   assert.deepEqual(aPad.layers, [], 'dangling layer links are removed');
+  // slot 0 became manual through toggleLayer: it only lost the keys of b
+  assert.equal(m.state.slots[0].auto, false);
+  assert.deepEqual(tags(m, 36, 44, 0), ['a0', 'a1', 'a2', 'a3', null, null, null, 'c0', 'c1']);
   // auto slots: a then c, contiguous
-  assert.deepEqual(tags(m, 36, 42, 0), ['a0', 'a1', 'a2', 'a3', 'c0', 'c1', null]);
   assert.deepEqual(tags(m, 36, 42, 5), ['a0', 'a1', 'a2', 'a3', 'c0', 'c1', null]);
   // the manual slot only lost the keys of b
   const manual = tags(m, 0, 127, 2).filter((x) => x !== null);
@@ -1004,7 +1005,6 @@ test('locked keys and mod-zone keys are not touched by shuffle', () => {
 test("shuffle scope 'source' only moves keys of that source", () => {
   const m = bigKit();
   const a = m.listSources()[0];
-  const b = m.listSources()[1];
   const before = m.getSlotKeys(0);
   const res = m.shuffle({ scope: 'source', sourceId: a.id, seed: 11 });
   const after = m.getSlotKeys(0);
@@ -1020,7 +1020,7 @@ test("shuffle scope 'source' only moves keys of that source", () => {
   const before2 = m2.getSlotKeys(0);
   assert.equal(m2.shuffle({ scope: 'source', sourceId: b2.id, seed: 2 }).moved, 4);
   for (let k = 36; k < 44; k++) assert.equal(m2.getSlotKeys(0)[k], before2[k]);
-  assert.ok(b);
+  for (let k = 44; k < 48; k++) assert.equal(m2.getPad(m2.getSlotKeys(0)[k]).sourceId, b2.id);
 });
 
 test("shuffle scope 'source' with an unknown or missing source does nothing", () => {
@@ -1402,24 +1402,70 @@ test('addSource and removeSource clear the undo/redo history', () => {
   assert.equal(m.undo(), false);
 });
 
-test('undo restores keys, locks, auto flags and the current slot', () => {
+test('undo restores keys, auto flags and the current slot of the snapshot', () => {
   const m = mk();
   addSrc(m, 'a', 4);
   m.setCurrentSlot(2);
-  const before = stripped(m);
-  m.setLock(37, true);
-  m.swapKeys(36, 38);
-  assert.equal(m.state.slots[2].auto, false);
+  m.swapKeys(36, 38);       // step 1, taken while slot 2 is current
   m.setCurrentSlot(5);
-  m.clearKey(36);
-  m.undo(); // clearKey (slot 5)
+  m.clearKey(36);           // step 2, taken while slot 5 is current
+  assert.equal(m.state.slots[5].auto, false);
+  m.undo();
   assert.equal(m.currentSlot(), 5);
-  m.undo(); // swapKeys (taken while slot 2 was current)
+  assert.equal(m.state.slots[5].auto, true);
+  assert.equal(tag(m, 36, 5), 'a0');
+  assert.equal(tag(m, 36, 2), 'a2', 'step 1 is still applied');
+  m.undo();
   assert.equal(m.currentSlot(), 2);
-  assert.equal(tag(m, 36), 'a0');
-  assert.equal(m.isLocked(37), true, 'lock toggles are not undo steps; they live in the next snapshot');
+  assert.equal(m.state.slots[2].auto, true);
+  assert.equal(tag(m, 36, 2), 'a0');
   assert.equal(m.canUndo(), false);
-  assert.ok(before);
+  m.redo();
+  m.redo();
+  assert.equal(m.currentSlot(), 5);
+  assert.equal(tag(m, 36, 5), null);
+  assert.equal(tag(m, 36, 2), 'a2');
+  checkInvariants(m);
+});
+
+test('lock toggles are not undo steps; they travel with the next snapshot', () => {
+  const m = mk();
+  addSrc(m, 'a', 4);
+  m.setLock(37, true);
+  assert.equal(m.canUndo(), false);
+  m.swapKeys(36, 38);
+  m.undo();
+  assert.equal(m.isLocked(37), true);
+  assert.equal(m.state.slots[0].auto, false, 'the lock made the slot manual before the snapshot was taken');
+  assert.equal(tag(m, 36), 'a0');
+});
+
+test('undo/redo keep object identity for pads, slices, slots and settings that exist on both sides', () => {
+  const m = mk();
+  const s = addSrc(m, 'a', 4);
+  const pad = m.getPadOnKey(36);
+  const slice0 = s.slices[0];
+  const slicing = s.slicing;
+  const slot = m.state.slots[0];
+  m.setPadParam(pad.id, 'pitch', 5);
+  m.shuffle({ seed: 2, flipPct: 100 });
+  m.addSlicePoint(s.id, 2500); // slice 0 keeps its range, so it keeps its object
+  m.undo();
+  m.undo();
+  m.undo();
+  assert.equal(m.getPad(pad.id), pad);
+  assert.equal(pad.pitch, 0);
+  assert.equal(m.state.sources[0].slicing, slicing);
+  assert.equal(m.state.slots[0], slot);
+  assert.equal(m.getSlicesOfSource(s.id)[0], slice0);
+  assert.equal(s.slices.length, 4);
+  m.redo();
+  m.redo();
+  m.redo();
+  assert.equal(m.getPad(pad.id), pad);
+  assert.equal(pad.pitch, 5);
+  assert.equal(m.getSlicesOfSource(s.id)[0], slice0);
+  assert.equal(s.slices.length, 5);
   checkInvariants(m);
 });
 
@@ -1439,9 +1485,12 @@ test('undo re-lays out auto slots (derived data) after layout globals changed in
   m.swapKeys(36, 37);        // slot 0 manual
   m.setGlobal('rootKey', 60); // slots 1..7 now at 60
   m.undo();
-  assert.deepEqual(tags(m, 60, 62, 1), ['a0', 'a1', 'a2'], 'auto slots follow the current globals');
+  // slot 0 is auto again after the undo, so it follows the *current* globals like every other auto slot
+  assert.equal(m.state.slots[0].auto, true);
+  assert.deepEqual(tags(m, 60, 62, 0), ['a0', 'a1', 'a2']);
+  assert.deepEqual(tags(m, 60, 62, 1), ['a0', 'a1', 'a2']);
+  assert.equal(tag(m, 36, 0), null);
   assert.equal(tag(m, 36, 1), null);
-  assert.equal(tag(m, 36, 0), 'a0');
   checkInvariants(m);
 });
 
@@ -1556,7 +1605,8 @@ test('spread skips locked and mod-zone keys, stops at 127, ignores bad input', (
   assert.deepEqual(keys, [37, 39, 52, 53]);
   assert.equal(m.getPadOnKey(38), lockedPad);
   assert.deepEqual(keys.map((k) => m.getPadOnKey(k).pitch), [1, 2, 3, 4]);
-  for (let k = 40; k <= 51; k++) assert.equal(m.getPadOnKey(k), null);
+  // slot 0 is manual: the pads parked on the (new) mod-zone keys 40..43 are left alone, not overwritten
+  assert.deepEqual(tags(m, 40, 44), ['a4', 'a5', 'a6', 'a7', null]);
 
   const e = spreadKit();
   e.assignPad(126, e.getPadOnKey(36).id);
@@ -1577,9 +1627,9 @@ test('spread uses the globals for omitted arguments and accepts menu indices / f
   const m = spreadKit();
   m.setGlobal('spreadParam', 'decay');
   m.setGlobal('spreadCount', 3);
-  m.setGlobal('spreadStep', 50);
+  m.setGlobal('spreadStep', 20);
   assert.deepEqual(m.spread(36), [37, 38]);
-  assert.deepEqual([36, 37, 38].map((k) => m.getPadOnKey(k).decayMs), [300, 350, 400]);
+  assert.deepEqual([36, 37, 38].map((k) => m.getPadOnKey(k).decayMs), [300, 320, 340]);
   const m2 = spreadKit();
   assert.deepEqual(m2.spread(36, 1, 3, 10), [37, 38], 'index 1 = decay');
   assert.deepEqual([37, 38].map((k) => m2.getPadOnKey(k).decayMs), [310, 320]);
@@ -1876,7 +1926,6 @@ test('copySlot copies keys, locks and the auto flag; pads are shared; undoable',
   addSrc(m, 'a', 4);
   m.shuffle({ seed: 3 });
   m.setLock(37, true);
-  const before = stripped(m);
   assert.equal(m.copySlot(0, 3), true);
   const s0 = m.state.slots[0];
   const s3 = m.state.slots[3];
@@ -1890,8 +1939,11 @@ test('copySlot copies keys, locks and the auto flag; pads are shared; undoable',
   assert.equal(m.state.slots[4].auto, true);
   addSrc(m, 'b', 2);
   assert.equal(tag(m, 40, 4), 'b0');
-  assert.equal(tag(m, 40, 3), null === tag(m, 40, 3) ? null : tag(m, 40, 3), 'manual copy is not re-laid out');
   assert.equal(m.state.slots[3].auto, false);
+  const manualCopy = m.getSlotKeys(3);
+  m.setGlobal('rootKey', 60);
+  assert.equal(tag(m, 60, 4), 'a0', 'the auto copy follows layout globals');
+  assert.deepEqual(m.getSlotKeys(3), manualCopy, 'the manual copy does not');
   // replacing a slot overwrites everything
   m.copySlot(1, 3);
   assert.deepEqual(m.state.slots[3].locks, m.state.slots[1].locks);
@@ -1909,7 +1961,6 @@ test('copySlot copies keys, locks and the auto flag; pads are shared; undoable',
   m2.copySlot(0, 3);
   m2.undo();
   assert.deepEqual(stripped(m2), b2);
-  assert.ok(before);
 });
 
 test('copySlot of identical slots creates no undo step', () => {
@@ -1992,7 +2043,6 @@ test('moveSlicePoint moves the start of slice i, clamped between its neighbours'
   assert.deepEqual(kinds, ['all']);
   assert.deepEqual(s.slices.map((x) => [x.start, x.end]), [[0, 2000], [2000, 4500], [4500, 6000], [6000, 8000]]);
   assert.equal(s.slicing.mode, 'manual');
-  assert.equal(s.slices[0].id !== undefined, true);
   // clamped: cannot cross the neighbours
   m.moveSlicePoint(s.id, 2, 10);
   assert.equal(s.slices[2].start, 2001);
@@ -2029,12 +2079,15 @@ test('moveSlicePoint keeps unchanged slices and coalesces a drag into one undo s
   m.undo();
   assert.deepEqual(stripped(m), before);
   assert.equal(m.canUndo(), false);
-  // a different slice point starts a new step
-  m.redo();
-  m.moveSlicePoint(s.id, 1, 2100);
+  // different slice points are different undo steps
+  assert.equal(m.moveSlicePoint(s.id, 1, 2100), true);
+  assert.equal(m.moveSlicePoint(s.id, 2, 4100), true);
   m.undo();
-  assert.equal(s.slices[1].start, 2000 + 0 + (4600 === 4600 ? 0 : 0));
-  assert.equal(m.canUndo(), true);
+  assert.equal(s.slices[1].start, 2100);
+  assert.equal(s.slices[2].start, 4000);
+  m.undo();
+  assert.equal(s.slices[1].start, 2000);
+  assert.equal(m.canUndo(), false);
 });
 
 test('removeSlicePoint merges slice i into i-1', () => {
@@ -2197,13 +2250,13 @@ test('clearKey / swapKeys / assignPad', () => {
 
 test('clearKey of a base pad keeps the pad alive (other slots, relayout)', () => {
   const m = mk();
-  const a = addSrc(m, 'a', 3);
+  addSrc(m, 'a', 3);
   const pad = m.getPadOnKey(36);
   m.clearKey(36);
   assert.equal(m.getPad(pad.id), pad);
+  assert.equal(m.getPadOnKey(36, 1), pad);
   m.applyLayout(0);
   assert.equal(m.getPadOnKey(36), pad);
-  assert.ok(a);
 });
 
 test('getSlotKeys returns a copy; setCurrentSlot clamps and notifies', () => {
@@ -2260,7 +2313,7 @@ test('auto slots follow structural changes, manual slots do not; new slots start
   const manual = m.getSlotKeys(1);
   addSrc(m, 'b', 2);
   assert.deepEqual(tags(m, 36, 41, 0), ['a0', 'a1', 'a2', 'b0', 'b1', null]);
-  assert.deepEqual(m.getSlotKeys(1).slice(36, 40), manual.slice(36, 40));
+  assert.deepEqual(m.getSlotKeys(1).slice(36, 39), manual.slice(36, 39), 'existing keys keep their pads');
   assert.equal(tag(m, 39, 1), 'b0', 'but new pads are appended to the manual slot');
   assert.equal(tag(m, 40, 1), 'b1');
   assert.equal(m.state.slots[1].auto, false);
@@ -2400,8 +2453,7 @@ test('only layout-affecting globals re-lay out, and only auto slots', () => {
     const kinds = record(m);
     m.setGlobal(name, value);
     const changed = JSON.stringify(prev) !== JSON.stringify(m.getSlotKeys(0));
-    assert.equal(kinds[0], name === 'zoneAlign' || name === 'sortBy' || name === 'modZoneStart' ? kinds[0] : kinds[0]);
-    assert.ok(kinds.length === 1 && kinds[0] === 'all', name + ' notifies all (globals + map): ' + kinds);
+    assert.deepEqual(kinds, ['all'], name + ' notifies once with all (globals + map)');
     if (name === 'rootKey' || name === 'layout') assert.ok(changed, name + ' changes the layout');
     assert.deepEqual(m.getSlotKeys(4), manual, name + ' leaves the manual slot alone');
   });
@@ -2757,7 +2809,8 @@ test('integration with the real features module (smart shuffle, similar swap, fi
 // ---------------------------------------------------------------- fuzz: invariants + undo exactness
 
 test('random operation sequences keep every invariant and every undoable op is exactly undoable', () => {
-  for (const seed of [1, 2, 3]) {
+  const checked = {};
+  for (const seed of [1, 2, 3, 4]) {
     const m = mk();
     const rng = prng.mulberry32(seed * 1000 + 7);
     const R = (n) => prng.randInt(rng, n);
@@ -2765,7 +2818,15 @@ test('random operation sequences keep every invariant and every undoable op is e
       addSrc(m, 'b', 5, (i) => feat(500 + i * 700, -25 + i * 2, 80 + i * 10)),
       addSrc(m, 'c', 7, (i) => feat(2000 + i * 100, -40 + i * 5, 120 + i * 5))];
     const slotPick = () => R(8);
-    const keyPick = () => 30 + R(40);
+    // mostly occupied keys of the current slot (so ops have something to act on), sometimes any key
+    const keyPick = () => {
+      const occ = m.occupiedKeys();
+      return occ.length && R(4) ? occ[R(occ.length)] : 30 + R(40);
+    };
+    const refreshFeatures = () => {
+      const s = srcs[R(srcs.length)];
+      m.setSliceFeatures(s.id, s.slices.map((_, i) => feat(100 * (i + 1) + R(50), -R(40), 50 + R(100))));
+    };
     const paramNames = ['pitch', 'fine', 'gainDb', 'attackMs', 'decayMs', 'sustain', 'releaseMs', 'startOffsetMs', 'loopOn', 'loopSizeMs', 'loopPos', 'cutoffHz', 'drive', 'reverse'];
     const anyPad = () => {
       const ids = padIds(m);
@@ -2802,8 +2863,10 @@ test('random operation sequences keep every invariant and every undoable op is e
         else if (pick === 3) m.setGlobal('sortBy', ['brightness', 'loudness', 'length'][R(3)]);
         else if (pick === 4) m.setGlobal('modZoneOn', R(2));
         else if (pick === 5) m.setGlobal('modZoneStart', R(117));
-        else m.setSliceFeatures(anySrc().id, anySrc().slices.map(() => null).concat([]).slice(0, 0).length ? [] : m.getSlicesOfSource(srcs[0].id).map((_, i) => feat(100 * (i + 1), -i)));
+        else refreshFeatures();
       }, false],
+      ['refreshFeatures', refreshFeatures, false],
+      ['refreshFeatures', refreshFeatures, false],
       ['undo', () => m.undo(), false],
       ['redo', () => m.redo(), false]
     ];
@@ -2816,6 +2879,7 @@ test('random operation sequences keep every invariant and every undoable op is e
       if (checkable) {
         const after = stripped(m);
         if (JSON.stringify(after) !== JSON.stringify(before)) {
+          checked[name] = (checked[name] || 0) + 1;
           assert.equal(m.canUndo(), true, name + ' changed state without an undo step (iteration ' + i + ')');
           assert.equal(m.undo(), true);
           assert.deepEqual(stripped(m), before, name + ' undo is exact (seed ' + seed + ', iteration ' + i + ')');
@@ -2830,6 +2894,11 @@ test('random operation sequences keep every invariant and every undoable op is e
     const j = m.toJSON();
     assert.deepEqual(Model.fromJSON(j, { features: fakeFeatures() }).toJSON(), j);
   }
+  // the fuzz must really have exercised every undoable operation
+  ['shuffle', 'spread', 'swapSimilar', 'duplicatePad', 'toggleLayer', 'swapKeys', 'clearKey', 'assignPad', 'copySlot',
+    'applyLayout', 'findBest', 'applyParamToSource', 'addSlicePoint', 'removeSlicePoint'].forEach((name) => {
+    assert.ok(checked[name] >= 3, name + ' was only undo-checked ' + (checked[name] || 0) + ' times: ' + JSON.stringify(checked));
+  });
 });
 
 // ---------------------------------------------------------------- performance
@@ -2873,6 +2942,129 @@ test('getPadOnKey / getSlice stay cheap (engine hot path)', () => {
   }
   assert.equal(hits, 20000);
   assert.ok(Date.now() - t0 < 5000);
+});
+
+// ---------------------------------------------------------------- misc behaviours
+
+test('two models are fully independent (no shared mutable module state)', () => {
+  const m1 = mk();
+  const m2 = mk();
+  addSrc(m1, 'a', 4);
+  m1.setGlobal('rootKey', 10);
+  m1.setPadParam(m1.getPadOnKey(10).id, 'pitch', 3);
+  assert.deepEqual(m2.listSources(), []);
+  assert.equal(m2.globals().rootKey, 36);
+  assert.deepEqual(m2.state.pads, {});
+  assert.equal(m2.state.nextId, 1);
+  assert.equal(m2.canUndo(), false);
+  const kinds = record(m2);
+  m1.setGlobal('velSens', 1);
+  assert.deepEqual(kinds, []);
+  assert.notEqual(m1.globals(), m2.globals());
+  assert.notEqual(m1.state.slots[0].keys, m2.state.slots[0].keys);
+});
+
+test('boolean inputs from a Max dict round trip (1/0, "true"/"false") are understood', () => {
+  const m = mk();
+  addSrc(m, 'a', 3);
+  const p = m.getPadOnKey(36);
+  ['true', 1, '1', true].forEach((v) => {
+    m.setPadParam(p.id, 'reverse', v);
+    assert.equal(p.reverse, true, String(v));
+    m.setPadParam(p.id, 'reverse', false);
+  });
+  ['false', 0, '0', false].forEach((v) => {
+    m.setPadParam(p.id, 'loopOn', true);
+    m.setPadParam(p.id, 'loopOn', v);
+    assert.equal(p.loopOn, false, String(v));
+  });
+  assert.equal(m.setGlobal('zoneAlign', 'true'), true);
+  assert.equal(m.globals().zoneAlign, true);
+  m.setGlobal('zoneAlign', 'false');
+  assert.equal(m.globals().zoneAlign, false);
+  const j = m.toJSON();
+  j.pads[p.id].base = 1;
+  j.pads[p.id].reverse = 0;
+  j.slots[0].auto = 0;
+  j.slots[1].auto = 'false';
+  j.slots[2].auto = 1;
+  j.slots[0].locks[3] = 1;
+  j.slots[0].locks[4] = 'false';
+  j.sources[0].slicing.snap = 0;
+  j.globals.modZoneOn = 1;
+  const r = Model.fromJSON(j);
+  assert.equal(r.getPad(p.id).base, true);
+  assert.equal(r.getPad(p.id).reverse, false);
+  assert.deepEqual(r.state.slots.slice(0, 3).map((x) => x.auto), [false, false, true]);
+  assert.equal(r.state.slots[0].locks[3], true);
+  assert.equal(r.state.slots[0].locks[4], false);
+  assert.equal(r.state.sources[0].slicing.snap, false);
+  assert.equal(r.globals().modZoneOn, true);
+});
+
+test('slicing settings alone are not an undo step; the reslice that follows is, with the settings', () => {
+  const m = mk();
+  const s = addSrc(m, 'a', 4);
+  m.setSourceSettings(s.id, { sensitivity: 70 });
+  m.setSourceSettings(s.id, { playMode: 'poly' });
+  assert.equal(m.canUndo(), false);
+  m.setSlices(s.id, ranges(4));
+  m.undo();
+  assert.equal(s.slicing.sensitivity, 50, 'sensitivity is part of the reslice step');
+  assert.equal(s.playMode, 'poly', 'playMode is not part of any undo step');
+  // an unrelated edit in between invalidates the remembered pre-change state
+  m.setSourceSettings(s.id, { sensitivity: 20 });
+  m.swapKeys(36, 37);
+  m.setSlices(s.id, ranges(3));
+  m.undo();
+  assert.equal(s.slices.length, 4);
+  assert.equal(tag(m, 36), 'a1', 'the swap is still applied');
+  m.undo();
+  assert.equal(tag(m, 36), 'a0');
+});
+
+test('reslices of different sources are separate undo steps; unknown source is refused', () => {
+  const m = mk();
+  const a = addSrc(m, 'a', 4);
+  const b = addSrc(m, 'b', 4);
+  m.setSlices(a.id, ranges(3));
+  m.setSlices(b.id, ranges(5));
+  m.setSlices(b.id, ranges(6));
+  assert.equal(m.setSlices(31337, ranges(2)), false);
+  m.undo();
+  assert.equal(b.slices.length, 4, 'both reslices of b coalesce');
+  assert.equal(a.slices.length, 3);
+  m.undo();
+  assert.equal(a.slices.length, 4);
+  assert.equal(m.canUndo(), false);
+});
+
+test('applyLayout / getSlotKeys / occupiedKeys clamp odd slot arguments', () => {
+  const m = mk();
+  addSrc(m, 'a', 2);
+  assert.deepEqual(m.applyLayout(99), { placed: 2, dropped: 0 });
+  assert.deepEqual(m.occupiedKeys(-5), [36, 37]);
+  assert.deepEqual(m.getSlotKeys('x'), m.getSlotKeys(0));
+  assert.equal(m.state.slots[7].auto, true);
+});
+
+test('pads referenced as layers stay reachable for the engine after their key is cleared', () => {
+  const m = mk();
+  addSrc(m, 'a', 3);
+  m.duplicatePad(36, 60);
+  const layered = m.getPadOnKey(60);
+  m.toggleLayer(37, 60);
+  m.clearKey(60);
+  const owner = m.getPadOnKey(37);
+  assert.equal(m.getPad(owner.layers[0]), layered);
+  m.shuffle({ seed: 1, flipPct: 100 });
+  // every pad in the slot is now a flipped copy; the copy of the owner keeps the layer link
+  const holders = m.getSlotKeys(0).filter((id) => id !== null).map((id) => m.getPad(id)).filter((p) => p.sliceId === owner.sliceId);
+  assert.equal(holders.length, 1);
+  assert.equal(holders[0].base, false);
+  assert.deepEqual(holders[0].layers, [layered.id]);
+  assert.equal(m.getPad(layered.id), layered);
+  checkInvariants(m);
 });
 
 // ---------------------------------------------------------------- ES5 conformance
