@@ -175,6 +175,15 @@ test('detectTransients: silence and tiny inputs give [0]', () => {
   assert.deepEqual(S.detectTransients(new Float32Array(SR).map(() => 0.5), SR, { sensitivity: 100 }), [0]);
 });
 
+test('detectTransients: stationary tones are not sliced (no phase-ripple false onsets)', () => {
+  for (const [f, amp] of [[100, 0.9], [440, 0.5], [1000, 0.99], [5000, 0.7]]) {
+    const x = new Float32Array(5 * SR);
+    for (let i = 0; i < x.length; i++) x[i] = amp * Math.sin(2 * Math.PI * f * i / SR + 0.3);
+    assert.deepEqual(S.detectTransients(x, SR, { sensitivity: 100 }), [0], `${f} Hz`);
+  }
+  assert.equal(S.estimateBpm(new Float32Array(5 * SR).map((_, i) => 0.5 * Math.sin(i * 0.06)), SR), null);
+});
+
 test('detectTransients: clicks are found within 5 ms, first point is 0, output is sorted unique ints', () => {
   const times = [0.3, 0.8, 1.3, 1.9, 2.4, 3.1, 3.5];
   const x = silence(4);

@@ -101,7 +101,7 @@ function onsetFunction(mono, sr, opts) {
   var lb = new Float64Array(bins);
   var mask = N - 1;
   var peak = 0;
-  var f, i, k, k2, s, avail, flux, d, x, y, ar, ai, br, bi, tmp;
+  var f, i, k, k2, s, avail, flux, d, ar, ai, br, bi, tmp;
 
   // Two real frames are transformed with one complex FFT: frame f in the real
   // part, frame f+1 in the imaginary part, then split by symmetry.
