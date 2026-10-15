@@ -109,7 +109,7 @@ end of its own sample, whatever the keyboard layout.
 |---|---|
 | sample tabs | click: select the sample |
 | waveform | click: select slice · Shift-click: add a slice point · Alt-click a marker: remove it · drag a marker: move it |
-| key strip | click: select key · Shift-click: audition · Cmd/Ctrl-click: lock / unlock · ‹ › : scroll by octave |
+| key strip | click: select key · Shift-click: audition · Cmd/Ctrl-click: lock / unlock · drag onto another key: swap · ‹ › : scroll by octave |
 
 ### v2 controls
 

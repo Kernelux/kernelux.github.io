@@ -15,6 +15,13 @@
  *     moveslice <i> <frame>  removeslice <i>   lock <key>
  *     swap <fromKey> <toKey>   (drag a key onto another key)
  *
+ * Keyboard mouse: a plain press selects the key at once (selectkey); dragging
+ * it onto a different key and releasing there sends `swap` (the target and
+ * source are highlighted and the status line reads "swap C3 -> D3"); releasing
+ * on the same key or off the strip cancels.  While dragging, hovering a < >
+ * arrow scrolls the window an octave per HOVER_MS.  Shift-press (audition) and
+ * cmd/ctrl-press (lock) never swap.
+ *
  * Besides the fields documented in PROTOCOL.md the view may carry
  *     selectedFrames   frame count of the selected source (needed to turn a
  *                      normalized waveform position into addslice/moveslice
@@ -903,10 +910,10 @@ function scrollTick() {
     if (!drag || drag.type !== 'swap' || !drag.hover) {
         return;
     }
-    var before = winStart;
     shiftWindow(drag.hover);
     drag.hoverAt = Date.now();
-    if (winStart !== before) {
+    /* keep scrolling only while there is somewhere left to go */
+    if (shiftedWinStart(winStart, drag.hover) !== winStart) {
         drag.timer = startScroll();
     }
 }
@@ -940,14 +947,19 @@ function swapText(from, to) {
     return 'swap ' + noteName(from) + ' \u2192 ' + (to >= 0 ? noteName(to) : '?');
 }
 
-function dragSwap(x, y) {
+/* has the pointer travelled far enough from the press to count as a drag? (sticky) */
+function swapMoved(x, y) {
     if (!drag.moved) {
         var dx = x - drag.x0;
         var dy = y - drag.y0;
-        if (dx * dx + dy * dy < SWAP_THRESHOLD * SWAP_THRESHOLD) {
-            return;
-        }
-        drag.moved = true;
+        drag.moved = dx * dx + dy * dy >= SWAP_THRESHOLD * SWAP_THRESHOLD;
+    }
+    return drag.moved;
+}
+
+function dragSwap(x, y) {
+    if (!swapMoved(x, y)) {
+        return;
     }
     var hit = hitTest(layout, view, winStart, x, y);
     var target = (hit.zone === 'key' && hit.key !== drag.key) ? hit.key : -1;
@@ -963,7 +975,7 @@ function dragSwap(x, y) {
 /* releasing on another key swaps; anywhere else (same key, arrows, outside) cancels */
 function releaseSwap(x, y) {
     stopScroll();
-    if (!drag.moved) {
+    if (!swapMoved(x, y)) {
         return;
     }
     var hit = hitTest(layout, view, winStart, x, y);

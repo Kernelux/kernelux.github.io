@@ -93,14 +93,14 @@ Select drums.wav for these steps. The Sources list row shows the slice count.
 
 Select drums.wav.
 
-21. Without changing the mode, click in the waveform between two existing cuts to add a
+21. Without changing the mode, Shift-click in the waveform between two existing cuts to add a
     cut.
     Expected: the mode switches to Manual, the existing cuts stay, a new cut appears, the
     slice count goes up by one, and the new slice has a key.
 22. Drag one cut left, then right.
     Expected: the cut moves. It cannot pass the cut next to it. The two slices on
     either side change length.
-23. Select a cut and remove it.
+23. Select a cut and Alt-click it (Option-click on a Mac) to remove it.
     Expected: the two slices merge and the slice count goes down by one. No error. The
     keys that played the removed slice still make sound.
 24. Set mode to Transient. Select key 36 and turn Reverse on. Change sensitivity to 70 %.
@@ -303,7 +303,8 @@ Use slot A, which is auto. Undo any earlier changes first.
 79. Select a key with a pad.wav sound (for example, a key in the middle of the pad.wav
     block). Press Sim › three times.
     Expected: the key plays a different slice that sounds similar in length, loudness and
-    brightness. Its pitch, envelope and Reverse settings stay the same.
+    brightness. Its pitch, envelope and Reverse settings stay the same. The key now holds a
+    copy of the pad (not a base pad), and the base pad keeps its own slice.
 80. Press ‹ Sim three times.
     Expected: the key returns to its original slice. Pressing ‹ Sim again does nothing.
 
@@ -323,7 +324,7 @@ Use slot A, which is auto. Undo any earlier changes first.
 84. Set Chaos to 50 %. Play the same key twenty times.
     Expected: about half the hits play a different slice. The mix changes from hit to hit.
 85. Set Chaos to 100 %. Play the same key ten times.
-    Expected: every hit plays a different slice.
+    Expected: every hit plays a different pad from the current map.
 86. Set Chaos back to 0 %. Draw an automation ramp from 0 to 100 % over four bars, with
     notes playing on the key.
     Expected: the hits get more random as the ramp rises.
@@ -350,7 +351,8 @@ Set the tempo back to 120 BPM for the next steps.
 
 92. Start the transport. Set Rate to 1/16 and Swing to 50 %. Hold a key across one bar.
     Expected: every second repeat is late, giving a long-short pattern rather than even
-    spacing. Set Swing to 0 %.
+    spacing. At 50 % the second repeat of each pair lands 62.5 % of the way through the pair.
+     Set Swing to 0 %.
 93. Set Swing to 0 %, Rate to 1/8, and turn Alt on. Use a pad.wav key with Reverse off.
     Hold it for one bar.
     Expected: each repeat plays in the opposite direction to the one before. Turn Alt off.
@@ -411,7 +413,8 @@ Skip this section if you have no keyboard or controller with aftertouch.
      the Repeat settings. No error lines in the Max Console.
 107. Move drums.wav to another folder. Reopen the Live Set.
      Expected: the drums source shows as not loaded. The other sources still work. Move the
-     file back and drop it into the device again to restore it.
+     file back and drop it into the device again to restore it. Dropping it again re-links the
+     existing drums source; no new source is added.
 108. Use File > Collect All and Save. Move the whole project folder somewhere else and
      reopen the set.
      Expected: all samples load, and none are reported missing.
@@ -449,7 +452,7 @@ Skip this section if you have no keyboard or controller with aftertouch.
 
 ## 24. Capture (skip-back)
 
-Groups 24 to 31 test v2. Start them with a fresh Set: one SliceKit on an empty MIDI
+Groups 24 to 32 test v2. Start them with a fresh Set: one SliceKit on an empty MIDI
 track, with drums.wav, pad.wav and word.wav loaded (as in group 2). Group 23 fills all
 16 source slots, and a capture needs a free one. Capture records what this device plays,
 so keep drums.wav sounding during these steps.
@@ -458,7 +461,7 @@ so keep drums.wav sounding during these steps.
      keys) with the transport running for about 10 seconds, then press **Capture**.
      Expected: about 0.3 seconds later a new source appears in the Sources list, named
      SliceKit Capture followed by a date and time. Its keys are filled after the other
-     sources. The status line reads Captured 2 bars, followed by the name.
+     sources. The status line reads Captured 2 Bars → <file name>.
 118. Find the capture file in the folder that holds SliceKit.amxd. Play it in Finder or a
      player.
      Expected: a file named SliceKit Capture YYYYMMDD-HHMMSS.wav is there. It is stereo,
@@ -492,7 +495,7 @@ the menu items are easy to tell apart.
      Load pad.wav into it, in Classic mode.
      Expected: the Simpler sits in the rack's chain. No error lines in the Max Console.
 125. In SliceKit, press **Find Simplers**, then open the Simpler menu.
-     Expected: the menu lists Track Drums / Simpler and Track Rack / Simpler. The Simpler
+     Expected: the menu lists Track Drums / Simpler and Track Rack / <chain name> / Simpler. The Simpler
      inside the rack is listed.
 126. Choose Track Drums / Simpler.
      Expected: a new source named drums.wav appears. Its cut marks match the Simpler's slice
@@ -624,7 +627,8 @@ like.
      Expected: each key plays a slice that is not its own. Set Scan back to 0 %.
 155. Hold a pad.wav key for about 3 seconds with Scan at 0 %. While it is still held, move
      Scan to 50 %.
-     Expected: the held note changes to a different slice at once. No new hit starts, and the
+     Expected: the held note jumps to the new slice at once. Its playhead moves into the new slice
+     and its envelope carries on. No new hit starts, and the
      attack does not repeat.
 156. Set Repeat on at 1/16 and Scan to 0 %, with the transport playing. Hold a pad.wav key.
      Over about 8 bars, move Scan slowly from 0 to 100 %. Then set Repeat off.
@@ -686,6 +690,73 @@ Transport playing. Keep clip starts off.
      length is 2 Bars, and the gestures are at their defaults (Build, Rise, Drop, Fade). Its pads
      sound as before. If the Set has Mods on and pads on keys 108 to 111, those pads are now
      gesture keys and make no sound. Turn Mods off to play them.
+
+## 32. v2 behaviours from the completeness audit
+
+Use the Set from group 31, or a fresh Set with drums.wav, pad.wav and word.wav loaded.
+
+171. Click key 36. Shift-click key 40 and hold the mouse button for one second. Cmd-click
+     (Ctrl-click on Windows) key 44, then Cmd-click it again.
+     Expected: the plain click selects key 36, and the PAD panel shows its pad, with no sound.
+     Shift-click plays key 40 for as long as the button is held, then it stops. The first
+     Cmd-click locks key 44 (its lock mark shows). The second unlocks it.
+172. Drag key 36 onto key 40. Then drag key 40 back onto key 36.
+     Expected: the pads on keys 36 and 40 swap, and the selection moves to the target key each
+     time. After the second drag the map is as it was before step 172. Keep clip is off, so no
+     clip changes.
+173. Turn Keep clip on. Put a note on key 36 in a clip and play the clip briefly. Drag key 36
+     onto key 40, then press Undo.
+     Expected: after the drag, the note moves to key 40, because its pad now sits there. Undo
+     moves the note back to key 36.
+174. Select a key with a base pad (the default pad of its slice) and press Sim › once. Then
+     press Undo.
+     Expected: the key plays the next similar slice. The key now holds a copy (a non-base pad),
+     and the original base pad keeps its own slice. Undo removes the copy, and the key plays
+     its original pad again.
+175. Copy slot A to B. On slot B, clear keys so that only 8 pads are left (for example, clear
+     every key above the eighth pad). Set Chaos to 100 % and select slot B. Play key 36 ten
+     times, then set Chaos back to 0 %.
+     Expected: every hit plays one of the 8 pads on slot B. No hit plays a sound that exists
+     only on slot A.
+176. Find the controls by panel: the slot tabs in PERFORM; Mods and Mod start in KIT; Layer,
+     Dup, Spread and ‹ Sim › in PAD; Reslice and Remove in SAMPLE; Clear in PAD.
+     Expected: each control is where the panel list in section 3 says.
+177. Set Vel sens to 0 %. Play a key softly, then hard. Set Vel sens to 100 % and do the same.
+     Expected: at 0 % the soft and hard hits play at the same level. At 100 % a soft hit is much
+     quieter than a hard one.
+178. Select drums.wav and press Reslice without changing any setting.
+     Expected: the slices stay the same, and every key keeps its pad. No new source is added.
+179. Select word.wav and press Remove. Then drop word.wav into the device again.
+     Expected: Remove deletes the source and clears its keys in every slot. Dropping the file again
+     adds it as a new source, with its keys after the others. The re-link rule of step 107 applies
+     only to a sample whose file was missing.
+180. Select a key with a pad and press Clear.
+     Expected: the key is empty in the current slot. Other slots keep their pads. Undo restores the pad.
+181. Look at the colours in the Sources list.
+     Expected: each sample's colour matches its slot number from the palette (the first sample is
+     red, slot 0). No control changes it.
+182. Set Slice mode to Beat, BPM 120, division 1/16, on a file at least 20 seconds long (for
+     example, a long loop).
+     Expected: exactly 128 slices. The status line reads "Limited to 128 slices".
+183. Starting from the result of step 182, switch to Manual and Shift-click the waveform once more.
+     Expected: the new cut is not added, and the status line reads "Limited to 128 slices".
+184. Set Snap on. Shift-click the waveform to add a cut in the middle of drums.wav, then play the
+     new slice from its start. Turn Snap off and repeat.
+     Expected: with Snap on, the slice starts without a click. With Snap off, the cut stays where
+     you clicked.
+185. Hold a pad.wav key for 1.5 seconds with Mods on. While it sounds, hold key 103 (reverse) for
+     about 0.5 seconds, then release it.
+     Expected: the hit turns around at the moment you press key 103. It plays backwards from where
+     it was, without restarting. When you release key 103, it turns forward again from where it is.
+186. Set Repeat off. Hold a drums key (Trigger mode) for about 2 seconds, past the end of its hit.
+     While it is still held, press key 97 (repeat 1/8).
+     Expected: the hit that had already finished starts again and repeats at 1/8 until you release
+     the key. Release it: the repeats stop.
+187. Use Poly sources with long decay (for example, pad.wav with Decay 3000 ms, Trigger mode).
+     Hold 16 keys so that 16 voices sound. Release one key; its voice keeps sounding, because
+     Trigger mode lets the hit finish. Then press a 17th key while the other 15 are still held.
+     Expected: the new hit takes the released voice, which is no longer held. The 15 held notes
+     all keep sounding. No stuck notes after all keys are released.
 
 ---
 

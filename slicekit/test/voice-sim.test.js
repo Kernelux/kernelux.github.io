@@ -742,6 +742,252 @@ test('repeat: kill ends a waiting voice at once; unheld trigger voices still end
 });
 
 // ---------------------------------------------------------------------------
+// jump / redir (Scan switches a held note's slice, Reverse turns a hit around)
+// ---------------------------------------------------------------------------
+
+/** two distinct plateaus: A = 0.2 in [0, 10000), B = 0.8 in [20000, 30000), silence elsewhere */
+function plateauBuffer() {
+  const b = new Float32Array(40000);
+  b.fill(0.2, 0, 10000);
+  b.fill(0.8, 20000, 30000);
+  return { channels: [b], sr: SR };
+}
+
+/** play a script on a sim and collect left / pos / env / active (concatenated) */
+function playFull(sim, script, total, phaseFn) {
+  const out = {
+    left: new Float32Array(total), active: new Float32Array(total),
+    pos: new Float64Array(total), env: new Float64Array(total)
+  };
+  const ev = script.slice().sort((a, b) => a.at - b.at);
+  let t = 0, ei = 0;
+  while (t < total) {
+    while (ei < ev.length && ev[ei].at <= t) {
+      Object.keys(ev[ei].set).forEach(k => sim.set(k, ev[ei].set[k]));
+      ei++;
+    }
+    const until = Math.min(total, ei < ev.length ? ev[ei].at : total);
+    const len = Math.max(1, until - t);
+    const r = sim.process(len, phaseFn);
+    out.left.set(r.left, t); out.active.set(r.active, t); out.pos.set(r.pos, t); out.env.set(r.env, t);
+    t += len;
+  }
+  return out;
+}
+
+test('jump: a sounding hit moves to the new slice with the 1 ms declick; envelope and activity are not restarted', () => {
+  const sim = make(plateauBuffer(), { pstart: 1000, pend: 9000, held: 1, att: 5, dec: 20, sus: 0.5, amp: 1 });
+  const r = playFull(sim, [
+    { at: 0, set: { trig: 1 } },
+    { at: 3000, set: { pstart: 21000, pend: 29000, jump: 1 } }
+  ], 3400);
+  const j = eventsOf(sim, 'jump');
+  assert.equal(j.length, 1);
+  assert.equal(eventsOf(sim, 'start').length, 1, 'no second start: the hit was not restarted');
+  const lag = j[0].n - 3000;
+  assert.ok(lag >= 44 && lag <= 47, 'the move happens after the ~1 ms fade-out: ' + lag);
+  // old material fades out, the playhead then sits at the new start and the new material fades in
+  close(r.left[2990], 0.1, 1e-6, 'old plateau at sustain 0.5 (0.2 * 0.5)');
+  assert.equal(r.left[3000 + lag - 1], 0, 'silent at the jump instant');
+  assert.equal(r.pos[3000 + lag], 21000);
+  assert.ok(r.pos[3000 + lag - 1] >= 3999 && r.pos[3000 + lag - 1] < 4100, 'old slice played on during the fade-out');
+  close(r.left[3000 + lag + 80], 0.4, 1e-6, 'new plateau at sustain 0.5 (0.8 * 0.5)');
+  for (let n = 3000; n < 3000 + lag - 1; n++) { assert.ok(r.left[n + 1] <= r.left[n] + 1e-9, 'monotonic fade-out at ' + n); }
+  for (let n = 3000 + lag; n < 3000 + lag + 44; n++) { assert.ok(r.left[n + 1] >= r.left[n] - 1e-9, 'monotonic fade-in at ' + n); }
+  assert.ok(maxStep(r.left, 2900, 3400) < 0.012, 'no click: max step ' + maxStep(r.left, 2900, 3400));
+  // the envelope neither restarts nor dips: sustain level all the way, voice active all the way
+  for (let n = 2500; n < 3400; n++) {
+    assert.ok(Math.abs(r.env[n] - 0.5) < 1e-12, 'envelope untouched at ' + n);
+    assert.equal(r.active[n], 1);
+  }
+  // for contrast: a trig at the same moment does restart the envelope (attack from 0)
+  const sim2 = make(plateauBuffer(), { pstart: 1000, pend: 9000, held: 1, att: 5, dec: 20, sus: 0.5 });
+  const r2 = playFull(sim2, [
+    { at: 0, set: { trig: 1 } }, { at: 3000, set: { pstart: 21000, pend: 29000, trig: 2 } }
+  ], 3400);
+  assert.ok(r2.env[3000 + lag + 10] < 0.2, 'trig restarts the attack: ' + r2.env[3000 + lag + 10]);
+});
+
+test('jump: loop region, direction toggle (rptalt) and repeat grid - loop is re-latched, the other two are kept', () => {
+  // micro-loop: the new loop region is in the new slice
+  let sim = make(rampBuffer(40000), { pstart: 1000, pend: 9000, loopon: 1, loopsize: 500, looppos: 0.5, held: 1 });
+  let r = playFull(sim, [
+    { at: 0, set: { trig: 1 } },
+    { at: 5000, set: { pstart: 21000, pend: 29000, jump: 1 } }
+  ], 9000);
+  const jn = eventsOf(sim, 'jump')[0];
+  assert.equal(jn.looping, 1);
+  assert.equal(r.pos[jn.n], 21000 + 0.5 * (8000 - 500), 'playhead at the new loop start');
+  for (let n = jn.n; n < 9000; n++) { assert.ok(r.pos[n] >= 24750 && r.pos[n] < 25250, 'inside the new loop region at ' + n + ': ' + r.pos[n]); }
+  for (let n = 3000; n < jn.n; n++) { assert.ok(r.pos[n] >= 4750 && r.pos[n] < 5250, 'inside the old loop region before'); }
+  assert.ok(eventsOf(sim, 'wrap').length > 8);
+
+  // repeat grid: lines fall on the same samples with and without a jump
+  const spb = 22050;
+  const base = { pstart: 1000, pend: 15000, rptdiv: 4, held: 1, playing: 1 };
+  const plain = make(rampBuffer(40000), base);
+  playFull(plain, [{ at: 0, set: { trig: 1 } }], spb, hostPhase(spb, 0));
+  sim = make(rampBuffer(40000), base);
+  r = playFull(sim, [
+    { at: 0, set: { trig: 1 } },
+    { at: 7000, set: { pstart: 20000, pend: 30000, jump: 1 } }
+  ], spb, hostPhase(spb, 0));
+  assert.deepEqual(eventsOf(sim, 'line').map(e => e.n), eventsOf(plain, 'line').map(e => e.n), 'grid not reset by the jump');
+  assert.equal(eventsOf(sim, 'jump').length, 1);
+
+  // rptalt: the toggle state is kept - a hit that plays mirrored keeps playing mirrored after the jump
+  sim = make(rampBuffer(40000), { pstart: 1000, pend: 15000, rptdiv: 4, rptalt: 1, held: 1, playing: 1 });
+  r = playFull(sim, [
+    { at: 0, set: { trig: 1 } },
+    { at: 7000, set: { pstart: 2000, pend: 12000, jump: 1 } }
+  ], spb, hostPhase(spb, 0));
+  const st = eventsOf(sim, 'start').map(e => e.n);
+  const jm = eventsOf(sim, 'jump')[0];
+  assert.deepEqual(eventsOf(sim, 'start').map(e => e.sdir), [1, -1, 1, -1], 'alternation continues undisturbed');
+  assert.ok(jm.n > 7000 && jm.n < st[2], 'jump while the 2nd (mirrored) hit sounds');
+  assert.equal(jm.sdir, -1, 'still mirrored');
+  assert.equal(r.pos[jm.n], 12000, 'mirrored hit starts at the new pend');
+  assert.ok(r.pos[jm.n + 10] < r.pos[jm.n + 9], 'and runs backwards');
+});
+
+test('jump while waiting between repeats or idle only remembers the counter; kill / trig / repeat line pending take over', () => {
+  const spb = 22050;
+  // waiting between repeats: nothing to move, the next repeat plays the new slice
+  let sim = make(rampBuffer(40000), { pstart: 1000, pend: 1500, rptdiv: 4, held: 1, playing: 1 });
+  let r = playFull(sim, [
+    { at: 0, set: { trig: 1 } },
+    { at: 3000, set: { pstart: 20000, pend: 21000, jump: 1 } }
+  ], spb, hostPhase(spb, 0));
+  assert.equal(eventsOf(sim, 'jump').length, 0, 'no move while waiting');
+  assert.equal(eventsOf(sim, 'jumpreq').length, 0);
+  for (let n = 700; n < 5500; n++) { assert.equal(r.active[n], 1, 'stays active (waiting) ' + n); assert.equal(r.left[n], 0); }
+  const s = eventsOf(sim, 'start').map(e => e.n);
+  assert.deepEqual(s, [0, 5513, 11025, 16538], 'repeats on the grid');
+  assert.equal(r.pos[5513], 20000, 'next repeat plays the new slice');
+
+  // idle: nothing happens at all; the counter is remembered
+  sim = make(rampBuffer(40000), { pstart: 3000, pend: 4000 });
+  sim.set('jump', 5);
+  let q = sim.process(500);
+  assert.ok(q.active.every(v => v === 0) && q.left.every(v => v === 0));
+  assert.equal(sim.events.length, 0);
+  sim.set('trig', 1);
+  q = sim.process(100);
+  assert.equal(q.pos[0], 3000, 'a later trig starts normally from pstart');
+  sim.set('jump', 5);
+  sim.set('pstart', 7000);
+  sim.process(200);
+  assert.equal(eventsOf(sim, 'jump').length, 0, 'the same counter value is no change');
+  sim.set('jump', 6);
+  sim.process(200);
+  assert.equal(eventsOf(sim, 'jump').length, 1, 'a changed counter value moves the hit');
+  // trig and jump in the same vector on an idle voice: the trig starts the hit, the jump is ignored
+  sim = make(rampBuffer(40000), { pstart: 3000, pend: 6000, jump: 0 });
+  sim.set('jump', 1);
+  sim.set('trig', 1);
+  sim.process(200);
+  assert.equal(eventsOf(sim, 'start').length, 1);
+  assert.equal(eventsOf(sim, 'jump').length, 0);
+
+  // kill during / before the jump: the kill wins; trig during the jump fade: the new note wins
+  sim = make(rampBuffer(40000), { pstart: 3000, pend: 9000, held: 1, trig: 1 });
+  sim.process(1000);
+  sim.set('kill', 1);
+  sim.set('jump', 1);
+  r = sim.process(300);
+  assert.equal(eventsOf(sim, 'jump').length, 0, 'kill wins');
+  assert.equal(r.active[299], 0);
+  sim = make(rampBuffer(40000), { pstart: 3000, pend: 9000, held: 1, trig: 1 });
+  sim.process(1000);
+  sim.set('jump', 1);
+  sim.process(10);
+  sim.set('pstart', 5000);
+  sim.set('trig', 2);
+  sim.process(300);
+  assert.equal(eventsOf(sim, 'jump').length, 0, 'the pending jump became a full restart');
+  assert.equal(eventsOf(sim, 'start').length, 2);
+
+  // a repeat line during a pending jump: the repeat restart takes over (full restart, kind 2)
+  sim = make(rampBuffer(40000), { pstart: 1000, pend: 15000, rptdiv: 4, held: 1, playing: 1 });
+  r = playFull(sim, [
+    { at: 0, set: { trig: 1 } }, { at: 5500, set: { pstart: 20000, pend: 30000, jump: 1 } }
+  ], 8000, hostPhase(spb, 0));
+  assert.equal(eventsOf(sim, 'jump').length, 0);
+  const st2 = eventsOf(sim, 'start');
+  assert.equal(st2.length, 2);
+  assert.equal(st2[1].kind, 2);
+  assert.equal(r.pos[st2[1].n], 20000, 'the repeat plays the new slice');
+});
+
+test('redir: a sounding hit turns around where it is - same playhead, no fade, no restart', () => {
+  const N = 20000;
+  const sim = make(rampBuffer(N), { pstart: 1000, pend: 9000, held: 1, att: 5, dec: 10, sus: 0.7 });
+  const r = playFull(sim, [
+    { at: 0, set: { trig: 1 } },
+    { at: 2000, set: { dir: -1, pend: 1000, redir: 1 } }
+  ], 4500);
+  assert.equal(r.pos[1999], 2999);
+  assert.equal(r.pos[2000], 3000, 'the playhead is where it was');
+  for (let k = 0; k < 1500; k++) { assert.equal(r.pos[2000 + k], 3000 - k, 'runs backwards at full speed from there ' + k); }
+  // continuous: the output value is the ramp at the playhead times the (untouched) envelope
+  const env = 0.7;
+  for (let k = 5; k < 1500; k += 7) { close(r.left[2000 + k], env * (3000 - k) / N, 3e-6, 'sample ' + k); }
+  assert.ok(maxStep(r.left, 1900, 2100) < 0.0002, 'no click at the turn: ' + maxStep(r.left, 1900, 2100));
+  assert.equal(eventsOf(sim, 'start').length, 1);
+  assert.equal(eventsOf(sim, 'jump').length, 0);
+  for (let n = 1000; n < 4000; n++) { assert.ok(Math.abs(r.env[n] - 0.7) < 1e-9, 'envelope untouched'); }
+  // it stops at the new pend (the slice start) with the usual end fade
+  const end = firstIndex(r.active, 2000, v => v === 0);
+  assert.equal(end, 2000 + 2000, 'ends when the playhead reaches pend 1000');
+  assert.ok(Math.abs(r.left[end - 1]) < 0.01);
+  // forward again: dir 1 and a nearer pend just shortens the hit
+  const sim2 = make(rampBuffer(N), { pstart: 1000, pend: 9000, held: 1, trig: 1 });
+  const r2 = playFull(sim2, [{ at: 2000, set: { pend: 4000, redir: 1 } }], 5000);
+  assert.equal(firstIndex(r2.active, 100, v => v === 0), 3000, 'stop moved to 4000: ends 1000 samples later');
+  // idle voice: nothing
+  const sim3 = make(rampBuffer(N), { pstart: 1000, pend: 9000, held: 1 });
+  sim3.set('redir', 1);
+  const r3 = sim3.process(300);
+  assert.ok(r3.active.every(v => v === 0) && sim3.events.length === 0);
+});
+
+test('redir: inside a micro-loop the loop region is mirrored; with the stop behind the playhead the hit ends with the end fade', () => {
+  // loop: reversing keeps the playhead inside the same region
+  let sim = make(rampBuffer(20000), {
+    pstart: 1000, pend: 9000, loopon: 1, loopsize: 500, looppos: 0.5, held: 1, trig: 1
+  });
+  let r = playFull(sim, [{ at: 4000, set: { dir: -1, pend: 1000, redir: 1 } }], 9000);
+  for (let n = 100; n < 9000; n++) { assert.ok(r.pos[n] >= 4750 - 1e-9 && r.pos[n] <= 5250 + 1e-9, 'pos in the region at ' + n + ': ' + r.pos[n]); }
+  for (let n = 4001; n < 9000; n++) {
+    const d = r.pos[n] - r.pos[n - 1];
+    assert.ok(d === -1 || d === 499, 'steps backwards, or wraps forward by loop length - 1: ' + d + ' at ' + n);
+  }
+  assert.ok(eventsOf(sim, 'wrap').length > 20);
+  for (let n = 4000; n < 9000; n++) { assert.equal(r.active[n], 1); }
+  assert.ok(maxStep(r.left, 3900, 9000) < 0.0015, 'smooth: ' + maxStep(r.left, 3900, 9000));
+
+  // stop behind: constant buffer so the fade is visible; trigger mode, no repeat -> idle after ~2 ms
+  sim = make(constBuffer(60000, 1), { pstart: 1000, pend: 9000, held: 1, trig: 1 });
+  r = playFull(sim, [{ at: 3000, set: { pend: 2500, redir: 1 } }], 4000);
+  const end = firstIndex(r.active, 3000, v => v === 0);
+  assert.ok(end >= 3000 + 86 && end <= 3000 + 90, 'ends after the 2 ms end fade: ' + (end - 3000));
+  assert.equal(r.left[3000], 1, 'the fade starts from the full level');
+  for (let n = 3000; n < end - 1; n++) { assert.ok(r.left[n + 1] <= r.left[n] + 1e-9, 'monotonic fade at ' + n); }
+  assert.ok(maxStep(r.left, 2900, 3200) < 0.015, 'no click: ' + maxStep(r.left, 2900, 3200));
+  assert.equal(r.left[end], 0);
+  assert.equal(eventsOf(sim, 'end').pop().why, 'pend');
+
+  // with repeat on and the key held, the finished hit waits for the next repeat like any other
+  const spb = 22050;
+  sim = make(constBuffer(60000, 1), { pstart: 1000, pend: 9000, rptdiv: 4, held: 1, playing: 1, trig: 1 });
+  r = playFull(sim, [{ at: 3000, set: { pend: 2500, redir: 1 } }], 8000, hostPhase(spb, 0));
+  assert.equal(r.left[3200], 0);
+  for (let n = 3000; n < 5500; n++) { assert.equal(r.active[n], 1, 'waiting, still active ' + n); }
+  assert.equal(eventsOf(sim, 'wait').length, 1);
+  assert.equal(eventsOf(sim, 'start').length, 2, 'the next repeat restarts it');
+});
+
+// ---------------------------------------------------------------------------
 // filter, drive
 // ---------------------------------------------------------------------------
 

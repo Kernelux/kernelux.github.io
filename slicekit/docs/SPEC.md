@@ -49,10 +49,27 @@ The reasons for building it:
 
 - Click a source in the Sources list to select it. Its waveform and slices appear.
 - Click a slice in the waveform to select it.
-- Click a key on the keyboard grid to select it. Clicking also plays the key
-  (audition). The pad panel edits the pad on the selected key.
-- The Kit panel holds the layout, root key, map slots, shuffle and kit-building
-  tools. The Performance panel holds chaos, repeat, swing and the modifier zone.
+- Click a key on the keyboard grid to select it. The PAD panel edits the pad on the
+  selected key. A plain click does not play the key.
+- Shift-click a key to audition it: it plays for as long as the mouse button is held.
+  Cmd-click (Ctrl-click on Windows) a key to lock or unlock it.
+- Drag a key onto another key to swap their pads. The selection moves to the target
+  key. A swap is a map change, so Keep clip follows it (section 17).
+- In the waveform, Shift-click adds a cut, Alt-click (Option-click on a Mac) removes a
+  cut, and dragging a cut moves it (section 5.4).
+- The controls sit in these panels:
+  - **SAMPLE:** play mode, trigger/gate, slice mode, sensitivity, beat division,
+    regions, BPM, min slice, Snap, **Reslice** (re-runs the slicing of the selected
+    sample), **Remove** (deletes the selected sample), and **Find Simplers** with its
+    menu (section 16).
+  - **PAD:** the pad settings (section 7.1), Lock, ‹ Sim and Sim ›, Layer, Dup, Spread
+    with its parameter, count and step, → Sample, and **Clear**, which empties the
+    selected key in the current map.
+  - **PERFORM:** the slot tabs A to H, Chaos, Repeat, Rate, Swing and Alt.
+  - **KIT:** Copy slot, Layout, Oct, Sort, Root, the Layout button, Shuffle with its
+    mode, scope, seed and flip, Undo, Redo, Best N and Find best, Choke scope, Mods and
+    Mod start (section 10.4), Vel sens, and Press (section 10.3).
+  - **MORPH / SCAN, CAPTURE and GESTURE:** sections 12 to 15.
 - A status line at the bottom reports the last action, errors and anything dropped
   (for example, slices that did not fit on the keyboard).
 - The v2 tools (Capture, Gestures, Morph, Scan, Simpler import, Keep clip) are described in sections 12 to 17.
@@ -76,8 +93,10 @@ every pad that plays the same source, use **→ Sample**.
 - Drag a file from the Live browser or from Finder onto the device, or press Load
   and choose a file.
 - Up to 16 sources. A 17th is refused, and the status line says so.
-- Each source gets a color from the 16-color palette (its slot number by default).
-  The color shows on its keys.
+- **Remove** deletes the selected sample. Its pads are deleted and their keys are
+  cleared in every map.
+- Each sample's color is its slot number, from the 16-color palette. The color shows on
+  its keys. There is no control to change it.
 - A new source is sliced with its own slicing settings (default: Transient). Adding
   or removing a source re-lays out the auto maps (see section 8).
 - Capture (section 12) and Simpler import (section 16) add samples the same way.
@@ -102,11 +121,14 @@ Options that apply to all modes:
   shorter than this is dropped.
 - **Snap** (on by default). Each cut moves to the nearest zero crossing within a short
   window, so a slice does not start with a click.
-- At most 128 slices per source, which is the number of keys.
+- At most 128 slices per sample, in every mode. Manual cuts and Simpler imports count
+  toward the same limit. A cut that would make a 129th slice is not added, and the
+  status line reads "Limited to 128 slices".
 
 ### 5.3 Re-slicing keeps the pads
 
-Changing any slicing setting re-slices the source at once. Re-slicing keeps the
+Changing any slicing setting re-slices the source at once, and so does the **Reslice**
+button, with the current settings. Re-slicing keeps the
 pads and their key positions:
 
 - Each pad on the source moves to the new slice whose start is nearest to the start
@@ -120,13 +142,13 @@ pads and their key positions:
 
 In the waveform:
 
-- Add a cut by clicking. The source switches to **Manual** mode and keeps the cuts
+- Shift-click in the waveform to add a cut. The source switches to **Manual** mode and keeps the cuts
   it already had.
 - Move a cut by dragging it. It stays between its neighbors.
-- Remove a cut to merge its slice into the slice before it. The pads that pointed to
+- Alt-click a cut (Option-click on a Mac) to remove it. Its slice merges into the slice before it. The pads that pointed to
   the removed slice point to the merged slice.
 
-Snap applies to manual cuts too.
+When Snap is on, manual cuts snap to zero crossings too.
 
 ## 6. Play modes
 
@@ -138,7 +160,8 @@ Play mode and trigger/gate are set per source.
   source (or of every source, see choke scope). Use it for hats, snares and anything
   that must not stack.
 - **Poly.** Hits overlap. The same key can sound more than once. Limited by the 16
-  voices.
+  voices. When every voice is busy, a new hit takes the oldest voice that is no longer
+  held. If all of them are held, it takes the oldest voice.
 - **Thru.** Each hit plays the original record from the slice's start to the end of
   the source file. The hit is not cut at the slice's end, so it works like a hot cue:
   you jump into the recording and it keeps going. The keyboard layout does not limit
@@ -207,8 +230,8 @@ Notes:
 
 Each slice has one base pad, and the layout places base pads. Extra pads appear on a
 key only when you put them there: by Duplicate (section 11.3), by Spread (section 11.1)
-or by Flip in the shuffle (section 9). Similar-swap (section 11.4) does not add a pad;
-it changes which slice an existing pad plays. A layer (section 11.2) is a reference to
+or by Flip in the shuffle (section 9). Similar-swap (section 11.4) changes which slice a pad plays. On a base pad it places a
+copy on the key, so the base pad keeps its own slice. A layer (section 11.2) is a reference to
 an existing pad, not a copy.
 
 ## 8. Layouts, root key and map slots
@@ -283,8 +306,8 @@ or slices.
 ### 10.1 Chaos
 
 - The chaos knob runs from 0 to 100 %. It is automatable.
-- Each new hit has that chance of playing a random slice from the whole pool, instead
-  of the slice on its key. At 0 nothing changes. At 100 every hit is random.
+- Each new hit has that chance of playing a random pad from the current map (the keys
+  of the current slot), instead of the pad on its key. At 0 nothing changes. At 100 every hit is random.
 - The modifier action **chaos** (section 10.4) makes every hit random while held.
 - Scan (section 15) picks the pad first, and chaos is applied after it, so chaos still works on top of Scan.
 
@@ -297,10 +320,14 @@ or slices.
 - **Timing.** When Live's transport is playing, the grid follows Live's beat. When it
   is stopped, the grid runs on its own at Live's tempo.
 - **Swing** (0 to 100 %). 0 % is straight. Larger values delay every second repeat.
-  At 50 % the second repeat of each pair lands three-quarters of the way through the
-  pair.
+  At 50 % the second repeat of each pair lands 62.5 % of the way through the pair, and at
+  100 % it lands 75 % of the way through.
 - **Alt.** Each repeat plays in the opposite direction to the one before. Alt is
   automatable.
+
+- **Repeat on a finished hit.** If a held hit has already finished (a one-shot that has
+  ended), turning repeat on restarts it, so it repeats while the key stays held. Repeat
+  can be turned on by the Repeat toggle, a repeat modifier or a gesture rate.
 
 Repeat, rate, swing and alt are all automatable.
 
@@ -314,6 +341,8 @@ A gesture (section 13) can set the repeat rate while its key is held. A gesture'
   pressure gives half level and full pressure gives full level. This is how MPC-style
   repeats get louder or softer as you press.
 - Channel aftertouch acts on all held keys, poly aftertouch on its own key.
+- **Vel sens** (KIT panel, 0 to 100 %) sets how much note velocity changes the level. At
+  0 % velocity has no effect; at 100 % a soft note is much quieter than a hard one.
 
 ### 10.4 Modifier zone
 
@@ -336,11 +365,11 @@ Default layout of the zone (offset from the start key):
 | 4 | 100 | rpt 1/16T | Repeat at 1/16 triplet. |
 | 5 | 101 | rpt 1/32 | Repeat at 1/32. |
 | 6 | 102 | rpt 1/64 | Repeat at 1/64. |
-| 7 | 103 | reverse | Flips the direction of the hits. |
+| 7 | 103 | reverse | Flips the direction of the hits. A hit that is already sounding turns around where it is. |
 | 8 | 104 | octave down | Plays one octave lower. |
 | 9 | 105 | octave up | Plays one octave higher. |
 | 10 | 106 | tape | Playing sounds slow to a stop over one beat. On release they speed back up. |
-| 11 | 107 | chaos | Every hit is a random slice from the pool. |
+| 11 | 107 | chaos | Every hit plays a random pad from the current map. |
 | 12 | 108 | gesture 1 (Build) | Runs the ramp of gesture 1 while held (section 13). |
 | 13 | 109 | gesture 2 (Rise) | Runs the ramp of gesture 2 while held. |
 | 14 | 110 | gesture 3 (Drop) | Runs the ramp of gesture 3 while held. |
@@ -392,7 +421,8 @@ Inspired by the SP-404 Pad Link.
 
 Inspired by the similarity maps in XO and Atlas 2.
 
-- Select a pad and press ‹ or ›. Its slice is swapped for the next slice in a ranking.
+- Select a pad and press ‹ or ›. Its slice is swapped for the next slice in a ranking. On a base pad, the key gets a copy
+  that takes the new slice, and the base pad stays on its own slice.
   The ranking covers every analyzed slice of every source, sorted by distance from
   the pad's original slice. The original is at index 0; ‹ goes back toward it.
 - Distance uses the same properties as shuffle's smart mode.
@@ -419,7 +449,7 @@ can still become a new sample.
   Bars are counted at Live's tempo, so 2 bars at 120 BPM is 4 seconds.
 - **Capture** saves that stretch of the ring as a stereo WAV file and loads it as a new
   sample, about 0.3 seconds later. The new sample is sliced like any other (section 5).
-  The status line reads "Captured N bars" followed by the sample's name.
+  The status line reads "Captured 2 Bars → <file name>", using the length shown in the Capture length menu.
 - **Folder.** Files go to the capture folder. By default that is the folder that holds
   the device. If the device has no folder, it is the folder of the first sample. Press
   **Folder…** to choose another. Files are named `SliceKit Capture YYYYMMDD-HHMMSS.wav`.
@@ -515,7 +545,8 @@ Scan rotates the whole kit under the keys. One knob moves each key to a differen
 - Scan changes what sounds, not the map. Keys keep showing the same pads, and the clip
   is not rewritten (section 17).
 - Scan is applied before chaos (section 10.1), so chaos still works on top of it.
-- A held note switches to the new slice at once, without a new attack. A note that
+- A held note jumps to the new slice at once. Its playhead moves into the new slice,
+  and its envelope carries on, so there is no new attack. A note that
   repeats (section 10.2) picks up the new slice at its next hit. This lets you sweep
   through the pool while a note repeats.
 
@@ -526,7 +557,7 @@ chop it again by hand.
 
 - **Find Simplers** fills a menu with every Simpler in the Live Set. The list covers
   Simplers on tracks and Simplers one level inside a rack. A Simpler nested deeper is
-  not listed. Each item reads `track name / device name`, so give your tracks distinct
+  not listed. Each item reads `track / device`, or `track / chain / device` for a Simpler inside a rack, so give your tracks distinct
   names.
 - Choose a Simpler from the menu. SliceKit adds a new source with:
   - the Simpler's sample, by file path, as for any other source;
@@ -545,7 +576,7 @@ the clip so the same pads keep playing.
 
 - **Keep clip** (toggle). When it is on, each map change on the current slot rewrites
   the current clip. The map changes are: shuffle; changing the layout, the root key or
-  zone align, and the Layout button; swapping two keys; clearing a key; Find best;
+  zone align, and the Layout button; swapping two keys (by dragging one key onto another); clearing a key; Find best;
   Spread; duplicating or placing a pad on a key; undo and redo; and removing, adding or
   re-slicing a sample (when that moves pads).
 - **Which clip.** The clip open in Live's detail view, if it is a MIDI clip on this
@@ -585,7 +616,7 @@ the clip so the same pads keep playing.
 | Sources | 16 |
 | Keys | 128 (MIDI 0 to 127) |
 | Slices per source | 128 |
-| Voices | 16 at a time. A 17th hit takes over the oldest voice. |
+| Voices | 16 at a time. A new hit takes the oldest voice that is no longer held, else the oldest voice. |
 | Map slots | 8 (A to H) |
 | Layers per key | 3 extra, so up to 4 slices per key |
 | Output | One stereo output (Max for Live). No per-slice outputs in v1. |
@@ -600,7 +631,7 @@ the clip so the same pads keep playing.
 - The instrument's state is saved with the Live Set: sources, slices, pads, map
   slots and settings.
 - Sources are stored as file paths. If a file is moved or deleted, its source shows as
-  not loaded and the rest of the kit still works. Drop the file again to restore it.
+  not loaded and the rest of the kit still works. Drop the file again to restore it. The file re-links the existing sample, and no new sample is added.
 - Before moving a set, use **File > Collect All and Save**. This copies the samples
   into the project folder.
 - Settings from v2 are saved too: Morph and each pad's B settings, Scan, Keep clip, the
