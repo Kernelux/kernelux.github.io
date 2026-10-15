@@ -559,9 +559,12 @@ function buildDevice() {
   p.connect(pDrop, 0, glue, 0);
 
   const load = p.liveText(SPECIAL.load, [20, 372, 80, 18], lay.pres.sk_load);
+  const loadOnce = p.obj('route bang 1', [110, 372, 0, 22]);
   const dlg = p.obj('opendialog sound', [20, 404, 0, 22]);
   const pLoad = p.obj('prepend load', [20, 440, 0, 22]);
-  p.connect(load, 0, dlg, 0);
+  p.connect(load, 0, loadOnce, 0);
+  p.connect(loadOnce, 0, dlg, 0);
+  p.connect(loadOnce, 1, dlg, 0);
   p.connect(dlg, 0, pLoad, 0);
   p.connect(pLoad, 0, glue, 0);
 
@@ -608,8 +611,12 @@ function buildDevice() {
         }
         const belowY = ry + 30 + h + 10;
         if (c.t === 'button') {
-          const m = p.msg(c.send, [x, belowY, textWidth(c.send, 30), 22]);
-          p.connect(box, 0, m, 0);
+          // [route bang 1] fires once per click whether live.text sends a bang or 1 then 0.
+          const once = p.obj('route bang 1', [x, belowY, 0, 22]);
+          const m = p.msg(c.send, [x, belowY + 28, textWidth(c.send, 30), 22]);
+          p.connect(box, 0, once, 0);
+          p.connect(once, 0, m, 0);
+          p.connect(once, 1, m, 0);
           p.connect(m, 0, glue, 0);
         } else {
           const pre = p.obj('prepend ' + c.send, [x, belowY, 0, 22]);
@@ -617,7 +624,7 @@ function buildDevice() {
           p.connect(pre, 0, glue, 0);
         }
       });
-      ry += 30 + maxH + 10 + 22 + 20;
+      ry += 30 + maxH + 10 + 22 + 28 + 20;
     }
     y = ry + 24;
   });

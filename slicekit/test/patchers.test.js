@@ -130,7 +130,10 @@ test('drop and load chains', () => {
   assert.equal(load.mode, 0);
   const dlg = one(dev, 'opendialog sound');
   const pLoad = one(dev, 'prepend load');
-  wired(dev, load, 0, dlg, 0);
+  const once = dev.targets(load, 0)[0].box;
+  assert.equal(once.text, 'route bang 1', 'Load fires once per click');
+  wired(dev, once, 0, dlg, 0);
+  wired(dev, once, 1, dlg, 0);
   wired(dev, dlg, 0, pLoad, 0);
   wired(dev, pLoad, 0, glue, 0);
 });
@@ -183,7 +186,7 @@ test('feedback: glue out2 -> route -> [prepend set] -> control (all PROTOCOL fee
   const table = loadControlTable();
   const names = table.filter((r) => r.feedback);
   assert.equal(names.length, 44);
-  const routes = dev.byText(/^route [a-z]/);
+  const routes = dev.byText(/^route (src|pad|kit)_/);
   assert.ok(routes.length >= 1);
   for (const r of routes) wired(dev, glue, 2, r, 0);
   for (const row of names) {
@@ -210,8 +213,14 @@ test('every control reaches the glue through its prepend/message', () => {
     if (row.sends === 'audio') continue;
     const ctl = control(row.varname);
     const key = row.sends.replace(/<[^>]*>/g, '').replace(/\.\.\./g, '').trim();
-    const first = dev.targets(ctl, 0);
+    let first = dev.targets(ctl, 0);
     assert.ok(first.length >= 1, row.varname + ' outlet 0 connected');
+    // buttons go through [route bang 1] (fires once per click, bang or 1/0), both outlets to the same box
+    if (first.length === 1 && first[0].box.text === 'route bang 1') {
+      const once = first[0].box;
+      first = dev.targets(once, 0);
+      assert.deepEqual(dev.targets(once, 1).map((t) => t.box.id), first.map((t) => t.box.id), row.varname + ' once-filter outlets');
+    }
     // direct [prepend X] / [X( to glue, or (load) via opendialog
     const direct = first.map((t) => t.box).filter((b) => b.text === 'prepend ' + key || b.text === key);
     if (row.varname === 'sk_load') {
