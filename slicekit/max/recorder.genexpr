@@ -1,0 +1,58 @@
+// SliceKit recorder - gen~ codebox (GenExpr)
+// ======================================================================
+// Records the device output (stereo) continuously into a ring buffer~ so the
+// glue can cut the last N bars out of it ("kit capture"). One gen~ in the
+// device patcher, fed with poly~ outlets 0/1 (before the output gain).
+// See docs/PROTOCOL.md (v2 additions: Topology, Capture flow, Recorder).
+//
+// INPUTS
+//   in1   left  signal
+//   in2   right signal
+// OUTPUT
+//   out1  write position: index of the NEXT frame that will be written
+//         (0 .. frames-1; 0 while no ring buffer is bound or it is empty)
+// BUFFERS (bound by the glue with messages sent to gen~ at init)
+//   cap <buffer~ name>   the ring buffer, 2 channels ([buffer~ ---cap 40000 2]).
+//                        Channel 0 = left, channel 1 = right.
+//   wpb <buffer~ name>   position buffer ([buffer~ ---capwp 10 1]). Frame 0,
+//                        channel 0 receives, every sample, the index of the
+//                        frame that was written in that sample (the most
+//                        recent frame). The glue reads it with peek() when a
+//                        capture is requested.
+//
+// Each sample, when the ring buffer has frames (dim(cap) > 0):
+//   poke(cap, in1, wp, 0); poke(cap, in2, wp, 1); poke(wpb, wp, 0, 0);
+//   then wp advances by one and wraps to 0 at dim(cap).
+// With an empty or unbound ring buffer nothing is written and wp stays put.
+//
+// GenExpr notes (the test checks these, see docs/VOICE.md):
+//   - poke(buffer, value, index, channel): value first, then index, then channel.
+//   - The History `wp` is read once into a local at the top and written once
+//     at the end, so the code does not depend on whether a History read sees a
+//     write made in the same sample. The local is assigned at top level
+//     because GenExpr scopes variables to their {} block.
+//   - If the ring buffer is resized to fewer frames than wp, wp wraps to 0
+//     before the first write.
+
+Buffer cap;
+Buffer wpb;
+
+History wp(0);
+
+wpos = wp;
+nfr = dim(cap);
+if (nfr > 0) {
+  if (wpos >= nfr) {
+    wpos = 0;
+  }
+  poke(cap, in1, wpos, 0);
+  poke(cap, in2, wpos, 1);
+  poke(wpb, wpos, 0, 0);
+  wpos = wpos + 1;
+  if (wpos >= nfr) {
+    wpos = 0;
+  }
+}
+wp = wpos;
+
+out1 = wpos;

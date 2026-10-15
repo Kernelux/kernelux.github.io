@@ -7570,7 +7570,7 @@
 							60,
 							90,
 							760,
-							330
+							710
 						],
 						"openinpresentation": 0,
 						"default_fontsize": 12,
@@ -7616,7 +7616,7 @@
 								"box": {
 									"id": "obj-3",
 									"maxclass": "codebox",
-									"code": "// SliceKit recorder PLACEHOLDER - max/recorder.genexpr was not found at build time.\n// Records nothing: Capture would produce silence.\nout1 = in1 * 0 + in2 * 0;\n",
+									"code": "// SliceKit recorder - gen~ codebox (GenExpr)\n// ======================================================================\n// Records the device output (stereo) continuously into a ring buffer~ so the\n// glue can cut the last N bars out of it (\"kit capture\"). One gen~ in the\n// device patcher, fed with poly~ outlets 0/1 (before the output gain).\n// See docs/PROTOCOL.md (v2 additions: Topology, Capture flow, Recorder).\n//\n// INPUTS\n//   in1   left  signal\n//   in2   right signal\n// OUTPUT\n//   out1  write position: index of the NEXT frame that will be written\n//         (0 .. frames-1; 0 while no ring buffer is bound or it is empty)\n// BUFFERS (bound by the glue with messages sent to gen~ at init)\n//   cap <buffer~ name>   the ring buffer, 2 channels ([buffer~ ---cap 40000 2]).\n//                        Channel 0 = left, channel 1 = right.\n//   wpb <buffer~ name>   position buffer ([buffer~ ---capwp 10 1]). Frame 0,\n//                        channel 0 receives, every sample, the index of the\n//                        frame that was written in that sample (the most\n//                        recent frame). The glue reads it with peek() when a\n//                        capture is requested.\n//\n// Each sample, when the ring buffer has frames (dim(cap) > 0):\n//   poke(cap, in1, wp, 0); poke(cap, in2, wp, 1); poke(wpb, wp, 0, 0);\n//   then wp advances by one and wraps to 0 at dim(cap).\n// With an empty or unbound ring buffer nothing is written and wp stays put.\n//\n// GenExpr notes (the test checks these, see docs/VOICE.md):\n//   - poke(buffer, value, index, channel): value first, then index, then channel.\n//   - The History `wp` is read once into a local at the top and written once\n//     at the end, so the code does not depend on whether a History read sees a\n//     write made in the same sample. The local is assigned at top level\n//     because GenExpr scopes variables to their {} block.\n//   - If the ring buffer is resized to fewer frames than wp, wp wraps to 0\n//     before the first write.\n\nBuffer cap;\nBuffer wpb;\n\nHistory wp(0);\n\nwpos = wp;\nnfr = dim(cap);\nif (nfr > 0) {\n  if (wpos >= nfr) {\n    wpos = 0;\n  }\n  poke(cap, in1, wpos, 0);\n  poke(cap, in2, wpos, 1);\n  poke(wpb, wpos, 0, 0);\n  wpos = wpos + 1;\n  if (wpos >= nfr) {\n    wpos = 0;\n  }\n}\nwp = wpos;\n\nout1 = wpos;\n",
 									"fontface": 0,
 									"fontname": "<Monospaced>",
 									"fontsize": 12,
@@ -7629,7 +7629,7 @@
 										30,
 										56,
 										640,
-										140
+										520
 									]
 								}
 							},
@@ -7642,7 +7642,7 @@
 									"numoutlets": 0,
 									"patching_rect": [
 										30,
-										220,
+										600,
 										46,
 										22
 									]

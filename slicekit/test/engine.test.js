@@ -1076,6 +1076,907 @@ test('pads whose slice or source is missing are skipped', () => {
   assert.deepEqual(engine.noteOn(60, 100), []);
 });
 
+// ===========================================================================
+// v2: 16-key mod zone
+// ===========================================================================
+
+test('v2 mod zone: gesture keys are mod keys at offsets 12..15 and never allocate voices', () => {
+  const { model, engine } = mk();
+  const src = model.addSource();
+  model.addPad(60, src, 0);
+  assert.equal(MOD.GEST_0, MOD_START + 12);
+  assert.equal(MOD.GEST_3, MOD_START + 15);
+  for (const k of [MOD.GEST_0, MOD.GEST_1, MOD.GEST_2, MOD.GEST_3]) {
+    assert.deepEqual(starts(engine.noteOn(k, 100)), [], 'key ' + k);
+  }
+  assert.deepEqual(engine.activeKeys(), []);
+  assert.equal(engine.noteOn(60, 100)[0].voice, 0);
+});
+
+// ===========================================================================
+// v2: morph
+// ===========================================================================
+
+// One pad whose B values differ from A in every morphable way.
+function morphSetup(padOpts = {}) {
+  const ctx = mk();
+  ctx.src = ctx.model.addSource({ slot: 1, frames: 48000, sr: 48000, slices: [[0, 4800], [4800, 9600]] });
+  ctx.pad = ctx.model.addPad(60, ctx.src, 0, {
+    pitch: 0, fine: 0, gainDb: 0, cutoffHz: 20000, drive: 0, decayMs: 100, sustain: 1,
+    startOffsetMs: 0, loopOn: false, loopSizeMs: 30, loopPos: 0, reverse: false,
+    morph: {
+      pitch: 12, fine: 50, gainDb: -12, cutoffHz: 2000, drive: 1, decayMs: 300, sustain: 0.5,
+      startOffsetMs: 40, loopOn: true, loopSizeMs: 60, loopPos: 1, reverse: true
+    },
+    ...padOpts
+  });
+  ctx.g.velSens = 0;                        // amp = pure gain
+  return ctx;
+}
+
+test('morph: noteOn reads the pad through effectivePad(id, morph / 100)', () => {
+  const { model, engine, g, pad } = morphSetup();
+  // morph 0 => A
+  let p = pmap(engine.noteOn(60, 100)[0]);
+  assert.deepEqual(model.effectivePadCalls.pop(), [pad.id, 0]);
+  near(p.pitch, 0);
+  near(p.amp, 1);
+  assert.equal(p.cutoff, 20000);
+  assert.equal(p.drive, 0);
+  assert.equal(p.dec, 100);
+  assert.equal(p.sus, 1);
+  assert.equal(p.loopon, 0);
+  assert.deepEqual([p.pstart, p.pend, p.dir], [0, 4800, 1]);
+
+  // morph 50 => halfway, cutoff geometric, booleans switch at 0.5
+  g.morph = 50;
+  p = pmap(engine.noteOn(60, 100)[0]);
+  assert.deepEqual(model.effectivePadCalls.pop(), [pad.id, 0.5]);
+  near(p.pitch, 6.25);                                  // 12/2 + 50 cents / 2
+  near(p.amp, dbtoa(-6));
+  near(p.cutoff, 20000 * Math.pow(0.1, 0.5));
+  near(p.drive, 0.5);
+  near(p.dec, 200);
+  near(p.sus, 0.75);
+  assert.equal(p.loopon, 1);
+  near(p.loopsize, 0.045 * 48000);                      // 45 ms
+  near(p.looppos, 0.5);
+  assert.deepEqual([p.pstart, p.pend, p.dir], [4800 - 960, 0, -1]);   // reverse, 20 ms offset
+
+  // morph 100 => B
+  g.morph = 100;
+  p = pmap(engine.noteOn(60, 100)[0]);
+  assert.deepEqual(model.effectivePadCalls.pop(), [pad.id, 1]);
+  near(p.pitch, 12.5);
+  near(p.amp, dbtoa(-12));
+  near(p.cutoff, 2000);
+  near(p.drive, 1);
+  near(p.dec, 300);
+  near(p.sus, 0.5);
+  assert.deepEqual([p.pstart, p.pend, p.dir], [4800 - 1920, 0, -1]);  // 40 ms offset
+});
+
+test('morph: layers are read through effectivePad too', () => {
+  const { model, engine, g, src } = morphSetup();
+  const layer = model.addPad(null, src, 1, { pitch: 0, morph: { pitch: -10 } });
+  model.getPadOnKey(60).layers = [layer.id];
+  g.morph = 100;
+  const cmds = engine.noteOn(60, 100);
+  assert.equal(cmds.length, 2);
+  near(pmap(cmds[0]).pitch, 12.5);
+  near(pmap(cmds[1]).pitch, -10);
+  assert.ok(model.effectivePadCalls.some(([id, m]) => id === layer.id && m === 1));
+});
+
+test('morph: a pad without B values is unchanged at any morph; a model without effectivePad is fine', () => {
+  const { model, engine, g } = mk();
+  const src = model.addSource();
+  model.addPad(60, src, 0, { pitch: 3, cutoffHz: 5000, morph: {} });
+  g.morph = 80;
+  near(pmap(engine.noteOn(60, 100)[0]).pitch, 3);
+  assert.equal(pmap(engine.noteOn(60, 100)[0]).cutoff, 5000);
+
+  const plain = morphSetup();
+  delete plain.model.effectivePad;              // v1-style model
+  plain.g.morph = 100;
+  const p = pmap(plain.engine.noteOn(60, 100)[0]);
+  near(p.pitch, 0);                              // B ignored: the pad itself
+  assert.equal(p.cutoff, 20000);
+  assert.deepEqual(plain.engine.refreshMorph().map((c) => names(c)), [['pitch', 'amp', 'cutoff', 'drive']]);
+});
+
+test('refreshMorph: sounding voices get pitch, amp, cutoff and drive from the effective pad', () => {
+  const { model, engine, g, src } = morphSetup();
+  model.addPad(61, src, 1, { gainDb: -3, pitch: 2, morph: { pitch: 4, cutoffHz: 5000, drive: 0.4 } });
+  engine.noteOn(60, 100);                        // v0
+  engine.noteOn(61, 100);                        // v1
+  g.morph = 100;
+  const cmds = engine.refreshMorph();
+  assert.deepEqual(cmds.map((c) => c.voice), [0, 1]);
+  for (const c of cmds) assert.deepEqual(names(c), ['pitch', 'amp', 'cutoff', 'drive']);
+  let p = pmap(cmds[0]);
+  near(p.pitch, 12.5); near(p.amp, dbtoa(-12)); near(p.cutoff, 2000); near(p.drive, 1);
+  p = pmap(cmds[1]);
+  near(p.pitch, 4); near(p.amp, dbtoa(-3)); near(p.cutoff, 5000); near(p.drive, 0.4);
+  g.morph = 0;
+  p = pmap(engine.refreshMorph()[0]);
+  near(p.pitch, 0); near(p.amp, 1); near(p.cutoff, 20000); near(p.drive, 0);
+});
+
+test('refreshMorph: only sounding voices (released tails count, free and ended voices do not)', () => {
+  const { model, engine, g, src } = morphSetup();
+  for (const k of [61, 62, 63]) model.addPad(k, src, 1);
+  assert.deepEqual(engine.refreshMorph(), []);   // nothing sounding
+  engine.noteOn(60, 100);                        // v0 held
+  engine.noteOn(61, 100);                        // v1 released tail
+  engine.noteOff(61);
+  engine.noteOn(62, 100);                        // v2 released and ended => free
+  engine.noteOff(62);
+  engine.voiceEnded(2);
+  engine.noteOn(63, 100);                        // v2 again, held ...
+  engine.voiceEnded(2);                          // ... and ended => silent
+  g.morph = 100;
+  assert.deepEqual(engine.refreshMorph().map((c) => c.voice), [0, 1]);
+});
+
+test('refreshMorph: keeps the stored velocity, the pressure level, octave mods; later mods use the new base', () => {
+  const { engine, g } = morphSetup();
+  g.velSens = 50;
+  g.pressureToLevel = true;
+  engine.noteOn(60, 64);
+  g.morph = 100;
+  near(pmap(engine.refreshMorph()[0]).amp, dbtoa(-12) * velCurve(64, 50));
+  engine.pressure(120);                           // pressure replaces the velocity level
+  g.morph = 50;
+  near(pmap(engine.refreshMorph()[0]).amp, dbtoa(-6) * velCurve(120, 50));
+  engine.noteOn(MOD.OCTUP, 100);
+  near(pmap(engine.refreshMorph()[0]).pitch, 6.25 + 12);
+  // pressure after a refresh uses the morphed gain
+  near(pmap(engine.pressure(30)[0]).amp, dbtoa(-6) * velCurve(30, 50));
+  // an octave modifier changing after a refresh uses the morphed pitch, not the stale one
+  g.morph = 100;
+  engine.refreshMorph();
+  near(pmap(engine.noteOff(MOD.OCTUP)[0]).pitch, 12.5);
+});
+
+test('refreshMorph: layer voices follow their own pad', () => {
+  const { model, engine, g, src } = morphSetup();
+  const layer = model.addPad(null, src, 1, { pitch: 1, morph: { pitch: 9 } });
+  model.getPadOnKey(60).layers = [layer.id];
+  engine.noteOn(60, 100);
+  g.morph = 100;
+  const cmds = engine.refreshMorph();
+  assert.deepEqual(cmds.map((c) => c.voice), [0, 1]);
+  near(pmap(cmds[0]).pitch, 12.5);
+  near(pmap(cmds[1]).pitch, 9);
+});
+
+test('refreshMorph: skips voices whose pad is gone', () => {
+  const { model, engine, g, pad } = morphSetup();
+  engine.noteOn(60, 100);
+  const orig = model.effectivePad;
+  model.effectivePad = (id, m) => (id === pad.id ? null : orig(id, m));
+  model.getPad = () => null;
+  g.morph = 100;
+  assert.deepEqual(engine.refreshMorph(), []);
+});
+
+// Gesture definition with every effect neutral (override what a test needs).
+const NEUTRAL = {
+  name: 'T', beats: 4, rateFrom: 'off', rateTo: 'off', cutFrom: 20000, cutTo: 20000,
+  pitchFrom: 0, pitchTo: 0, ampFrom: 1, ampTo: 1, curve: 0
+};
+
+// ===========================================================================
+// v2: scan
+// ===========================================================================
+
+// Four pads on keys 60..63, one slice each: pstart identifies the pad (0/100/200/300).
+function scanSetup(engineOpts = {}) {
+  const ctx = mk(engineOpts);
+  ctx.src = ctx.model.addSource({ slices: [[0, 100], [100, 200], [200, 300], [300, 400]] });
+  ctx.pads = [0, 1, 2, 3].map((i) => ctx.model.addPad(60 + i, ctx.src, i));
+  return ctx;
+}
+const pstartOf = (cmds) => pmap(cmds[0]).pstart;
+
+test('scan: rotates the occupied keys, wrapping around; scan 0 is the identity', () => {
+  const { engine, g } = scanSetup();
+  const table = (scan) => {
+    g.scan = scan;
+    return [60, 61, 62, 63].map((k) => pstartOf(engine.noteOn(k, 100)));
+  };
+  assert.deepEqual(table(0), [0, 100, 200, 300]);
+  assert.deepEqual(table(10), [0, 100, 200, 300]);       // round(0.3) = 0
+  assert.deepEqual(table(20), [100, 200, 300, 0]);       // round(0.6) = 1
+  assert.deepEqual(table(34), [100, 200, 300, 0]);       // round(1.02) = 1
+  assert.deepEqual(table(50), [200, 300, 0, 100]);       // round(1.5) = 2
+  assert.deepEqual(table(70), [200, 300, 0, 100]);       // round(2.1) = 2
+  assert.deepEqual(table(100), [300, 0, 100, 200]);      // n - 1 = 3: every key looks one to the left
+  assert.deepEqual(table(0), [0, 100, 200, 300]);
+});
+
+test('scan: shift = round(scan / 100 * (n - 1)) over occupied keys, gaps ignored', () => {
+  const { model, engine, g } = mk();
+  const src = model.addSource({ slices: [[0, 100], [100, 200], [200, 300]] });
+  model.addPad(40, src, 0);
+  model.addPad(45, src, 1);
+  model.addPad(50, src, 2);
+  model.addPad(MOD.TAPE, src, 0);                          // stray pad on a mod key: not in occupiedKeys
+  g.scan = 100;                                            // shift 2 of 3
+  assert.deepEqual([40, 45, 50].map((k) => pstartOf(engine.noteOn(k, 100))), [200, 0, 100]);
+  g.scan = 50;                                             // shift 1
+  assert.deepEqual([40, 45, 50].map((k) => pstartOf(engine.noteOn(k, 100))), [100, 200, 0]);
+});
+
+test('scan: a single occupied key is never rotated; the rotated pad brings its layers and settings', () => {
+  const solo = mk();
+  const s = solo.model.addSource();
+  solo.model.addPad(60, s, 0, { pitch: 5 });
+  solo.g.scan = 100;
+  near(pmap(solo.engine.noteOn(60, 100)[0]).pitch, 5);
+
+  const { model, engine, g, src, pads } = scanSetup();
+  const layer = model.addPad(null, src, 0, { pitch: 7 });
+  pads[2].layers = [layer.id];
+  pads[2].pitch = -2;
+  g.scan = 50;                                             // key 60 plays the pad on 62
+  const cmds = engine.noteOn(60, 100);
+  assert.equal(cmds.length, 2);
+  assert.equal(pmap(cmds[0]).pstart, 200);
+  near(pmap(cmds[0]).pitch, -2);
+  near(pmap(cmds[1]).pitch, 7);
+  assert.deepEqual(engine.activeKeys(), [60]);             // physical key
+  assert.deepEqual(engine.noteOff(60).map((c) => c.voice), [0, 1]);
+});
+
+test('scan: applied before chaos (chaos picks from the unrotated kit); scan alone never calls rng', () => {
+  // no chaos: rng must not be consulted, key 61 -> pad on 60
+  const quiet = scanSetup({ rng: () => { throw new Error('rng must not be called'); } });
+  quiet.g.scan = 100;
+  assert.equal(pstartOf(quiet.engine.noteOn(61, 100)), 0);
+
+  // chaos fires: random occupied key 63 (index floor(0.9 * 4) = 3) wins, not its rotated neighbour
+  const hit = scanSetup({ rng: seqRng(0.5, 0.9) });
+  hit.g.scan = 100; hit.g.chaos = 100;
+  assert.equal(pstartOf(hit.engine.noteOn(61, 100)), 300);
+
+  // chaos misses (99 >= 50): the scan-rotated pad plays
+  const miss = scanSetup({ rng: seqRng(0.99) });
+  miss.g.scan = 100; miss.g.chaos = 50;
+  assert.equal(pstartOf(miss.engine.noteOn(61, 100)), 0);
+
+  // chaos modifier behaves like chaos 100: index 0 => the pad on 60, not the rotated one (63 -> 62 = 200)
+  const mod = scanSetup({ rng: seqRng(0.0, 0.0) });
+  mod.g.scan = 100;
+  mod.engine.noteOn(MOD.CHAOS, 100);
+  assert.equal(pstartOf(mod.engine.noteOn(63, 100)), 0);
+});
+
+test('scan: with the mod zone off its keys take part in the rotation', () => {
+  const { model, engine, g } = mk();
+  const src = model.addSource({ slices: [[0, 100], [100, 200]] });
+  model.addPad(60, src, 0);
+  model.addPad(100, src, 1);
+  model.modZoneOn = false;
+  g.scan = 100;
+  assert.equal(pstartOf(engine.noteOn(60, 100)), 100);
+  assert.equal(pstartOf(engine.noteOn(100, 100)), 0);
+});
+
+// Two sources with different sample rates / settings so a switch changes everything.
+function scanVoiceSetup(engineOpts = {}) {
+  const ctx = mk({ bufferName: (slot) => 'buf' + slot, ...engineOpts });
+  const A = ctx.model.addSource({ slot: 0, frames: 10000, sr: 1000, slices: [[1000, 2000]] });
+  const B = ctx.model.addSource({ slot: 3, frames: 20000, sr: 2000, playMode: 'thru', slices: [[4000, 6000]] });
+  ctx.padA = ctx.model.addPad(60, A, 0, { pitch: 1, gainDb: -6, cutoffHz: 8000, drive: 0.1, loopSizeMs: 100, loopPos: 0.2 });
+  ctx.padB = ctx.model.addPad(61, B, 0, {
+    pitch: 3, fine: 50, gainDb: -12, cutoffHz: 2000, drive: 0.7, loopSizeMs: 500, loopPos: 0.9,
+    startOffsetMs: 250, reverse: true
+  });
+  ctx.A = A; ctx.B = B;
+  return ctx;
+}
+
+test('refreshScan: held main voices switch slice without trig or held', () => {
+  const { engine, g } = scanVoiceSetup();
+  g.velSens = 50;
+  engine.noteOn(60, 64);                                   // v0 -> pad A
+  engine.noteOn(61, 100);                                  // v1 -> pad B
+  g.scan = 100;                                            // 60 -> pad B, 61 -> pad A
+  const cmds = engine.refreshScan();
+  assert.equal(cmds.length, 2);
+  assert.deepEqual(cmds.map((c) => c.voice), [0, 1]);
+  const order = ['src', 'bufsr', 'pstart', 'pend', 'dir', 'loopsize', 'looppos', 'pitch', 'amp', 'cutoff', 'drive'];
+  for (const c of cmds) {
+    assert.deepEqual(names(c), order);
+    assert.ok(!names(c).includes('trig') && !names(c).includes('held'));
+  }
+  // voice 0 now plays pad B: reversed thru slice [4000, 6000) with a 250 ms (500 frame) offset
+  const p0 = pmap(cmds[0]);
+  assert.equal(p0.src, 'buf3');
+  assert.equal(p0.bufsr, 2000);
+  assert.deepEqual([p0.pstart, p0.pend, p0.dir], [5500, 0, -1]);
+  assert.equal(p0.loopsize, 1000);                         // 500 ms at 2 kHz (slice is 2000 frames)
+  assert.equal(p0.looppos, 0.9);
+  near(p0.pitch, 3.5);
+  near(p0.amp, dbtoa(-12) * velCurve(64, 50));             // stored velocity kept
+  assert.equal(p0.cutoff, 2000);
+  assert.equal(p0.drive, 0.7);
+  // voice 1 now plays pad A
+  const p1 = pmap(cmds[1]);
+  assert.equal(p1.src, 'buf0');
+  assert.equal(p1.bufsr, 1000);
+  assert.deepEqual([p1.pstart, p1.pend, p1.dir], [1000, 2000, 1]);
+  assert.equal(p1.loopsize, 100);
+  near(p1.pitch, 1);
+  near(p1.amp, dbtoa(-6) * velCurve(100, 50));
+  assert.equal(p1.cutoff, 8000);
+  assert.equal(p1.drive, 0.1);
+  // idempotent until scan changes again; then it switches back
+  assert.deepEqual(engine.refreshScan(), []);
+  g.scan = 0;
+  const back = engine.refreshScan();
+  assert.equal(pmap(back[0]).src, 'buf0');
+  assert.equal(pmap(back[1]).src, 'buf3');
+  assert.deepEqual(engine.refreshScan(), []);
+});
+
+test('refreshScan: later modifiers, pressure and note off use the new slice of a switched voice', () => {
+  const { engine, g } = scanVoiceSetup();
+  g.pressureToLevel = true; g.velSens = 100;
+  engine.noteOn(60, 100);                                  // pad A, forward, non-thru
+  g.scan = 100;                                            // key 60 -> pad B (thru, reversed)
+  engine.refreshScan();
+  // B is reversed + thru: reverse modifier plays it forward to the end of the source
+  assert.deepEqual(engine.noteOn(MOD.REVERSE, 100), [{ voice: 0, params: [['dir', 1], ['pend', 20000]] }]);
+  assert.deepEqual(engine.noteOff(MOD.REVERSE), [{ voice: 0, params: [['dir', -1], ['pend', 0]] }]);
+  near(pmap(engine.noteOn(MOD.OCTUP, 100)[0]).pitch, 3.5 + 12);
+  near(pmap(engine.pressure(127)[0]).amp, dbtoa(-12));
+  assert.deepEqual(engine.noteOff(60), [{ voice: 0, params: [['held', 0]] }]);
+  assert.deepEqual(engine.activeKeys(), [60]);
+});
+
+test('refreshScan: applies the current reverse modifier, morph and gesture to the new slice', () => {
+  const clock = { t: 0 };
+  const { engine, g, padB } = scanVoiceSetup({ now: () => clock.t });
+  padB.morph = { pitch: 10, cutoffHz: 200 };               // at morph 100: pitch 10 (+ 50 cents), cutoff 200
+  g.morph = 100;
+  g.gestures[0] = { ...NEUTRAL, pitchFrom: 1, pitchTo: 1, ampFrom: 0.5, ampTo: 0.5 };
+  engine.noteOn(MOD.GEST_0, 100);
+  engine.noteOn(MOD.REVERSE, 100);
+  engine.noteOn(60, 127);                                  // pad A, played reversed by the modifier
+  g.scan = 100;                                            // -> pad B (reversed pad), flipped to forward
+  const p = pmap(engine.refreshScan()[0]);
+  assert.deepEqual([p.pstart, p.pend, p.dir], [4500, 20000, 1]);
+  near(p.pitch, 10.5 + 1);                                 // morphed pad + gesture pitch
+  assert.equal(p.cutoff, 200);
+  near(p.amp, dbtoa(-12) * velCurve(127, 50) * 0.5);       // gesture amp
+});
+
+test('refreshScan: layers, released voices and non-main voices are left alone', () => {
+  const { model, engine, g, src, pads } = scanSetup();
+  const layer = model.addPad(null, src, 3);
+  pads[0].layers = [layer.id];
+  engine.noteOn(60, 100);                                  // v0 main + v1 layer
+  engine.noteOn(61, 100);                                  // v2
+  engine.noteOff(61);                                      // released tail
+  g.scan = 100;
+  const cmds = engine.refreshScan();
+  assert.deepEqual(cmds.map((c) => c.voice), [0]);         // only the held main voice
+  assert.equal(pmap(cmds[0]).pstart, 300);                 // key 60 -> pad on 63
+  assert.deepEqual(engine.refreshScan(), []);
+});
+
+test('refreshScan: a note started under scan is already in sync; no held voices => nothing', () => {
+  const { engine, g } = scanSetup();
+  assert.deepEqual(engine.refreshScan(), []);
+  g.scan = 100;
+  engine.noteOn(61, 100);                                  // maps to the pad on 60
+  assert.deepEqual(engine.refreshScan(), []);
+  engine.noteOff(61);
+  g.scan = 50;
+  assert.deepEqual(engine.refreshScan(), []);              // released
+  assert.deepEqual(engine.refreshScan(), []);
+});
+
+test('refreshScan: chaos substitutions are only replaced when the key mapping really changes', () => {
+  const ctx = mk({ rng: seqRng(0.0, 0.99) });              // chaos fires, picks the pad on 63
+  const src = ctx.model.addSource({ slices: [[0, 100], [100, 200], [200, 300], [300, 400]] });
+  [0, 1, 2, 3].forEach((i) => ctx.model.addPad(60 + i, src, i));
+  ctx.g.chaos = 100;
+  assert.equal(pstartOf(ctx.engine.noteOn(60, 100)), 300);
+  assert.deepEqual(ctx.engine.refreshScan(), []);          // scan unchanged: keep the random pad
+  ctx.g.scan = 100;                                        // key 60 now maps to the pad on 63 ...
+  const cmds = ctx.engine.refreshScan();
+  assert.equal(cmds.length, 1);                            // ... which differs from what it mapped to (60)
+  assert.equal(pmap(cmds[0]).pstart, 300);
+});
+
+test('refreshScan: skips voices whose new pad cannot be played', () => {
+  const { model, engine, g, src } = scanSetup();
+  const dead = model.addSource({ frames: 0, sr: 0 });
+  model.addPad(70, dead, 0);                               // 5th occupied key, unloaded source
+  engine.noteOn(60, 100);
+  g.scan = 100;                                            // shift 4: key 60 -> 70
+  assert.deepEqual(engine.refreshScan(), []);
+  assert.ok(src);
+});
+
+// ===========================================================================
+// v2: gestures
+// ===========================================================================
+
+function gmk(padOpts = {}, engineOpts = {}) {
+  const clock = { t: 1000 };
+  const ctx = mk({ now: () => clock.t, ...engineOpts });
+  ctx.clock = clock;
+  ctx.g.velSens = 0;                                       // amp = pure gain
+  ctx.src = ctx.model.addSource();
+  ctx.pad = ctx.model.addPad(60, ctx.src, 0, padOpts);
+  ctx.setGest = (i, o) => { ctx.g.gestures[i] = { ...NEUTRAL, ...o }; };
+  // at(ms) = ms after the clock origin (t = 1000)
+  ctx.at = (ms) => { ctx.clock.t = 1000 + ms; return ctx.engine; };
+  return ctx;
+}
+
+test('gesture: needsTick is true only while a gesture modifier is held', () => {
+  const { engine } = gmk();
+  assert.equal(engine.needsTick(), false);
+  engine.noteOn(MOD.OCTUP, 100);
+  engine.noteOn(MOD.RPT_4, 100);
+  assert.equal(engine.needsTick(), false);                 // other modifiers do not count
+  engine.noteOn(MOD.GEST_1, 100);
+  assert.equal(engine.needsTick(), true);
+  engine.noteOn(MOD.GEST_3, 100);
+  engine.noteOff(MOD.GEST_1);
+  assert.equal(engine.needsTick(), true);                  // GEST_3 still down
+  engine.noteOff(MOD.GEST_3);
+  assert.equal(engine.needsTick(), false);
+  engine.noteOn(MOD.GEST_0, 100);
+  assert.equal(engine.needsTick(), true);
+  engine.noteOn(MOD.GEST_0, 0);                            // velocity 0 = release
+  assert.equal(engine.needsTick(), false);
+  engine.noteOn(MOD.GEST_2, 100);
+  engine.panic();
+  assert.equal(engine.needsTick(), false);
+  assert.deepEqual(engine.tick(), []);
+});
+
+test('gesture: tick without a held gesture sends nothing', () => {
+  const { engine, at } = gmk();
+  engine.noteOn(60, 100);
+  assert.deepEqual(at(5000).tick(), []);
+});
+
+test('gesture cutoff: geometric from -> to over beats*60000/bpm, clamped, then held', () => {
+  const { engine, at, setGest } = gmk();
+  setGest(0, { cutFrom: 20000, cutTo: 1000, beats: 4 });   // 2000 ms at the default 120 bpm
+  engine.noteOn(60, 100);
+  assert.deepEqual(engine.noteOn(MOD.GEST_0, 100), []);    // t = 0: same cutoff as the pad
+  assert.deepEqual(at(0).tick(), []);
+  let cmds = at(1000).tick();                              // halfway: 20000 * 0.05^0.5
+  assert.equal(cmds.length, 1);
+  assert.deepEqual(names(cmds[0]), ['cutoff']);
+  near(pmap(cmds[0]).cutoff, 20000 * Math.sqrt(0.05));
+  cmds = at(500).tick();                                   // clock may go back: 0.25 -> 20000 * 0.05^0.25
+  near(pmap(cmds[0]).cutoff, 20000 * Math.pow(0.05, 0.25));
+  cmds = at(2000).tick();                                  // end
+  assert.equal(cmds.length, 1);
+  assert.deepEqual(names(cmds[0]), ['cutoff']);
+  near(pmap(cmds[0]).cutoff, 1000);
+  assert.deepEqual(at(9000).tick(), []);                   // held at the end value, nothing new
+  assert.deepEqual(at(60000).tick(), []);
+});
+
+test('gesture cutoff: multiplies the pad cutoff (g / 20000) and clamps to 20..20000', () => {
+  const { engine, at, setGest } = gmk({ cutoffHz: 5000 });
+  setGest(0, { cutFrom: 20000, cutTo: 1000 });
+  engine.noteOn(60, 100);
+  engine.noteOn(MOD.GEST_0, 100);
+  near(pmap(at(2000).tick()[0]).cutoff, 250);              // 5000 * 1000 / 20000
+  near(pmap(at(1000).tick()[0]).cutoff, 5000 * Math.sqrt(0.05));
+
+  const low = gmk({ cutoffHz: 100 });
+  low.setGest(0, { cutFrom: 20000, cutTo: 20 });
+  low.engine.noteOn(60, 100);
+  low.engine.noteOn(MOD.GEST_0, 100);
+  assert.equal(pmap(low.at(2000).tick()[0]).cutoff, 20);   // 100 * 20 / 20000 = 0.1 -> 20
+  // a new note started inside the clamp range gets the clamped value, too
+  assert.equal(pmap(low.engine.noteOn(60, 100)[0]).cutoff, 20);
+});
+
+test('gesture pitch: adds semitones on top of pad pitch and octave modifiers', () => {
+  const { engine, at, setGest } = gmk({ pitch: 2, fine: 50 });
+  setGest(1, { pitchFrom: 0, pitchTo: 12 });
+  engine.noteOn(60, 100);                                  // base 2.5
+  engine.noteOn(MOD.OCTUP, 100);                           // 14.5
+  engine.noteOn(MOD.GEST_1, 100);
+  let cmds = at(1000).tick();                              // +6
+  assert.deepEqual(names(cmds[0]), ['pitch']);
+  near(pmap(cmds[0]).pitch, 14.5 + 6);
+  near(pmap(at(500).tick()[0]).pitch, 14.5 + 3);
+  near(pmap(at(2000).tick()[0]).pitch, 14.5 + 12);
+  // an octave modifier changing during the gesture keeps the gesture offset (end: +12)
+  near(pmap(engine.noteOn(MOD.OCTDOWN, 100)[0]).pitch, 2.5 + 0 + 12);
+  near(pmap(engine.noteOff(MOD.OCTDOWN)[0]).pitch, 2.5 + 12 + 12);
+});
+
+test('gesture pitch: negative ramps and from != 0', () => {
+  const { engine, at, setGest } = gmk();
+  setGest(2, { pitchFrom: -3, pitchTo: -27, beats: 2 });   // 1000 ms
+  engine.noteOn(60, 100);
+  near(pmap(engine.noteOn(MOD.GEST_2, 100)[0]).pitch, -3);   // t = 0 value lands at press
+  near(pmap(at(500).tick()[0]).pitch, -15);
+  near(pmap(at(1000).tick()[0]).pitch, -27);
+});
+
+test('gesture amp: multiplies gain x velocity, also for pressure', () => {
+  const { engine, at, setGest, g } = gmk({ gainDb: -6 });
+  g.velSens = 50;
+  setGest(3, { ampFrom: 1, ampTo: 0 });
+  engine.noteOn(60, 64);
+  const base = dbtoa(-6) * velCurve(64, 50);
+  engine.noteOn(MOD.GEST_3, 100);
+  near(pmap(at(500).tick()[0]).amp, base * 0.75);
+  near(pmap(at(1000).tick()[0]).amp, base * 0.5);
+  const end = at(2000).tick();
+  assert.deepEqual(end, [{ voice: 0, params: [['amp', 0]] }]);   // lands exactly on the end value
+  g.pressureToLevel = true;
+  at(1000);
+  near(pmap(engine.pressure(127)[0]).amp, dbtoa(-6) * 0.5);
+});
+
+test('gesture amp: ampFrom > ampTo and ampTo > 1 are both fine', () => {
+  const { engine, at, setGest } = gmk();
+  setGest(0, { ampFrom: 0.2, ampTo: 1.5 });
+  engine.noteOn(60, 127);
+  near(pmap(engine.noteOn(MOD.GEST_0, 100)[0]).amp, 0.2 * velCurve(127, 0));
+  near(pmap(at(2000).tick()[0]).amp, 1.5);
+});
+
+test('gesture curve: u = t^(1 + 4 * curve)', () => {
+  const probe = (curve, t) => {
+    const { engine, at, setGest } = gmk();
+    setGest(0, { pitchFrom: 0, pitchTo: 10, curve });
+    engine.noteOn(60, 100);
+    engine.noteOn(MOD.GEST_0, 100);
+    return pmap(at(2000 * t).tick()[0]).pitch;
+  };
+  near(probe(0, 0.5), 5);
+  near(probe(0.5, 0.5), 10 * Math.pow(0.5, 3));
+  near(probe(1, 0.5), 10 * Math.pow(0.5, 5));
+  near(probe(0.3, 0.8), 10 * Math.pow(0.8, 2.2));
+  near(probe(1, 1), 10);
+  // the curve also shapes the cutoff
+  const { engine, at, setGest } = gmk();
+  setGest(0, { cutFrom: 20000, cutTo: 2000, curve: 1 });
+  engine.noteOn(60, 100);
+  engine.noteOn(MOD.GEST_0, 100);
+  near(pmap(at(1000).tick()[0]).cutoff, 20000 * Math.pow(0.1, Math.pow(0.5, 5)));
+});
+
+test('gesture rate: log2 interpolation snapped to the repeat grid, in both directions', () => {
+  const run = (from, to, probes) => {
+    const { engine, at, setGest } = gmk();
+    setGest(0, { rateFrom: from, rateTo: to });
+    engine.noteOn(60, 100);
+    let cur = pmap(engine.noteOn(MOD.GEST_0, 100)[0]).rptdiv;   // t = 0 lands at press
+    const seen = [cur];
+    for (const [t, expected] of probes) {
+      const cmds = at(2000 * t).tick();
+      if (cmds.length) {
+        assert.deepEqual(names(cmds[0]), ['rptdiv', 'rptswing', 'rptalt'], 't=' + t);
+        cur = pmap(cmds[0]).rptdiv;
+      }
+      assert.equal(cur, expected, from + '->' + to + ' at t=' + t);
+      seen.push(cur);
+    }
+    return seen;
+  };
+  // 1/4 (1) -> 1/64 (16): log2 0 -> 4
+  assert.deepEqual(run('1/4', '1/64', [[0, 1], [0.1, 1], [0.25, 2], [0.4, 3], [0.5, 4], [0.65, 6], [0.75, 8], [0.9, 12], [1, 16]]),
+    [1, 1, 1, 2, 3, 4, 6, 8, 12, 16]);
+  // and back: 1/64 -> 1/4
+  run('1/64', '1/4', [[0, 16], [0.25, 8], [0.5, 4], [0.75, 2], [1, 1]]);
+  // 1/8 -> 1/16T (2 -> 6): L = 1 + 1.585 u
+  run('1/8', '1/16T', [[0.05, 2], [0.2, 3], [0.6, 4], [0.9, 6], [1, 6]]);
+  // equal ends: constant, nothing to send after the press
+  const { engine, at, setGest } = gmk();
+  setGest(0, { rateFrom: '1/16', rateTo: '1/16' });
+  engine.noteOn(60, 100);
+  assert.equal(pmap(engine.noteOn(MOD.GEST_0, 100)[0]).rptdiv, 4);
+  assert.deepEqual(at(1000).tick(), []);
+  assert.deepEqual(at(2000).tick(), []);
+});
+
+test('gesture rate: swing and alt travel with rptdiv; the press already applies the t = 0 rate', () => {
+  const { engine, g, setGest } = gmk();
+  g.swing = 30; g.repeatAlt = true;
+  setGest(0, { rateFrom: '1/8', rateTo: '1/64' });
+  engine.noteOn(60, 100);
+  assert.deepEqual(engine.noteOn(MOD.GEST_0, 100), [
+    { voice: 0, params: [['rptdiv', 2], ['rptswing', 0.3], ['rptalt', 1]] }
+  ]);
+});
+
+test("gesture rate: 'off' on both ends leaves the repeat (global and modifier) alone", () => {
+  const { engine, at, setGest, g } = gmk();
+  setGest(0, { rateFrom: 'off', rateTo: 'off', pitchTo: 12 });
+  g.repeatOn = true; g.repeatDiv = '1/8';
+  engine.noteOn(60, 100);                                  // rptdiv 2
+  assert.deepEqual(engine.noteOn(MOD.GEST_0, 100), []);
+  engine.noteOn(MOD.RPT_16, 100);                          // modifier => 4
+  const cmds = at(1000).tick();
+  assert.deepEqual(names(cmds[0]), ['pitch']);             // only pitch moves
+  assert.equal(pmap(engine.noteOn(60, 100)[0]).rptdiv, 4);
+  assert.deepEqual(engine.noteOff(MOD.RPT_16).map(pmap).map((p) => p.rptdiv), [2, 2]);
+  assert.ok(engine.noteOff(MOD.GEST_0).every((c) => !names(c).includes('rptdiv')));
+});
+
+test("gesture rate: one end 'off' uses the other end for the whole gesture", () => {
+  for (const [from, to, expected] of [['off', '1/16', 4], ['1/8', 'off', 2], ['off', '1/32T', 12]]) {
+    const { engine, at, setGest } = gmk();
+    setGest(0, { rateFrom: from, rateTo: to });
+    engine.noteOn(60, 100);
+    const press = engine.noteOn(MOD.GEST_0, 100);
+    assert.equal(pmap(press[0]).rptdiv, expected, from + '->' + to);
+    assert.deepEqual(at(700).tick(), [], 'constant mid');
+    assert.deepEqual(at(2000).tick(), [], 'constant end');
+    assert.equal(pmap(engine.noteOn(60, 100)[0]).rptdiv, expected);
+  }
+});
+
+test('gesture rate: priority gesture > repeat modifier > global repeat, and release falls back in order', () => {
+  const { engine, g, setGest } = gmk();
+  setGest(0, { rateFrom: '1/16', rateTo: '1/16' });         // 4
+  g.repeatOn = true; g.repeatDiv = '1/8';                   // global 2
+  engine.noteOn(60, 100);
+  assert.equal(pmap(engine.noteOn(MOD.RPT_4, 100)[0]).rptdiv, 1);   // modifier beats global
+  assert.equal(pmap(engine.noteOn(MOD.GEST_0, 100)[0]).rptdiv, 4);  // gesture beats the modifier
+  assert.equal(pmap(engine.noteOn(60, 100)[0]).rptdiv, 4);          // new notes too
+  // pressing / releasing a repeat modifier while the gesture holds the rate: still the gesture's
+  assert.equal(pmap(engine.noteOn(MOD.RPT_64, 100)[0]).rptdiv, 4);
+  assert.equal(pmap(engine.noteOff(MOD.RPT_64)[0]).rptdiv, 4);
+  assert.equal(engine.refreshHeld()[0].params[0][1], 4);
+  const rel = engine.noteOff(MOD.GEST_0);
+  assert.equal(pmap(rel[0]).rptdiv, 1);                              // back to the modifier
+  assert.equal(pmap(engine.noteOff(MOD.RPT_4)[0]).rptdiv, 2);        // then global
+});
+
+test('gesture: notes started while it is held get the current gesture values, and stay in sync', () => {
+  const { engine, at, setGest } = gmk({ gainDb: -6, cutoffHz: 10000, pitch: 1 });
+  setGest(0, { rateFrom: '1/8', rateTo: '1/8', cutFrom: 20000, cutTo: 1000, pitchFrom: 0, pitchTo: 12, ampFrom: 1, ampTo: 0.5 });
+  engine.noteOn(MOD.GEST_0, 100);
+  at(1000);                                                // halfway
+  const c = engine.noteOn(60, 127);
+  const p = pmap(c[0]);
+  near(p.pitch, 1 + 6);
+  near(p.amp, dbtoa(-6) * 1 * 0.75);
+  near(p.cutoff, 10000 * Math.sqrt(0.05));
+  assert.equal(p.rptdiv, 2);
+  assert.deepEqual(engine.tick(), []);                     // already in sync at this instant
+  const end = at(2000).tick();
+  assert.equal(end.length, 1);
+  assert.deepEqual(names(end[0]), ['cutoff', 'pitch', 'amp']);
+  near(pmap(end[0]).pitch, 13);
+  near(pmap(end[0]).amp, dbtoa(-6) * 0.5);
+  near(pmap(end[0]).cutoff, 10000 * 1000 / 20000);
+});
+
+test('gesture: release reverts every parameter, including rate, on all sounding voices', () => {
+  const { engine, at, setGest, g, src, model } = gmk({ gainDb: -3, cutoffHz: 12000, pitch: 2 });
+  model.addPad(61, src, 1, { cutoffHz: 20000 });
+  g.repeatOn = true; g.repeatDiv = '1/16'; g.swing = 10;
+  setGest(0, { rateFrom: '1/4', rateTo: '1/64', cutTo: 2000, pitchTo: -12, ampTo: 0.25 });
+  engine.noteOn(60, 100);                                  // v0
+  engine.noteOn(61, 100);                                  // v1
+  engine.noteOff(61);                                      // v1 released tail, still sounding
+  engine.noteOn(MOD.GEST_0, 100);
+  assert.ok(at(2000).tick().length === 2);
+  const rel = engine.noteOff(MOD.GEST_0);
+  assert.deepEqual(rel.map((c) => c.voice), [0, 1]);
+  const base0 = dbtoa(-3) * velCurve(100, 0);
+  let p = pmap(rel[0]);
+  assert.deepEqual(p, { rptdiv: 4, rptswing: 0.1, rptalt: 0, cutoff: 12000, pitch: 2, amp: base0 });
+  p = pmap(rel[1]);
+  assert.equal(p.rptdiv, 4);
+  assert.equal(p.cutoff, 20000);
+  near(p.pitch, 0);
+  assert.equal(engine.needsTick(), false);
+  assert.deepEqual(engine.tick(), []);
+});
+
+test('gesture: releasing right after the press restores only the rate', () => {
+  const { engine, setGest } = gmk();
+  setGest(0, { rateFrom: '1/8', rateTo: '1/64', cutTo: 1000 });
+  engine.noteOn(60, 100);
+  engine.noteOn(MOD.GEST_0, 100);
+  assert.deepEqual(engine.noteOff(MOD.GEST_0), [{ voice: 0, params: [['rptdiv', 0], ['rptswing', 0], ['rptalt', 0]] }]);
+});
+
+test('gesture: the most recently pressed gesture is active; releasing it falls back to the older one', () => {
+  const { engine, at, setGest } = gmk();
+  setGest(0, { pitchFrom: 0, pitchTo: 12, beats: 4 });       // 2000 ms
+  setGest(1, { pitchFrom: 0, pitchTo: -12, beats: 2 });      // 1000 ms
+  engine.noteOn(60, 100);
+  engine.noteOn(MOD.GEST_0, 100);                           // t0 = 0
+  near(pmap(at(1000).tick()[0]).pitch, 6);
+  // GEST_1 pressed at 1000 ms: switches (its t = 0 value) and restarts the clock
+  const sw = at(1000).noteOn(MOD.GEST_1, 100);
+  near(pmap(sw[0]).pitch, 0);
+  near(pmap(at(1500).tick()[0]).pitch, -6);
+  near(pmap(at(2000).tick()[0]).pitch, -12);
+  assert.deepEqual(at(2400).tick(), []);                     // GEST_1 finished and holds
+  // releasing GEST_1 falls back to GEST_0 which kept its own start time: 2400 / 2000 -> end
+  const back = at(2400).noteOff(MOD.GEST_1);
+  near(pmap(back[0]).pitch, 12);
+  assert.equal(engine.needsTick(), true);
+  assert.deepEqual(at(2500).tick(), []);                     // GEST_0 already finished
+  near(pmap(engine.noteOff(MOD.GEST_0)[0]).pitch, 0);
+  assert.equal(engine.needsTick(), false);
+});
+
+test('gesture: releasing the older of two held gestures changes nothing', () => {
+  const { engine, at, setGest } = gmk();
+  setGest(0, { pitchTo: 12 });
+  setGest(1, { pitchTo: -12 });
+  engine.noteOn(60, 100);
+  engine.noteOn(MOD.GEST_0, 100);
+  at(500).noteOn(MOD.GEST_1, 100);
+  const cmds = at(1000).tick();
+  near(pmap(cmds[0]).pitch, -12 * 0.25);                     // GEST_1: 500 of 2000 ms
+  assert.deepEqual(engine.noteOff(MOD.GEST_0), []);          // not the active one
+  assert.equal(engine.needsTick(), true);
+  assert.deepEqual(at(1000).tick(), []);
+});
+
+test('gesture: duration follows the transport bpm (default 120)', () => {
+  const run = (bpmValue) => {
+    const { engine, at, setGest } = gmk();
+    if (bpmValue) engine.setTransport({ bpm: bpmValue, playing: true });
+    setGest(0, { pitchTo: 8, beats: 2 });
+    engine.noteOn(60, 100);
+    engine.noteOn(MOD.GEST_0, 100);
+    return (ms) => (at(ms), engine.tick().map(pmap));
+  };
+  const d120 = run(0);                                       // 2 beats = 1000 ms
+  near(d120(500)[0].pitch, 4);
+  near(d120(1000)[0].pitch, 8);
+  const d60 = run(60);                                       // 2000 ms
+  near(d60(1000)[0].pitch, 4);
+  near(d60(2000)[0].pitch, 8);
+  const d240 = run(240);                                     // 500 ms
+  near(d240(250)[0].pitch, 4);
+  near(d240(500)[0].pitch, 8);
+});
+
+test('gesture: definitions are read at tick time (edits while held apply)', () => {
+  const { engine, at, g, setGest } = gmk();
+  setGest(0, { pitchTo: 12 });
+  engine.noteOn(60, 100);
+  engine.noteOn(MOD.GEST_0, 100);
+  near(pmap(at(1000).tick()[0]).pitch, 6);
+  g.gestures[0].pitchTo = 24;                                // edited while held
+  near(pmap(engine.tick()[0]).pitch, 12);
+  g.gestures[0].beats = 8;                                   // longer: 1000 / 4000
+  near(pmap(engine.tick()[0]).pitch, 6);
+});
+
+test('gesture: tick emits only what changed (epsilon on cutoff, pitch and amp)', () => {
+  const { engine, at, setGest } = gmk();
+  setGest(0, { pitchTo: 12, cutFrom: 20000, cutTo: 1000, ampTo: 0 });   // 2000 ms
+  engine.noteOn(60, 100);
+  engine.noteOn(MOD.GEST_0, 100);
+  assert.deepEqual(at(0).tick(), []);
+  assert.deepEqual(at(0).tick(), []);
+  // per ms: pitch +0.006 st, amp -0.0005, cutoff about -0.15 %. 1 ms is below every threshold.
+  assert.deepEqual(at(1).tick(), []);
+  // 2 ms: pitch 0.012 > 0.01 st; cutoff 0.3 % < 0.5 %; amp 0.001 < 0.002
+  let cmds = at(2).tick();
+  assert.equal(cmds.length, 1);
+  assert.deepEqual(names(cmds[0]), ['pitch']);
+  near(pmap(cmds[0]).pitch, 0.012);
+  // 3 ms: pitch only 0.006 further than what was sent, cutoff 0.45 %, amp 0.0015
+  assert.deepEqual(at(3).tick(), []);
+  // 5 ms: pitch 0.018 further, cutoff 0.75 % and amp 0.0025 are past their thresholds
+  cmds = at(5).tick();
+  assert.deepEqual(names(cmds[0]).sort(), ['amp', 'cutoff', 'pitch']);
+  assert.deepEqual(at(5).tick(), []);                        // same instant: nothing new
+  // far past the end: lands exactly on the end values, then silence
+  cmds = at(100000).tick();
+  near(pmap(cmds[0]).pitch, 12);
+  near(pmap(cmds[0]).amp, 0);
+  near(pmap(cmds[0]).cutoff, 1000);
+  assert.deepEqual(at(200000).tick(), []);
+});
+
+test('gesture: the last tiny step still lands (end of the ramp is exact, not epsilon-limited)', () => {
+  const { engine, at, setGest } = gmk();
+  setGest(0, { pitchTo: 0.005, ampTo: 0.999 });              // total movement below every epsilon
+  engine.noteOn(60, 100);
+  engine.noteOn(MOD.GEST_0, 100);
+  assert.deepEqual(at(1999).tick(), []);                     // not complete yet, below epsilon
+  const cmds = at(2000).tick();
+  assert.deepEqual(names(cmds[0]).sort(), ['amp', 'pitch']);
+  near(pmap(cmds[0]).pitch, 0.005);
+  near(pmap(cmds[0]).amp, 0.999);
+});
+
+test('gesture: a gesture that changes nothing never emits', () => {
+  const { engine, at, setGest } = gmk();
+  setGest(0, {});                                            // neutral, rate off/off
+  engine.noteOn(60, 100);
+  assert.deepEqual(engine.noteOn(MOD.GEST_0, 100), []);
+  for (const ms of [0, 10, 500, 1999, 2000, 5000]) assert.deepEqual(at(ms).tick(), [], 'ms ' + ms);
+  assert.deepEqual(engine.noteOff(MOD.GEST_0), []);
+});
+
+test('gesture: applies to layer voices and released tails, not to free or ended voices', () => {
+  const { model, engine, at, setGest, src } = gmk();
+  const layer = model.addPad(null, src, 1, { cutoffHz: 10000 });
+  model.getPadOnKey(60).layers = [layer.id];
+  model.addPad(61, src, 2);
+  model.addPad(62, src, 3);
+  setGest(0, { cutTo: 2000 });
+  engine.noteOn(60, 100);                                    // v0 main, v1 layer
+  engine.noteOn(61, 100);                                    // v2
+  engine.noteOff(61);                                        // released tail
+  engine.noteOn(62, 100);                                    // v3
+  engine.voiceEnded(3);                                      // held + ended => silent
+  engine.noteOn(MOD.GEST_0, 100);
+  const cmds = at(2000).tick();
+  assert.deepEqual(cmds.map((c) => c.voice), [0, 1, 2]);
+  near(pmap(cmds[1]).cutoff, 10000 * 2000 / 20000);
+});
+
+test('gesture: without gesture definitions in the globals it is inert but does not throw', () => {
+  const { engine, at, g } = gmk();
+  delete g.gestures;
+  engine.noteOn(60, 100);
+  assert.deepEqual(engine.noteOn(MOD.GEST_2, 100), []);
+  assert.equal(engine.needsTick(), true);
+  assert.deepEqual(at(1000).tick(), []);
+  g.gestures = [];                                           // definition missing for this index
+  assert.deepEqual(at(2000).tick(), []);
+  assert.deepEqual(engine.noteOff(MOD.GEST_2), []);
+});
+
+test('gesture: the press time is the clock at press, not at creation (default clock works too)', () => {
+  const { engine, at, setGest } = gmk();
+  setGest(0, { pitchTo: 10 });
+  engine.noteOn(60, 100);
+  at(7000).noteOn(MOD.GEST_0, 100);                           // pressed 7 s after the origin
+  near(pmap(at(8000).tick()[0]).pitch, 5);
+
+  const real = mk();                                           // no `now` injected => Date.now
+  const src = real.model.addSource();
+  real.model.addPad(60, src, 0);
+  real.engine.noteOn(60, 100);
+  real.engine.noteOn(MOD.GEST_1, 100);                         // Rise: pitch 0 -> 12 over 4 beats
+  assert.ok(Array.isArray(real.engine.tick()));
+  assert.equal(real.engine.needsTick(), true);
+});
+
+test('gesture + morph + scan: refreshMorph and refreshScan keep the gesture factors on top', () => {
+  const { model, engine, at, setGest, g, src } = gmk({ cutoffHz: 20000, morph: { cutoffHz: 2000, gainDb: -6 } });
+  model.addPad(61, src, 1, { cutoffHz: 8000, gainDb: -12 });
+  setGest(0, { cutFrom: 20000, cutTo: 10000, pitchFrom: 3, pitchTo: 3, ampFrom: 0.5, ampTo: 0.5 });
+  engine.noteOn(60, 127);
+  engine.noteOn(MOD.GEST_0, 100);
+  g.morph = 100;
+  const m = pmap(engine.refreshMorph()[0]);
+  near(m.cutoff, 2000);                                       // t = 0: factor 1
+  near(m.pitch, 3);
+  near(m.amp, dbtoa(-6) * 0.5);
+  near(pmap(at(2000).tick()[0]).cutoff, 1000);                // 2000 * 10000 / 20000
+  g.scan = 100;                                               // key 60 -> pad on 61 (2 occupied keys)
+  const s = pmap(engine.refreshScan()[0]);
+  near(s.cutoff, 8000 * 0.5);
+  near(s.pitch, 3);
+  near(s.amp, dbtoa(-12) * 0.5);
+});
+
 // ---------------------------------------------------------------------------
 // API shape and ES5 discipline
 // ---------------------------------------------------------------------------

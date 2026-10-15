@@ -1860,6 +1860,11 @@ function create(host) {
         if (!pad) { return; }
         if (model.globals().morphEdit) {
           if (!lastEditedMorph) { setStatus('Edit a B parameter first'); return; }
+          // The model copies B values only; a pad without a B value for this param
+          // shows its A value, so make that the B value first ("-> Sample" copies what is shown).
+          if (!pad.morph || !has(pad.morph, lastEditedMorph)) {
+            model.setPadMorphParam(pad.id, lastEditedMorph, pad[lastEditedMorph]);
+          }
           model.applyMorphParamToSource(pad.id, lastEditedMorph);
           sendCommands(engine.refreshMorph());
           setStatus('Applied B ' + lastEditedMorph + ' to the whole sample');
