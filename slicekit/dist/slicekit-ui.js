@@ -18,14 +18,23 @@
  *     selectedFrames   frame count of the selected source (needed to turn a
  *                      normalized waveform position into addslice/moveslice
  *                      frames; without it those two actions are disabled)
- *     modStart         first key of the 12-key modifier zone (otherwise it is
+ *     modStart         first key of the 16-key modifier zone (otherwise it is
  *                      derived from the lowest key with the "mod zone" flag)
+ *
+ * v2 fields (all optional; a v1 view renders exactly as before):
+ *     morph            0..100, shown as "MORPH nn%" in the status line when > 0
+ *     morphEdit        0/1, shows the "EDIT B" badge
+ *     scan             0..100, shown as "SCAN nn%" when > 0
+ *     gesture          index 0..3 of the active gesture or -1; highlights the
+ *                      matching G1..G4 key of the mod zone
+ *     gestureNames     4 strings; the active gesture's name goes in the status line
+ *     keyFlags bit 64  the pad has morph B values (small diamond on the key)
  *
  * Layout (default 600x160, any size >= 80 px high works):
  *     source tabs   18 px   one chip per source
  *     waveform      ~58 %   of the remaining height
  *     keyboard      ~42 %   48 keys (4 octaves) with < > buttons
- *     status line   14 px
+ *     status line   14 px   [EDIT B] [MORPH] [SCAN] [gesture] status ...  key  SLOT x
  *
  * The file is organised as: Max wiring, constants, pure helpers (layout, key
  * geometry, hit testing), state + event handlers, painting, exports for the
@@ -75,12 +84,18 @@ var FLAG_LAYERS = 4;
 var FLAG_MOD = 8;
 var FLAG_SOUNDING = 16;
 var FLAG_COPY = 32;
+var FLAG_MORPHB = 64;
 
 var NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
 var IS_BLACK = [0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0];
 var WHITES_BELOW = [0, 1, 1, 2, 2, 3, 4, 4, 5, 5, 6, 6];
-/* labels for the 12 modifier actions, in Model.CONST.MOD_ACTIONS order */
-var MOD_LABELS = ['4', '8', '8T', '16', '16T', '32', '64', 'Rv', 'O-', 'O+', 'Tp', 'Ch'];
+/* labels for the 16 mod zone keys: 12 modifier actions in Model.CONST.MOD_ACTIONS
+ * order, then the four gesture keys */
+var MOD_LABELS = ['4', '8', '8T', '16', '16T', '32', '64', 'Rv', 'O-', 'O+', 'Tp', 'Ch',
+    'G1', 'G2', 'G3', 'G4'];
+var GESTURE_COUNT = 4;
+var GESTURE_OFFSET = 12;      /* mod zone offset of the first gesture key (G1) */
+var STATUS_MIN_TEXT = 48;     /* px kept for the status text before optional indicators are dropped */
 var SLOT_LETTERS = 'ABCDEFGH';
 
 var DEFAULT_PALETTE = ['#FF5A5A', '#FFA54A', '#FFD84A', '#9BE35A',
@@ -105,6 +120,10 @@ var COL = {
     modW: [0.23, 0.19, 0.31],
     modB: [0.16, 0.13, 0.23],
     hatch: [0.72, 0.64, 0.92],
+    gesture: [0.36, 0.86, 0.95],
+    editB: [1, 0.45, 0.28],
+    morphTxt: [1, 0.66, 0.48],
+    scanTxt: [0.56, 0.86, 0.56],
     sounding: [1, 0.93, 0.37],
     ink: [0.05, 0.05, 0.05],
     inkLight: [0.92, 0.92, 0.92]
@@ -163,6 +182,19 @@ function armedText(armed) {
 
 function modLabel(offset) {
     return (offset >= 0 && offset < MOD_LABELS.length) ? MOD_LABELS[offset] : '';
+}
+
+/* 0/1 from a number, boolean or numeric string */
+function toFlag(x) {
+    if (typeof x === 'string') {
+        x = Number(x);
+    }
+    return (x === true || (isNum(x) && x !== 0)) ? 1 : 0;
+}
+
+/* "nn" percent text for a 0..100 value that is > 0 (never shows 0%) */
+function pctText(x) {
+    return String(clamp(Math.round(x), 1, 100));
 }
 
 function inRect(r, x, y) {
@@ -261,6 +293,18 @@ function normalizeView(raw) {
             }
         }
     }
+
+    /* v2 fields */
+    v.morph = isNum(r.morph) ? clamp(r.morph, 0, 100) : 0;
+    v.scan = isNum(r.scan) ? clamp(r.scan, 0, 100) : 0;
+    v.morphEdit = toFlag(r.morphEdit);
+    var g = toInt(r.gesture, -1);
+    v.gesture = (g >= 0 && g < GESTURE_COUNT) ? g : -1;
+    v.gestureNames = [];
+    for (i = 0; i < GESTURE_COUNT; i++) {
+        var gn = Array.isArray(r.gestureNames) ? r.gestureNames[i] : '';
+        v.gestureNames.push((typeof gn === 'string' || isNum(gn)) ? String(gn) : '');
+    }
     return v;
 }
 
@@ -270,6 +314,15 @@ function modOffsetOf(v, k) {
     }
     var o = k - v.modStart;
     return (o >= 0 && o < MOD_LABELS.length) ? o : -1;
+}
+
+/* key of the active gesture (G1..G4 in the mod zone) or -1 */
+function gestureKey(v) {
+    if (v.gesture < 0 || v.modStart < 0) {
+        return -1;
+    }
+    var k = v.modStart + GESTURE_OFFSET + v.gesture;
+    return k < NUM_KEYS ? k : -1;
 }
 
 function findSource(v, index) {
@@ -525,6 +578,33 @@ function keyPolygon(L, ws, k) {
         pts.push(xl, yt + bh, xl + nb, yt + bh);
     }
     return pts;
+}
+
+/*
+ * Diamond [x0, y0, ...] marking a pad that has morph B values.  It sits at the
+ * top of the key, centred in the part not covered by neighbouring black keys,
+ * above the lock / reverse / layer glyphs.  null if the key is not visible.
+ */
+function morphMarkPoly(L, ws, k) {
+    var r = keyRect(L, ws, k);
+    if (!r) {
+        return null;
+    }
+    var nb = L.blackW / 2;
+    var lo = r.x;
+    var hi = r.x + r.w;
+    if (!r.black) {
+        if (k - 1 >= ws && isBlackKey(k - 1)) {
+            lo += nb;
+        }
+        if (k + 1 < ws + WIN_KEYS && isBlackKey(k + 1)) {
+            hi -= nb;
+        }
+    }
+    var rad = clamp((hi - lo) / 2 - 0.5, 1, 2.5);
+    var cx = (lo + hi) / 2;
+    var cy = r.y + 1.5 + rad;
+    return [cx, cy - rad, cx + rad, cy, cx, cy + rad, cx - rad, cy];
 }
 
 /* 45 degree hatch lines clipped to a rectangle: [[x1, y1, x2, y2], ...] */
@@ -1212,6 +1292,10 @@ function paintKey(L, v, k) {
     if (f & FLAG_SOUNDING) {
         fill = mixRgb(fill, COL.white, 0.45);
     }
+    var isGesture = k === gestureKey(v);
+    if (isGesture) {
+        fill = mixRgb(fill, COL.gesture, 0.6);
+    }
     fillRect(r.x, r.y, r.w, r.h, fill, 1);
     strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1, COL.keyLine, 0.9, 1);
 
@@ -1231,7 +1315,20 @@ function paintKey(L, v, k) {
         mgraphics.stroke();
         var lab = modLabel(modOffsetOf(v, k));
         var ly = black ? r.y + r.h / 2 + 3 : r.y + L.blackH + 9;
-        drawText(lab, cx, ly, 7, COL.inkLight, 0.95, 'center');
+        drawText(lab, cx, ly, 7, isGesture ? COL.white : COL.inkLight, 0.95, 'center');
+    }
+
+    /* morph B values: diamond at the top of the key */
+    var hasB = (f & FLAG_MORPHB) ? 1 : 0;
+    if (hasB) {
+        var dia = morphMarkPoly(L, winStart, k);
+        setRGBA(ink, 0.9);
+        mgraphics.move_to(dia[0], dia[1]);
+        for (i = 2; i < dia.length; i += 2) {
+            mgraphics.line_to(dia[i], dia[i + 1]);
+        }
+        mgraphics.close_path();
+        mgraphics.fill();
     }
 
     /* lock / reversed / layers glyphs: a row on white keys, a column on black ones */
@@ -1245,10 +1342,12 @@ function paintKey(L, v, k) {
     if (f & FLAG_LAYERS) {
         glyphs.push(drawDotGlyph);
     }
-    var step = clamp(Math.floor((r.h - 8) / Math.max(1, glyphs.length)), 4, 8);
+    /* on black keys the column starts lower when the diamond sits at the top */
+    var top = black ? 7 + (hasB ? 5 : 0) : 7;
+    var step = clamp(Math.floor((r.h - 1 - top) / Math.max(1, glyphs.length)), 4, 8);
     for (i = 0; i < glyphs.length; i++) {
         if (black) {
-            glyphs[i](cx, r.y + 7 + i * step, ink);
+            glyphs[i](cx, r.y + top + i * step, ink);
         } else {
             glyphs[i](cx + (i - (glyphs.length - 1) / 2) * 7, r.y + L.blackH + 6, ink);
         }
@@ -1311,9 +1410,41 @@ function paintKeys(L, v) {
             strokePoly(keyPolygon(L, ws, k), COL.sounding, 1, 2);
         }
     }
+    var gk = gestureKey(v);
+    if (gk >= ws && gk < ws + WIN_KEYS) {
+        strokePoly(keyPolygon(L, ws, gk), COL.gesture, 1, 2);
+    }
     if (v.selectedKey >= ws && v.selectedKey < ws + WIN_KEYS) {
         strokePoly(keyPolygon(L, ws, v.selectedKey), COL.white, 1, 2);
     }
+}
+
+/*
+ * Optional status indicators in priority order: [{kind, text, short?}].
+ * Absent / zero v2 fields give an empty list.
+ */
+function statusIndicators(v) {
+    var out = [];
+    if (v.morphEdit) {
+        out.push({ kind: 'edit', text: 'EDIT B', short: 'B' });
+    }
+    if (v.morph > 0) {
+        out.push({ kind: 'morph', text: 'MORPH ' + pctText(v.morph) + '%' });
+    }
+    if (v.scan > 0) {
+        out.push({ kind: 'scan', text: 'SCAN ' + pctText(v.scan) + '%' });
+    }
+    if (v.gesture >= 0) {
+        var tag = 'G' + (v.gesture + 1);
+        var name = v.gestureNames[v.gesture];
+        out.push({ kind: 'gesture', text: (name && name !== tag) ? tag + ' ' + name : tag });
+    }
+    return out;
+}
+
+function measure(s, px) {
+    setFont(px);
+    return textW(s);
 }
 
 function paintStatus(L, v) {
@@ -1336,8 +1467,44 @@ function paintStatus(L, v) {
         drawText(armed, right, base, 9, COL.amber, 1, 'right');
         right -= textW(armed) + 12;
     }
+
+    /*
+     * Left side: EDIT B badge, MORPH, SCAN and gesture indicators, then the
+     * status text in whatever room is left.  The badge is only dropped when it
+     * does not fit at all (then a bare "B"); the others make way for the
+     * status text once less than STATUS_MIN_TEXT px would remain for it.
+     */
     var text = note || v.status;
-    drawText(fitText(text, right - (r.x + 4), 9), r.x + 4, base, 9, note ? COL.amber : COL.text, 1, 'left');
+    var left = r.x + 4;
+    var inds = statusIndicators(v);
+    for (var i = 0; i < inds.length; i++) {
+        var ind = inds[i];
+        var room = right - left - ((ind.kind === 'edit' || !text) ? 0 : STATUS_MIN_TEXT);
+        if (ind.kind === 'edit') {
+            var label = ind.text;
+            var pw = measure(label, 8) + 10;
+            if (pw > room) {
+                label = ind.short;
+                pw = measure(label, 8) + 10;
+            }
+            if (pw <= room) {
+                fillRect(left, r.y + 1, pw, r.h - 2, COL.editB, 1);
+                drawText(label, left + pw / 2, base, 8, COL.ink, 1, 'center');
+                left += pw + 6;
+            }
+        } else {
+            var s = ind.text;
+            if (measure(s, 9) > room - 6) {
+                s = (ind.kind === 'gesture' && room - 6 >= 24) ? fitText(s, room - 6, 9) : '';
+            }
+            if (s) {
+                var col = ind.kind === 'morph' ? COL.morphTxt : (ind.kind === 'scan' ? COL.scanTxt : COL.gesture);
+                drawText(s, left, base, 9, col, 1, 'left');
+                left += textW(s) + 10;
+            }
+        }
+    }
+    drawText(fitText(text, right - left, 9), left, base, 9, note ? COL.amber : COL.text, 1, 'left');
 }
 
 function paint() {
@@ -1362,7 +1529,11 @@ if (typeof module !== 'undefined' && module.exports) {
             MAX_WIN_START: MAX_WIN_START,
             MARKER_TOL: MARKER_TOL,
             DRAG_THRESHOLD: DRAG_THRESHOLD,
-            AUDITION_VEL: AUDITION_VEL
+            AUDITION_VEL: AUDITION_VEL,
+            FLAG_MORPHB: FLAG_MORPHB,
+            GESTURE_COUNT: GESTURE_COUNT,
+            GESTURE_OFFSET: GESTURE_OFFSET,
+            STATUS_MIN_TEXT: STATUS_MIN_TEXT
         },
         normalizeView: normalizeView,
         computeLayout: computeLayout,
@@ -1390,6 +1561,9 @@ if (typeof module !== 'undefined' && module.exports) {
         slotLetter: slotLetter,
         armedText: armedText,
         modLabel: modLabel,
+        gestureKey: gestureKey,
+        morphMarkPoly: morphMarkPoly,
+        statusIndicators: statusIndicators,
         hexToRgb: hexToRgb,
         fitText: fitText
     };

@@ -2015,8 +2015,12 @@ function create(host) {
         model.setGlobal('captureBars', CONST.CAPTURE_BARS[clampInt(v, 0, CONST.CAPTURE_BARS.length - 1)]);
         break;
       case 'capturefolder':
-        model.setGlobal('captureFolder', stripSlash(a.slice(1).join(' ')));
-        if (model.globals().captureFolder) { setStatus('Capture folder: ' + model.globals().captureFolder); }
+        // an empty path (cancelled dialog) keeps the current folder
+        res = stripSlash(a.slice(1).join(' '));
+        if (res) {
+          model.setGlobal('captureFolder', res);
+          setStatus('Capture folder: ' + res);
+        }
         break;
       case 'keepclip':
         model.setGlobal('keepClip', toBool(v));
@@ -2209,7 +2213,11 @@ function create(host) {
         return;
       }
       h = handlers[name];
-      h(a);
+      if (has(MAP_MESSAGES, name) && model) {
+        mapTracked(function () { h(a); });
+      } else {
+        h(a);
+      }
       if (!has(REALTIME, name) && model) { afterEdit(); }
     } catch (e) {
       log('error handling "' + name + '": ' + errText(e));
@@ -2232,6 +2240,8 @@ function create(host) {
       try { if (typeof liveObjs[i].freepeer === 'function') { liveObjs[i].freepeer(); } } catch (e3) { /* ignore */ }
     }
     liveObjs = [];
+    freeTemps();
+    tickRunning = false;
     pending = {};
   };
 
@@ -2240,7 +2250,8 @@ function create(host) {
     return {
       model: model, engine: engine, sel: sel, armed: armed, lastEdited: lastEdited,
       autoParams: autoParams, monoCache: monoCache, pending: pending, status: status,
-      names: { prefix: prefix, state: stateName, view: viewName }
+      simplers: simplers, lastMapping: lastMapping, gestHeld: gestHeld, tickRunning: tickRunning,
+      names: { prefix: prefix, state: stateName, view: viewName, cap: capName, capwp: capWpName, capout: capOutName }
     };
   };
 

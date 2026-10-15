@@ -1512,6 +1512,38 @@ test('parity: forward / reverse / pitch / envelope / filter / drive / amp / kill
   assert.ok(rms(out.left, 0, 40000) > 0.01, 'non-trivial audio');
 });
 
+test('parity: cutoff steps and sweeps mid-note (smoothing, bypass crossings both ways, snaps at restarts)', () => {
+  // bright, stereo, deterministic material so that the filter really matters
+  const rnd = mulberry32(4242);
+  const l = new Float32Array(60000), r = new Float32Array(60000);
+  for (let i = 0; i < 60000; i++) {
+    const tone = 0.3 * Math.sin(2 * Math.PI * 2500 * i / SR);
+    l[i] = tone + 0.3 * (rnd() * 2 - 1);
+    r[i] = 0.3 * Math.sin(2 * Math.PI * 7000 * i / SR) + 0.3 * (rnd() * 2 - 1);
+  }
+  const buf = { channels: [l, r], sr: SR };
+  const script = [
+    { at: 0, set: { pstart: 1000, pend: 55000, held: 1, cutoff: 20000, trig: 1 } },
+    { at: 3000, set: { cutoff: 18000 } },          // bypass -> filter (crossing after ~17 ms)
+    { at: 9000, set: { cutoff: 600 } },
+    { at: 12000, set: { cutoff: 24000 } },         // filter -> bypass
+    { at: 16000, set: { cutoff: 19000 } },         // exactly the bypass limit
+    { at: 18000, set: { cutoff: 18999, trig: 2 } },    // retrigger with a changed cutoff (snap)
+    { at: 21000, set: { cutoff: 90000 } },         // above the Param range of the filter clamp
+    { at: 22000, set: { cutoff: 1 } },             // the lowest value (clamped to 10 Hz in the filter)
+    { at: 24000, set: { cutoff: 3000, kill: 1 } },
+    { at: 24050, set: { cutoff: 150, trig: 3 } },  // kill then trig: the new note wins
+    { at: 26000, set: { cutoff: 20000, held: 0 } },
+    { at: 27000, set: { cutoff: 800, held: 1, trig: 4, rptdiv: 8, playing: 1, pend: 4000 } }
+  ];
+  // a 1 s sweep in 15 ms steps (20000 -> 500) and back, starting at 30000
+  const every = 662;
+  for (let k = 1; k <= 66; k++) { script.push({ at: 30000 + k * every, set: { cutoff: 20000 * Math.pow(0.025, k / 66) } }); }
+  for (let k = 1; k <= 66; k++) { script.push({ at: 75000 + k * every, set: { cutoff: 500 * Math.pow(40, k / 66) } }); }
+  const out = parity(buf, script, 125000, hostPhase(SPB, 321));
+  assert.ok(rms(out.left, 0, 3000) > 0.05 && rms(out.right, 80000, 90000) > 0.001, 'non-trivial audio');
+});
+
 test('parity: micro-loop (forward, reverse, live enable / exit) scenarios', () => {
   const buf = { channels: [sineBuffer(60000, 180, 0.7).channels[0]], sr: SR };
   const script = [
@@ -1586,7 +1618,7 @@ test('parity: random scenarios (seeded fuzz of every parameter and event)', () =
           if (rnd() < 0.5) { set.pstart = a; set.pend = Math.min(frames + 500, a + len); set.dir = 1; }
           else { set.pstart = Math.min(frames, a + len); set.pend = a; set.dir = -1; }
         }
-        else if (what === 'filter') { set.cutoff = pick([40, 300, 2000, 12000, 19000, 20000]); }
+        else if (what === 'filter') { set.cutoff = pick([1, 40, 300, 2000, 8000, 12000, 17500, 18999, 19000, 20000, 60000]); }
         else if (what === 'drive') { set.drive = pick([0, 0.2, 1]); }
         else if (what === 'tape') { set.tape = rnd() < 0.5 ? 1 : 0; set.tapems = pick([5, 50, 400]); }
         else if (what === 'env') { set.att = pick([0, 2, 30]); set.dec = pick([0, 10, 120]); set.sus = pick([0, 0.4, 1]); set.rel = pick([0, 5, 80, 400]); }
