@@ -1174,7 +1174,10 @@ function createModel(state, deps) {
   // Replace the slices of `src` with `ranges` following the reslice policy.
   // preserveSame: slices whose [start,end) is unchanged keep their id/features
   // (used by the manual slice-point edits; setSlices always makes fresh ones).
-  function resliceSource(src, ranges, preserveSame) {
+  // forced (manual edits only): { oldSliceId: start frame of the new slice it becomes },
+  // so the pads of a split / moved / merged slice go to that slice instead of the new
+  // slice with the nearest start.
+  function resliceSource(src, ranges, preserveSame, forced) {
     var oldSlices = src.slices;
     var clean = sanitizeRanges(ranges, src.frames);
     var oldById = {};
@@ -1200,11 +1203,14 @@ function createModel(state, deps) {
       newStarts.push(r.start);
     }
 
-    // old slice id -> new slice id (nearest start), null when there are no new slices
+    // old slice id -> new slice id (forced, else nearest start), null when there are no new slices
     var idMap = {};
+    var byStart = {};
+    for (i = 0; i < newSlices.length; i++) byStart[newSlices[i].start] = newSlices[i];
     for (i = 0; i < oldSlices.length; i++) {
       o = oldSlices[i];
       if (hasOwn(reused, o.id)) idMap[o.id] = o.id;
+      else if (forced && hasOwn(forced, o.id) && hasOwn(byStart, forced[o.id])) idMap[o.id] = byStart[forced[o.id]].id;
       else idMap[o.id] = newSlices.length ? newSlices[nearestIndex(newStarts, o.start)].id : null;
     }
 
@@ -1255,13 +1261,18 @@ function createModel(state, deps) {
     src.slices = newSlices;
     touchSlices();
 
-    var s;
+    var s, dropped;
+    var results = [];
     if (fresh.length) {
       for (s = 0; s < NUM_SLOTS; s++) {
-        if (!state.slots[s].auto) appendPads(state.slots[s], fresh);
+        if (!state.slots[s].auto) {
+          dropped = appendPads(state.slots[s], fresh);
+          if (s === state.currentSlot) results.push({ slot: s, placed: fresh.length - dropped, dropped: dropped });
+        }
       }
     }
-    relayoutAutoSlots();
+    relayoutAutoSlots(results);
+    recordLayout(results);
     gcPads();
     mark('slices');
     mark('pads');
@@ -1496,6 +1507,14 @@ function createModel(state, deps) {
   api.setSlices = function (sourceId, ranges) {
     var src = getSource(sourceId);
     if (!src) return false;
+    var clean = sanitizeRanges(ranges, src.frames);
+    lastTruncation = 0;
+    if (clean.length > MAX_SLICES) {
+      // cap: the tail is merged into the last allowed slice, the coverage stays the same
+      lastTruncation = clean.length - MAX_SLICES;
+      clean[MAX_SLICES - 1].end = clean[clean.length - 1].end;
+      clean.length = MAX_SLICES;
+    }
     var initial = src.slices.length === 0;
     if (initial) {
       clearHistory();
@@ -1503,10 +1522,15 @@ function createModel(state, deps) {
       var snap = (pendingSnap && pendingSnap.sourceId === src.id) ? pendingSnap.snap : null;
       beginOp('slices:' + src.id, snap);
     }
-    resliceSource(src, ranges, false);
+    resliceSource(src, clean, false, null);
     mark('all');
     flush();
     return true;
+  };
+
+  // number of slice points the most recent setSlices dropped to respect MAX_SLICES (0 = none)
+  api.lastSliceTruncation = function () {
+    return lastTruncation;
   };
 
   api.setSliceFeatures = function (sourceId, featuresArray) {
@@ -1524,11 +1548,11 @@ function createModel(state, deps) {
   };
 
   // manual slice-point edits: set mode 'manual' and go through the reslice policy
-  function manualEdit(src, coalesceKey, ranges) {
+  function manualEdit(src, coalesceKey, ranges, forced) {
     beginOp(coalesceKey, null);
     src.slicing.mode = 'manual';
     touchSlices();
-    resliceSource(src, ranges, true);
+    resliceSource(src, ranges, true, forced);
     mark('sources');
     mark('all');
     flush();
@@ -1552,11 +1576,15 @@ function createModel(state, deps) {
     var f = toInt(frame);
     if (isNaN(f)) return false;
     var ranges = currentRanges(src);
-    var i;
+    if (ranges.length >= MAX_SLICES) return false;
+    var i, forced;
     for (i = 0; i < ranges.length; i++) {
       if (f > ranges[i].start && f < ranges[i].end) {
+        // the pads of the split slice stay on its first half
+        forced = {};
+        if (i < src.slices.length) forced[src.slices[i].id] = ranges[i].start;
         ranges.splice(i, 1, { start: ranges[i].start, end: f }, { start: f, end: ranges[i].end });
-        return manualEdit(src, null, ranges);
+        return manualEdit(src, null, ranges, forced);
       }
     }
     return false;
@@ -1574,9 +1602,13 @@ function createModel(state, deps) {
     f = clamp(f, lo, hi);
     if (f === src.slices[i].start) return false;
     var ranges = currentRanges(src);
+    // both neighbours change their range but keep their pads (not "the nearest start")
+    var forced = {};
+    forced[src.slices[i - 1].id] = ranges[i - 1].start;
+    forced[src.slices[i].id] = f;
     ranges[i - 1].end = f;
     ranges[i].start = f;
-    return manualEdit(src, 'move:' + src.id + ':' + i, ranges);
+    return manualEdit(src, 'move:' + src.id + ':' + i, ranges, forced);
   };
 
   api.removeSlicePoint = function (sourceId, sliceIndex) {
@@ -1585,8 +1617,12 @@ function createModel(state, deps) {
     var i = toInt(sliceIndex);
     if (isNaN(i) || i < 1 || i >= src.slices.length) return false;
     var ranges = currentRanges(src);
+    // the pads of both merged slices go to the merged slice
+    var forced = {};
+    forced[src.slices[i - 1].id] = ranges[i - 1].start;
+    forced[src.slices[i].id] = ranges[i - 1].start;
     ranges.splice(i - 1, 2, { start: ranges[i - 1].start, end: ranges[i].end });
-    return manualEdit(src, null, ranges);
+    return manualEdit(src, null, ranges, forced);
   };
 
   api.getSlice = function (sliceId) {
@@ -2081,6 +2117,7 @@ function createModel(state, deps) {
     var before = JSON.stringify(sl);
     var token = beginOp(null, null);
     var res = placeLayout(s, layoutOrder());
+    lastLayoutRes = { placed: res.placed, dropped: res.dropped, slot: s };
     sl.auto = true;
     if (JSON.stringify(sl) === before) {
       cancelOp(token);
@@ -2090,6 +2127,11 @@ function createModel(state, deps) {
       flush();
     }
     return res;
+  };
+
+  // outcome of the most recent layout pass (see the header): { placed, dropped, slot }
+  api.lastLayout = function () {
+    return { placed: lastLayoutRes.placed, dropped: lastLayoutRes.dropped, slot: lastLayoutRes.slot };
   };
 
   api.occupiedKeys = function (slot) {
@@ -2205,6 +2247,7 @@ function createModel(state, deps) {
       cur++;
     }
     slot.auto = false;
+    lastLayoutRes = { placed: placed, dropped: pads.length - placed, slot: state.currentSlot };
     gcPads();
     mark('map');
     flush();

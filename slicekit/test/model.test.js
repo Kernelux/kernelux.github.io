@@ -4317,6 +4317,407 @@ test('random morph / gesture / copy operations keep every invariant and every un
   });
 });
 
+// ================================================================ v2 fixes: slice cap, merge mapping, lastLayout
+
+// source with explicit slice ranges (frames = end of the last one) and optional features
+function addRanged(m, name, rs, featFn) {
+  const s = m.addSource({ name, path: '/samples/' + name + '.wav' });
+  m.setSourceInfo(s.id, { frames: rs[rs.length - 1].end, sr: 44100, channels: 1 });
+  m.setSlices(s.id, rs);
+  if (featFn) m.setSliceFeatures(s.id, rs.map((_, i) => featFn(i)));
+  return s;
+}
+
+function assertCovers(src) {
+  assert.equal(src.slices[0].start, 0);
+  for (let i = 1; i < src.slices.length; i++) assert.equal(src.slices[i].start, src.slices[i - 1].end, 'slice ' + i + ' is contiguous');
+  assert.equal(src.slices[src.slices.length - 1].end, src.frames);
+}
+
+test('MAX_SLICES is 128', () => {
+  assert.equal(CONST.MAX_SLICES, 128);
+});
+
+test('setSlices caps at 128 slices: the tail is merged into the 128th, coverage unchanged, lastSliceTruncation reports the drop', () => {
+  const m = mk();
+  const s = m.addSource({ name: 'long', path: '/x/long.wav' });
+  m.setSourceInfo(s.id, { frames: 130 * 100, sr: 44100, channels: 1 });
+  assert.equal(m.lastSliceTruncation(), 0, 'nothing truncated yet');
+  assert.equal(m.setSlices(s.id, ranges(130, 100)), true, 'setSlices still returns true / false');
+  assert.equal(s.slices.length, 128);
+  assert.equal(m.lastSliceTruncation(), 2, 'two slice points were dropped');
+  assert.deepEqual({ start: s.slices[127].start, end: s.slices[127].end }, { start: 127 * 100, end: 130 * 100 });
+  assert.deepEqual({ start: s.slices[126].start, end: s.slices[126].end }, { start: 126 * 100, end: 127 * 100 });
+  assertCovers(s);
+  assert.equal(Object.keys(m.state.pads).length, 128, 'one base pad per remaining slice');
+  s.slices.forEach((sl) => basePadOf(m, sl.id));
+  checkInvariants(m);
+  // the record belongs to the most recent setSlices call
+  m.setSlices(s.id, ranges(10, 1300));
+  assert.equal(m.lastSliceTruncation(), 0);
+  m.setSlices(s.id, ranges(129, 100));
+  assert.equal(m.lastSliceTruncation(), 1);
+  assert.equal(s.slices.length, 128);
+  assert.deepEqual({ start: s.slices[127].start, end: s.slices[127].end }, { start: 127 * 100, end: 129 * 100 });
+  m.setSlices(s.id, ranges(128, 100));
+  assert.equal(m.lastSliceTruncation(), 0, 'exactly 128 is fine');
+  assert.equal(s.slices.length, 128);
+  assert.equal(s.slices[127].end, 128 * 100);
+  m.setSlices(s.id, ranges(500, 26));
+  assert.equal(m.lastSliceTruncation(), 372);
+  assert.equal(s.slices.length, 128);
+  assert.equal(s.slices[127].end, 500 * 26);
+  checkInvariants(m);
+});
+
+test('the cap counts sanitised ranges, merges gaps into the last slice, and a truncating reslice is one undo step', () => {
+  const m = mk();
+  const s = addSrc(m, 'a', 4, null, 1000);
+  const pad0 = m.getPadOnKey(36);
+  m.setPadParam(pad0.id, 'pitch', 5);
+  const before = stripped(m);
+  // 128 real ranges plus empty / inverted / duplicate junk: nothing is dropped
+  const junk = ranges(128, 10).concat([{ start: 5, end: 5 }, { start: 9, end: 3 }, { start: 0, end: 10 }, null]);
+  assert.equal(m.setSlices(s.id, junk), true);
+  assert.equal(m.lastSliceTruncation(), 0);
+  assert.equal(s.slices.length, 128);
+  m.undo();
+  assert.deepEqual(stripped(m), before);
+  // 130 ranges with a gap before the last one: the merged slice spans the gap
+  const gappy = ranges(130, 10);
+  gappy[129] = { start: 1500, end: 2000 };
+  assert.equal(m.setSlices(s.id, gappy), true);
+  assert.equal(m.lastSliceTruncation(), 2);
+  assert.deepEqual({ start: s.slices[127].start, end: s.slices[127].end }, { start: 1270, end: 2000 });
+  assert.equal(s.slices.length, 128);
+  // the single undo step restores the 4-slice state exactly
+  m.undo();
+  assert.deepEqual(stripped(m), before);
+  assert.equal(m.canUndo(), true, 'only the truncating reslice was undone (the pitch edit is still a step)');
+  m.redo();
+  assert.equal(s.slices.length, 128);
+  checkInvariants(m);
+});
+
+test('a capped source lays out normally: 128 base pads, the keys that do not fit are reported', () => {
+  const m = mk();
+  const s = m.addSource({ name: 'long', path: '/x/long.wav' });
+  m.setSourceInfo(s.id, { frames: 200 * 10, sr: 44100, channels: 1 });
+  m.setSlices(s.id, ranges(200, 10));
+  assert.equal(s.slices.length, 128);
+  assert.equal(m.occupiedKeys().length, 92, 'keys 36..127');
+  assert.deepEqual(m.lastLayout(), { placed: 92, dropped: 36, slot: 0 });
+});
+
+test('addSlicePoint refuses at 128 slices (no state change, no undo step, no notification)', () => {
+  const m = mk();
+  const s = addSrc(m, 'a', 127, null, 1000);
+  assert.equal(m.addSlicePoint(s.id, 500), true);
+  assert.equal(s.slices.length, 128);
+  const before = JSON.stringify(m.state);
+  const kinds = record(m);
+  assert.equal(m.addSlicePoint(s.id, 1500), false);
+  assert.equal(m.addSlicePoint(s.id, 99999), false);
+  assert.equal(s.slices.length, 128);
+  assert.deepEqual(kinds, []);
+  assert.equal(JSON.stringify(m.state), before);
+  m.undo(); // the successful addSlicePoint is the only step
+  assert.equal(s.slices.length, 127);
+  assert.equal(m.canUndo(), false);
+  // removing a point makes room again
+  m.redo();
+  assert.equal(m.removeSlicePoint(s.id, 1), true);
+  assert.equal(s.slices.length, 127);
+  assert.equal(m.addSlicePoint(s.id, 1500), true);
+  assert.equal(s.slices.length, 128);
+  checkInvariants(m);
+});
+
+test('moveSlicePoint and removeSlicePoint still work on a full (128 slice) source', () => {
+  const m = mk();
+  const s = addSrc(m, 'a', 128, null, 100);
+  assert.equal(m.moveSlicePoint(s.id, 64, 6410), true);
+  assert.equal(s.slices.length, 128);
+  assert.equal(m.removeSlicePoint(s.id, 64), true);
+  assert.equal(s.slices.length, 127);
+  checkInvariants(m);
+});
+
+// ---------------------------------------------------------------- merge / move keep pads on their own slice
+
+test('removeSlicePoint: the pads of the removed slice go to the MERGED slice even when the next slice is nearer', () => {
+  const m = mk();
+  // s0 [0,1000) s1 [1000,1100) (short) s2 [1100,3000)
+  const s = addRanged(m, 'a', [{ start: 0, end: 1000 }, { start: 1000, end: 1100 }, { start: 1100, end: 3000 }]);
+  const [b0, b1, b2] = s.slices.map((sl) => basePadOf(m, sl.id));
+  const s2id = s.slices[2].id;
+  // non-base copies of the first two slices' pads
+  const c0 = m.duplicatePad(36, 70);
+  const c1 = m.duplicatePad(37, 71);
+  m.setPadParam(c1.id, 'pitch', 9);
+  assert.equal(m.removeSlicePoint(s.id, 1), true);
+  assert.equal(s.slices.length, 2);
+  assert.deepEqual({ start: s.slices[0].start, end: s.slices[0].end }, { start: 0, end: 1100 });
+  const merged = s.slices[0].id;
+  assert.equal(s.slices[1].id, s2id, 'the untouched slice keeps its id');
+  assert.equal(b0.sliceId, merged);
+  assert.equal(b1.sliceId, merged, 'the removed slice\'s base pad follows the merge (not the nearer next slice)');
+  assert.equal(c0.sliceId, merged);
+  assert.equal(c1.sliceId, merged);
+  assert.equal(b2.sliceId, s2id);
+  assert.equal(c1.pitch, 9, 'pad settings survive');
+  // exactly one base per slice: the lowest id that was base keeps it
+  assert.equal(b0.base, true);
+  assert.equal(b1.base, false);
+  assert.equal(basePadOf(m, merged), b0);
+  assert.equal(basePadOf(m, s2id), b2);
+  // every pad still sits on its key
+  assert.equal(m.getPadOnKey(37), b1);
+  assert.equal(m.getPadOnKey(70), c0);
+  assert.equal(m.getPadOnKey(71), c1);
+  checkInvariants(m);
+  // exact undo / redo
+  const after = stripped(m);
+  m.undo();
+  assert.equal(s.slices.length, 3);
+  assert.equal(b1.sliceId, s.slices[1].id);
+  assert.equal(b1.base, true);
+  m.redo();
+  assert.deepEqual(stripped(m), after);
+});
+
+test('removeSlicePoint merges in both length directions and at the ends; similar-swap cursors follow', () => {
+  // removed slice longer than the previous one
+  const m = mk();
+  const s = addRanged(m, 'a', [{ start: 0, end: 100 }, { start: 100, end: 2000 }, { start: 2000, end: 2100 }]);
+  const [b0, b1, b2] = s.slices.map((sl) => basePadOf(m, sl.id));
+  m.removeSlicePoint(s.id, 1);
+  assert.equal(b0.sliceId, s.slices[0].id);
+  assert.equal(b1.sliceId, s.slices[0].id);
+  assert.equal(b2.sliceId, s.slices[1].id);
+  // last slice removed (short, next slice does not exist)
+  const m2 = mk();
+  const s2 = addRanged(m2, 'a', [{ start: 0, end: 2000 }, { start: 2000, end: 2100 }]);
+  const [x0, x1] = s2.slices.map((sl) => basePadOf(m2, sl.id));
+  m2.removeSlicePoint(s2.id, 1);
+  assert.equal(s2.slices.length, 1);
+  assert.equal(x0.sliceId, s2.slices[0].id);
+  assert.equal(x1.sliceId, s2.slices[0].id);
+  checkInvariants(m2);
+
+  // sliceId and origSliceId of a similar-swapped copy both land on the merged slice
+  const m3 = mk();
+  const s3 = addRanged(m3, 'a', [{ start: 0, end: 1000 }, { start: 1000, end: 1100 }, { start: 1100, end: 3000 }],
+    (i) => feat([1000, 1100, 5000][i]));
+  // key 37 holds slice 1's pad; its nearest neighbour by centroid is slice 0
+  const sw = m3.swapSimilar(37, 1);
+  assert.equal(sw.origSliceId, s3.slices[1].id);
+  assert.equal(sw.sliceId, s3.slices[0].id);
+  assert.equal(sw.simIndex, 1);
+  m3.removeSlicePoint(s3.id, 1);
+  const merged = s3.slices[0].id;
+  assert.equal(sw.sliceId, merged);
+  assert.equal(sw.origSliceId, merged, 'the cursor follows the merge, not the nearer next slice');
+  checkInvariants(m3);
+});
+
+test('removeSlicePoint on a pad-heavy kit keeps every pad on the right side of the merge (random check)', () => {
+  const rng = prng.mulberry32(99);
+  for (let round = 0; round < 25; round++) {
+    const m = mk();
+    const n = 3 + prng.randInt(rng, 6);
+    const rs = [];
+    let at = 0;
+    for (let i = 0; i < n; i++) {
+      const len = 10 + prng.randInt(rng, 2000);
+      rs.push({ start: at, end: at + len });
+      at += len;
+    }
+    const s = addRanged(m, 'a', rs);
+    for (let i = 0; i < 6; i++) m.duplicatePad(36 + prng.randInt(rng, n), 70 + i);
+    const idx = 1 + prng.randInt(rng, n - 1);
+    const oldIds = s.slices.map((sl) => sl.id);
+    const owner = {};
+    padIds(m).forEach((id) => { owner[id] = oldIds.indexOf(m.getPad(id).sliceId); });
+    m.removeSlicePoint(s.id, idx);
+    const newIds = s.slices.map((sl) => sl.id);
+    padIds(m).forEach((id) => {
+      const o = owner[id];
+      const want = o === idx || o === idx - 1 ? newIds[idx - 1] : (o > idx ? newIds[o - 1] : newIds[o]);
+      assert.equal(m.getPad(id).sliceId, want, 'round ' + round + ' pad ' + id + ' (slice ' + o + ', removed point ' + idx + ')');
+    });
+    checkInvariants(m);
+  }
+});
+
+test('moveSlicePoint keeps every pad on its own slice, wherever the point goes', () => {
+  // s0 short, s1 long: moving the point far right must not send s1's pads to s0
+  const m = mk();
+  const s = addRanged(m, 'a', [{ start: 0, end: 100 }, { start: 100, end: 2000 }]);
+  const [b0, b1] = s.slices.map((sl) => basePadOf(m, sl.id));
+  const c1 = m.duplicatePad(37, 70);
+  assert.equal(m.moveSlicePoint(s.id, 1, 1900), true);
+  assert.deepEqual({ start: s.slices[1].start, end: s.slices[1].end }, { start: 1900, end: 2000 });
+  assert.equal(b0.sliceId, s.slices[0].id);
+  assert.equal(b1.sliceId, s.slices[1].id, 'old slice 1 stays slice 1 although old slice 0 starts nearer');
+  assert.equal(c1.sliceId, s.slices[1].id);
+  assert.equal(b1.base, true);
+  assert.equal(b0.base, true);
+  assert.equal(Object.keys(m.state.pads).length, 3, 'no pads created or dropped');
+  checkInvariants(m);
+  // and back to the left, past the old start of s0's neighbour
+  assert.equal(m.moveSlicePoint(s.id, 1, 1), true);
+  assert.equal(b0.sliceId, s.slices[0].id);
+  assert.equal(b1.sliceId, s.slices[1].id);
+  assert.equal(c1.sliceId, s.slices[1].id);
+  // a middle point of a longer chain
+  const m2 = mk();
+  const s2 = addRanged(m2, 'a', [{ start: 0, end: 500 }, { start: 500, end: 600 }, { start: 600, end: 5000 }, { start: 5000, end: 5200 }]);
+  const base2 = s2.slices.map((sl) => basePadOf(m2, sl.id));
+  m2.moveSlicePoint(s2.id, 2, 4800);
+  base2.forEach((p, i) => assert.equal(p.sliceId, s2.slices[i].id, 'pad ' + i + ' stays on slice ' + i));
+  m2.moveSlicePoint(s2.id, 1, 550);
+  base2.forEach((p, i) => assert.equal(p.sliceId, s2.slices[i].id));
+  checkInvariants(m2);
+});
+
+test('addSlicePoint keeps the pads of the split slice on its first half; the second half gets a fresh base pad', () => {
+  const m = mk();
+  const s = addRanged(m, 'a', [{ start: 0, end: 100 }, { start: 100, end: 2000 }]);
+  const [b0, b1] = s.slices.map((sl) => basePadOf(m, sl.id));
+  const c1 = m.duplicatePad(37, 70);
+  assert.equal(m.addSlicePoint(s.id, 1900), true);
+  assert.equal(s.slices.length, 3);
+  assert.equal(b0.sliceId, s.slices[0].id);
+  assert.equal(b1.sliceId, s.slices[1].id, 'the first half [100,1900) keeps the pads');
+  assert.equal(c1.sliceId, s.slices[1].id);
+  const fresh = basePadOf(m, s.slices[2].id);
+  assert.notEqual(fresh, b1);
+  assert.equal(Object.keys(m.state.pads).length, 4);
+  checkInvariants(m);
+});
+
+// ---------------------------------------------------------------- lastLayout
+
+test('lastLayout: starts empty, returns a copy, is not serialised', () => {
+  const m = mk();
+  assert.deepEqual(m.lastLayout(), { placed: 0, dropped: 0, slot: 0 });
+  addSrc(m, 'a', 5);
+  assert.deepEqual(m.lastLayout(), { placed: 5, dropped: 0, slot: 0 });
+  const l = m.lastLayout();
+  l.placed = 999;
+  assert.equal(m.lastLayout().placed, 5, 'a copy');
+  assert.equal(JSON.stringify(m.toJSON()).indexOf('placed'), -1);
+  assert.deepEqual(Model.fromJSON(m.toJSON()).lastLayout(), { placed: 0, dropped: 0, slot: 0 });
+});
+
+test('lastLayout after applyLayout(slot): that slot\'s result, same numbers applyLayout returns', () => {
+  const m = mk();
+  addSrc(m, 'a', 12);
+  m.setGlobal('rootKey', 120);
+  assert.deepEqual(m.lastLayout(), { placed: 8, dropped: 4, slot: 0 });
+  const res = m.applyLayout(3);
+  assert.deepEqual(res, { placed: 8, dropped: 4 }, 'return value unchanged');
+  assert.deepEqual(m.lastLayout(), { placed: 8, dropped: 4, slot: 3 });
+  m.setGlobal('rootKey', 36);
+  assert.deepEqual(m.lastLayout(), { placed: 12, dropped: 0, slot: 0 }, 'back to no drops (current slot is 0)');
+  m.setLock(126, true);
+  m.applyLayout(5);
+  assert.deepEqual(m.lastLayout(), { placed: 12, dropped: 0, slot: 5 }, 'applyLayout that changes nothing is a pass too');
+  m.setGlobal('rootKey', 120);
+  m.applyLayout(0);
+  assert.deepEqual(m.lastLayout(), { placed: 7, dropped: 5, slot: 0 }, 'the locked key 126 stays a hole');
+});
+
+test('lastLayout after an automatic re-layout: the current slot when it was re-laid out, else the auto slot that dropped most', () => {
+  const m = mk();
+  addSrc(m, 'a', 12);
+  // slot 3: a locked empty key makes it drop one more than the other auto slots
+  m.setCurrentSlot(3);
+  m.setLock(126, true);
+  m.applyLayout(3);
+  m.setCurrentSlot(1);
+  m.setGlobal('rootKey', 120);
+  assert.deepEqual(m.lastLayout(), { placed: 8, dropped: 4, slot: 1 }, 'current slot (auto) was re-laid out');
+  m.setCurrentSlot(3);
+  m.setGlobal('rootKey', 121);
+  assert.deepEqual(m.lastLayout(), { placed: 6, dropped: 6, slot: 3 }, 'slot 3: keys 121..125 and 127 only');
+  // current slot is manual: the auto slot with the most dropped keys is reported
+  m.setCurrentSlot(0);
+  m.swapKeys(121, 122); // slot 0 manual
+  m.setGlobal('rootKey', 120);
+  assert.deepEqual(m.lastLayout(), { placed: 7, dropped: 5, slot: 3 });
+  m.setGlobal('layout', 'interleave');
+  assert.deepEqual(m.lastLayout(), { placed: 7, dropped: 5, slot: 3 });
+  // a pass that fits everything reports zero dropped
+  m.setGlobal('rootKey', 36);
+  assert.equal(m.lastLayout().dropped, 0);
+});
+
+test('lastLayout is untouched when there is no auto slot to re-lay out', () => {
+  const m = mk();
+  addSrc(m, 'a', 12);
+  m.setGlobal('rootKey', 120);
+  for (let s = 0; s < 8; s++) {
+    m.setCurrentSlot(s);
+    m.swapKeys(120, 121);
+  }
+  const before = m.lastLayout();
+  m.setGlobal('rootKey', 100);
+  assert.deepEqual(m.lastLayout(), before);
+});
+
+test('lastLayout after a reslice: new pads appended to a manual current slot are reported with that slot', () => {
+  const m = mk();
+  const s = addSrc(m, 'a', 2, null, 4000);
+  m.setGlobal('rootKey', 125);
+  m.shuffle({ seed: 1 }); // slot 0 manual: pads on 125, 126
+  m.setSlices(s.id, ranges(8, 1000));
+  // 6 new pads appended after key 126: only key 127 is left
+  assert.equal(m.occupiedKeys(0).length, 3);
+  assert.deepEqual(m.lastLayout(), { placed: 1, dropped: 5, slot: 0 });
+  // current slot auto: its re-layout is what counts (8 base pads from 125: 3 fit)
+  m.setCurrentSlot(2);
+  m.setSlices(s.id, ranges(10, 800));
+  assert.deepEqual(m.lastLayout(), { placed: 3, dropped: 7, slot: 2 });
+  // current slot manual with nothing appended (reslice to fewer slices): the auto slots decide
+  m.setCurrentSlot(0);
+  m.setSlices(s.id, ranges(4, 2000));
+  assert.deepEqual(m.lastLayout(), { placed: 3, dropped: 1, slot: 1 });
+});
+
+test('lastLayout after findBest: placed and the picked pads that did not fit', () => {
+  const m = mk();
+  addSrc(m, 'a', 8, (i) => feat(1000, -40 + i * 5));
+  m.setGlobal('rootKey', 126);
+  assert.equal(m.findBest(4).placed, 2);
+  assert.deepEqual(m.lastLayout(), { placed: 2, dropped: 2, slot: 0 });
+  m.setGlobal('rootKey', 40);
+  m.setCurrentSlot(2);
+  assert.equal(m.findBest(5).placed, 5);
+  assert.deepEqual(m.lastLayout(), { placed: 5, dropped: 0, slot: 2 });
+  // findBest without features is no pass
+  const e = mk();
+  addSrc(e, 'a', 4);
+  e.setGlobal('rootKey', 126);
+  const before = e.lastLayout();
+  assert.equal(e.findBest(3).placed, 0);
+  assert.deepEqual(e.lastLayout(), before);
+});
+
+test('lastLayout is updated by undo (it re-lays out auto slots) and by removeSource', () => {
+  const m = mk();
+  const a = addSrc(m, 'a', 12);
+  m.setGlobal('rootKey', 120);
+  m.setPadParam(m.getPadOnKey(120).id, 'pitch', 3);
+  m.applyLayout(2);
+  assert.deepEqual(m.lastLayout(), { placed: 8, dropped: 4, slot: 2 });
+  m.undo();
+  assert.deepEqual(m.lastLayout(), { placed: 8, dropped: 4, slot: 0 }, 'the undo re-laid out the auto slots; current slot 0');
+  m.removeSource(a.id);
+  assert.deepEqual(m.lastLayout(), { placed: 0, dropped: 0, slot: 0 });
+});
+
 // ---------------------------------------------------------------- ES5 conformance
 
 test('model.js is ES5-clean (acorn ecmaVersion 5 + banned API scan)', () => {
