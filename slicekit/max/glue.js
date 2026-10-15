@@ -17,6 +17,7 @@ var Model = require('../core/model');
 var Engine = require('../core/engine');
 var Slicing = require('../core/slicing');
 var Features = require('../core/features');
+var Remap = require('../core/remap');
 
 var CONST = Model.CONST;
 
@@ -24,6 +25,7 @@ var NUM_VOICES = 16;
 var DEFAULT_PREFIX = '---src';
 var DEFAULT_STATE = '---skstate';
 var DEFAULT_VIEW = '---skview';
+var DEFAULT_CAP = '---cap';
 
 var PEEK_CHUNK = 65536;
 var OVERVIEW_COLUMNS = 512;
@@ -31,6 +33,9 @@ var POLL_MS = 100;
 var POLL_TICKS = 300;        // 300 x 100 ms = 30 s
 var SAVE_MS = 300;
 var VIEW_MS = 30;
+var TICK_MS = 15;            // gesture ramp update period while a gesture key is held
+var CAPTURE_LOAD_MS = 300;   // wait between writewave and loading the file
+var SIMPLER_CLASS = 'OriginalSimpler';
 
 var PLAY_MODES = ['mono', 'poly', 'thru'];
 var TRIG_MODES = ['trigger', 'gate'];
@@ -41,6 +46,26 @@ var SHUFFLE_MODES = ['chaos', 'smart'];
 var SHUFFLE_SCOPES = ['all', 'source'];
 var CHOKE_SCOPES = ['source', 'global'];
 var SPREAD_PARAMS = ['pitch', 'decay', 'start', 'cutoff'];
+
+// Automatable kit params: Live remembers them, they may arrive before `init`.
+var AUTO_PARAMS = ['slot', 'chaos', 'repeat', 'rate', 'swing', 'alt', 'morph', 'scan'];
+
+// gest <param> -> Gesture field. kind: 'idx' (index into a list), 'num' (value * scale)
+var GEST_PARAMS = {
+  beats: { field: 'beats', kind: 'beats' },
+  ratefrom: { field: 'rateFrom', kind: 'rate' },
+  rateto: { field: 'rateTo', kind: 'rate' },
+  cutfrom: { field: 'cutFrom' },
+  cutto: { field: 'cutTo' },
+  pitchfrom: { field: 'pitchFrom' },
+  pitchto: { field: 'pitchTo' },
+  ampfrom: { field: 'ampFrom', scale: 0.01 },
+  ampto: { field: 'ampTo', scale: 0.01 },
+  curve: { field: 'curve', scale: 0.01 }
+};
+
+// Messages after which the current slot's key map may have changed (see mapTracked).
+var MAP_MESSAGES = { source: 1, pad: 1, kit: 1, ui: 1, loaded: 1 };
 
 // pad <param> -> Pad field. scale: UI value * scale = model value.
 var PAD_PARAMS = {
@@ -116,9 +141,50 @@ function basename(p) {
   return b === '' ? s : b;
 }
 
+// Folder part of a path ('' when there is none). Handles / \\ and Max-style volume:name.
+function dirname(p) {
+  var s = String(p);
+  var i = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'));
+  if (i < 0) { i = s.lastIndexOf(':'); }
+  if (i <= 0) { return ''; }
+  return s.substring(0, i);
+}
+
+function stripSlash(p) {
+  return String(p).replace(/[\/\\]+$/, '');
+}
+
+function pad2(n) {
+  return n < 10 ? '0' + n : String(n);
+}
+
+// YYYYMMDD-HHMMSS in local time.
+function timestamp(ms) {
+  var d = new Date(ms);
+  return d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate()) + '-' +
+    pad2(d.getHours()) + pad2(d.getMinutes()) + pad2(d.getSeconds());
+}
+
+// First value of a LiveAPI get() result (an array of atoms), or the value itself.
+function first(r) {
+  if (r !== null && r !== undefined && typeof r === 'object' && typeof r.length === 'number') {
+    return r.length ? r[0] : undefined;
+  }
+  return r;
+}
+
 function indexOfValue(list, value, d) {
   var i = list.indexOf(value);
   return i < 0 ? d : i;
+}
+
+function nearestIndex(list, v) {
+  var best = 0;
+  var i;
+  for (i = 1; i < list.length; i++) {
+    if (Math.abs(list[i] - v) < Math.abs(list[best] - v)) { best = i; }
+  }
+  return best;
 }
 
 function toArray(a) {
@@ -185,6 +251,7 @@ function normalizeState(st) {
       p = st.pads[ids[i]];
       if (!p || typeof p !== 'object') { continue; }
       fixBools(p, ['reverse', 'base', 'loopOn']);
+      if (p.morph && typeof p.morph === 'object') { fixBools(p.morph, ['reverse', 'loopOn']); }
       p.layers = asArray(p.layers);
       p.origSliceId = fixNull(p.origSliceId);
     }
@@ -202,7 +269,8 @@ function normalizeState(st) {
     for (j = 0; j < slot.locks.length; j++) { slot.locks[j] = !!slot.locks[j] && slot.locks[j] !== 'false'; }
   }
 
-  fixBools(st.globals, ['zoneAlign', 'repeatOn', 'repeatAlt', 'modZoneOn', 'pressureToLevel']);
+  fixBools(st.globals, ['zoneAlign', 'repeatOn', 'repeatAlt', 'modZoneOn', 'pressureToLevel', 'morphEdit', 'keepClip']);
+  if (st.globals && has(st.globals, 'gestures')) { st.globals.gestures = asArray(st.globals.gestures); }
   return st;
 }
 
@@ -225,6 +293,21 @@ function hostFromGlobals() {
   h.LiveAPI = (typeof LiveAPI !== 'undefined') ? LiveAPI : null;
   h.Task = (typeof Task !== 'undefined') ? Task : null;
   h.args = (typeof jsarguments !== 'undefined') ? toArray(jsarguments) : [];
+  h.now = function () { return Date.now(); };
+  // File path of the patcher that contains this js/v8 object ('' when unavailable).
+  // The bundle footer (tools/build.js) keeps the top-level `this` of the js object and
+  // exposes __skPatcher(), which reads `this.patcher` lazily; that is more robust than
+  // reading `this` here, where it may be the global object of a plain function call.
+  h.patcherPath = function () {
+    var p, f;
+    try {
+      p = (typeof __skPatcher === 'function') ? __skPatcher() : null;
+      f = p ? p.filepath : '';
+      return (typeof f === 'string') ? f : '';
+    } catch (e) {
+      return '';
+    }
+  };
   return h;
 }
 
@@ -237,6 +320,10 @@ function create(host) {
   var prefix = nameArg(args[1], DEFAULT_PREFIX);
   var stateName = nameArg(args[2], DEFAULT_STATE);
   var viewName = nameArg(args[3], DEFAULT_VIEW);
+  var capName = nameArg(args[4], DEFAULT_CAP);   // ring buffer; the others derive from it
+  var capWpName = capName + 'wp';                // frame 0 = recorder write position
+  var capOutName = capName + 'out';              // staging buffer for writewave
+  var nowFn = (typeof host.now === 'function') ? host.now : function () { return Date.now(); };
 
   var model = null;
   var engine = null;
@@ -244,6 +331,7 @@ function create(host) {
   var selPadSig = '';
   var armed = '';
   var lastEdited = '';
+  var lastEditedMorph = '';
   var monoCache = {};
   var overviewCache = {};
   var waveCache = {};
@@ -267,6 +355,17 @@ function create(host) {
   var warned = {};
   var saveDeb = null;
   var viewDeb = null;
+  var tickTask = null;        // gesture ramp ticker
+  var tickRunning = false;
+  var gestHeld = [];          // held gesture keys, oldest first: { key, index }
+  var simplers = [];          // result of the last Simpler scan: { path, label }
+  var captureTask = null;     // delayed load of captured files
+  var captureQueue = [];
+  var lastCaptureName = '';
+  var lastCaptureRepeat = 0;
+  var lastMapping = null;     // { map: int[128], applied: clip path or '' } of the last map change
+  var mapDepth = 0;
+  var liveTemps = [];         // short-lived LiveAPI objects, freed by freeTemps()
   var self = {};
 
   // ----- output helpers --------------------------------------------------

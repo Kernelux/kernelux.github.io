@@ -12,11 +12,12 @@
  *                               buffer: { channels: [Float32Array, ...], sr: 44100 } });
  *   sim.set('pstart', 0);                       // same names as the gen~ Params
  *   sim.process(n, function (i, k) { return phase; })
- *       -> { left, right, active, pos, env }    // Float32Array x3, Float64Array x2
+ *       -> { left, right, active, pos, env, cut }  // Float32Array x3, Float64Array x3
  *
  * `beatPhase(i, k)` gives the host beat phase (0..1 per beat) for sample `i`
  * of this call (`k` = sample index since creation); null means phase 0.
- * `pos` / `env` are extras for tests (playhead before the read, envelope).
+ * `pos` / `env` / `cut` are extras for tests (playhead before the read,
+ * envelope, effective filter cutoff in Hz after smoothing; -1 when not rendering).
  * The `src` param is accepted and ignored (the buffer is given at create or
  * with setBuffer). Unknown names throw. Values are clamped to the same
  * [min, max] as the `Param` declarations in voice.genexpr.
@@ -58,6 +59,7 @@ var abs = Math.abs;
 var min = Math.min;
 var max = Math.max;
 var exp = Math.exp;
+var log = Math.log;
 var tan = Math.tan;
 var sqrt = Math.sqrt;
 
@@ -88,11 +90,13 @@ function create(opts) {
   var h_lcprev = 0, h_lastk = -1, h_fr = 0, h_plprev = 0, h_lastph = 0, h_rdprev = 0, h_swprev = 0;
   var h_seentrig = 0;
   var h_seenkill = 0, h_ic1l = 0, h_ic2l = 0, h_ic1r = 0, h_ic2r = 0;
+  var h_cs = 14.29, h_byp = 1;
 
   // --- outputs of the last tick ---
   var out1 = 0, out2 = 0, out3 = 0;
   var dbgPos = 0;
   var dbgEnv = 0;
+  var dbgCut = -1;
 
   for (name in PARAMS) {
     if (Object.prototype.hasOwnProperty.call(PARAMS, name)) { P[name] = PARAMS[name].def; }
@@ -117,7 +121,7 @@ function create(opts) {
     return data[index];
   }
 
-  function log(type, extra) {
+  function logEvent(type, extra) {
     var e = { n: sampleCount, type: type };
     var key;
     if (extra) {
@@ -141,14 +145,16 @@ function create(opts) {
     var nsrc = dim();
     var chr = 0;
     var fadein_step, rtfade_step, killfade_step, endfade_len, tape_back_step, loopexit_step, ampcoef;
+    var cscoef, bypstep;
     var st, mode, pkind, g, pos, sdir, sstart, sstop, alt, stage, envv, ampsm, tf, lw;
     var looping, lstart, lend, llen, lcprev, lastk, fr, plprev, lastph, rdprev, swprev, seentrig, seenkill;
-    var ic1l, ic2l, ic1r, ic2r;
+    var ic1l, ic2l, ic1r, ic2r, cs, byp;
     var trigreq = 0, ph = 0, pl = 0, rd = 0, kidx = -1, gp = 0, pairs = 0, odd = 0.5;
     var fire = 0, rptact = 0, dorestart = 0, dd = 1, span = 0, lc = 0, remain = 0;
     var ended = 0, finish = 0, incr = 0, aincr = 0, ge = 1, xf = 1, stg = 0;
     var attn = 0, decn = 0, reln = 0, over = 0, vg = 0, p1 = 0, p2 = 0, i0 = 0, f1 = 0;
     var a0 = 0, b0 = 0, a1 = 0, b1 = 0, xl = 0, xr = 0;
+    var ctgt = 0, lcut = 0, fh = 0, bt = 0;
     var fc = 0, gf = 0, a1f = 0, a2f = 0, a3f = 0, v1 = 0, v2 = 0, v3 = 0;
     var yl = 0, yr = 0, da = 1, dn = 1, dw = 0, outl = 0, outr = 0, outa = 0;
 
@@ -164,6 +170,8 @@ function create(opts) {
     tape_back_step = 1 / (0.01 * sr);
     loopexit_step = 1 / (0.001 * sr);
     ampcoef = 1 - exp(-1 / (0.005 * sr));
+    cscoef = 1 - exp(-1 / (0.01 * sr));
+    bypstep = 1 / (0.002 * sr);
 
     // ---- load state ----
     st = h_st;
@@ -197,24 +205,33 @@ function create(opts) {
     ic2l = h_ic2l;
     ic1r = h_ic1r;
     ic2r = h_ic2r;
+    cs = h_cs;
+    byp = h_byp;
+
+    // cutoff target (Hz) for the smoother: the bypass range (>= 19000) aims
+    // above it so that the bypass is reached in finite time
+    ctgt = max(cutoff, 10);
+    if (cutoff >= 19000) {
+      ctgt = 24000;
+    }
 
     // ---- 1. host events: kill and trig ----
     if (kill !== seenkill) {
       seenkill = kill;
       if (st === 1) {
         mode = 2;
-        if (logOn) { log('kill'); }
+        if (logOn) { logEvent('kill'); }
       }
       if (st === 2) {
         st = 0;
         mode = 0;
-        if (logOn) { log('kill'); log('end', { why: 'kill' }); }
+        if (logOn) { logEvent('kill'); logEvent('end', { why: 'kill' }); }
       }
     }
     if (trig !== seentrig) {
       seentrig = trig;
       trigreq = 1;
-      if (logOn) { log('trig'); }
+      if (logOn) { logEvent('trig'); }
     }
 
     // a finished hit that waits for the next repeat ends when the key is
@@ -223,7 +240,7 @@ function create(opts) {
       if (held < 0.5 || rptdiv <= 0) {
         st = 0;
         mode = 0;
-        if (logOn) { log('end', { why: 'wait' }); }
+        if (logOn) { logEvent('end', { why: 'wait' }); }
       }
     }
 
@@ -288,7 +305,7 @@ function create(opts) {
       }
     } else {
       if (fire > 0.5) {
-        if (logOn) { log('line', { k: kidx }); }
+        if (logOn) { logEvent('line', { k: kidx }); }
         if (st === 2) {
           pkind = 2;
           dorestart = 1;
@@ -306,7 +323,7 @@ function create(opts) {
       if (st === 1 && mode === 2 && g <= 0) {
         st = 0;
         mode = 0;
-        if (logOn) { log('end', { why: 'kill' }); }
+        if (logOn) { logEvent('end', { why: 'kill' }); }
       }
     }
 
@@ -327,6 +344,12 @@ function create(opts) {
       ic2l = 0;
       ic1r = 0;
       ic2r = 0;
+      // every hit starts exactly at its cutoff (smoother snapped, bypass decided)
+      cs = log(ctgt) * 1.4426950408889634;
+      byp = 0;
+      if (ctgt >= 19000) {
+        byp = 1;
+      }
       dd = 1;
       if (dir < 0) {
         dd = -1;
@@ -364,11 +387,12 @@ function create(opts) {
       tf = 1;
       lw = 0;
       st = 1;
-      if (logOn) { log('start', { kind: pkind, sdir: sdir, alt: alt, looping: looping }); }
+      if (logOn) { logEvent('start', { kind: pkind, sdir: sdir, alt: alt, looping: looping }); }
     }
 
     // ---- 5. render one sample ----
     dbgPos = -1;
+    dbgCut = -1;
     if (st === 1) {
       span = abs(sstart - sstop);
       lc = 0;
@@ -400,10 +424,10 @@ function create(opts) {
         } else {
           if (rptdiv > 0 && held > 0.5) {
             st = 2;
-            if (logOn) { log('wait'); }
+            if (logOn) { logEvent('wait'); }
           } else {
             st = 0;
-            if (logOn) { log('end', { why: 'pend' }); }
+            if (logOn) { logEvent('end', { why: 'pend' }); }
           }
           g = 0;
           mode = 0;
@@ -532,8 +556,21 @@ function create(opts) {
           xr = xr * (1 - lw) + (a1 + (b1 - a1) * f1) * lw;
         }
 
+        // cutoff smoothing: one-pole (~10 ms) on log2(Hz), so gesture sweeps that
+        // update `cutoff` every ~15 ms do not zipper
+        lcut = log(ctgt) * 1.4426950408889634;
+        cs = cs + (lcut - cs) * cscoef;
+        fh = exp(cs * 0.6931471805599453);
+        // bypass (>= 19000 Hz) is decided on the smoothed value and ramped in 2 ms
+        bt = 0;
+        if (fh >= 19000) {
+          bt = 1;
+        }
+        byp = min(max(bt, byp - bypstep), byp + bypstep);
+
         // 2-pole TPT low-pass (Simper SVF) on the raw signal, always running
-        fc = min(max(cutoff, 10), 0.45 * sr);
+        fc = min(max(fh, 10), 0.45 * sr);
+        dbgCut = fc;
         gf = tan(3.141592653589793 * fc / sr);
         a1f = 1 / (1 + gf * (gf + 1.4142135623730951));
         a2f = gf * a1f;
@@ -550,10 +587,8 @@ function create(opts) {
         ic1r = 2 * v1 - ic1r;
         ic2r = 2 * v2 - ic2r;
         yr = v2;
-        if (cutoff >= 19000) {
-          yl = xl;
-          yr = xr;
-        }
+        yl = yl * (1 - byp) + xl * byp;
+        yr = yr * (1 - byp) + xr * byp;
 
         // drive
         // the shaped signal fades in over drive 0..0.1 (no level jump above 0)
@@ -581,7 +616,7 @@ function create(opts) {
           over = (pos - lend) * sdir;
           if (over >= 0) {
             pos = pos - sdir * llen * (floor(over / llen) + 1);
-            if (logOn) { log('wrap'); }
+            if (logOn) { logEvent('wrap'); }
           }
         }
 
@@ -591,7 +626,7 @@ function create(opts) {
           } else {
             st = 0;
             mode = 0;
-            if (logOn) { log('end', { why: 'release' }); }
+            if (logOn) { logEvent('end', { why: 'release' }); }
           }
         }
       }
@@ -639,6 +674,8 @@ function create(opts) {
     h_ic2l = ic2l;
     h_ic1r = ic1r;
     h_ic2r = ic2r;
+    h_cs = cs;
+    h_byp = byp;
 
     dbgEnv = envv;
     out1 = outl;
@@ -671,6 +708,7 @@ function create(opts) {
     var active = new Float32Array(n);
     var pos = new Float64Array(n);
     var env = new Float64Array(n);
+    var cut = new Float64Array(n);
     var i, ph;
     for (i = 0; i < n; i++) {
       ph = beatPhase ? beatPhase(i, sampleCount) : 0;
@@ -680,9 +718,10 @@ function create(opts) {
       active[i] = out3;
       pos[i] = dbgPos;
       env[i] = dbgEnv;
+      cut[i] = dbgCut;
       sampleCount++;
     }
-    return { left: left, right: right, active: active, pos: pos, env: env };
+    return { left: left, right: right, active: active, pos: pos, env: env, cut: cut };
   }
 
   setBuffer(opts.buffer || null);

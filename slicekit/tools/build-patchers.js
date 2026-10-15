@@ -8,12 +8,15 @@
  *   dist/slicekit.voice.maxpat    poly~ voice abstraction with an embedded gen~ codebox
  *                                 (code read from max/voice.genexpr at build time)
  *
+ * The device patcher embeds a second gen~ (the capture recorder, code read from
+ * max/recorder.genexpr at build time); a missing source file gives a warning and a silent placeholder.
+ *
  * The contract is docs/PROTOCOL.md (patch topology, UI control table, voice wiring).
  * Tooling only: Node 22, modern JS allowed, no dependencies.
  *
  *   node tools/build-patchers.js        build both files into dist/ and validate them
  *
- * API:  build({ outDir, voiceSrc, quiet }) -> { device, voice, files, warnings }
+ * API:  build({ outDir, voiceSrc, recorderSrc, quiet }) -> { device, voice, files, warnings, devicewidth }
  */
 
 const fs = require('node:fs');
@@ -22,6 +25,7 @@ const path = require('node:path');
 const ROOT = path.resolve(__dirname, '..');
 const DEFAULT_OUT_DIR = path.join(ROOT, 'dist');
 const DEFAULT_VOICE_SRC = path.join(ROOT, 'max', 'voice.genexpr');
+const DEFAULT_RECORDER_SRC = path.join(ROOT, 'max', 'recorder.genexpr');
 
 const DEVICE_HEIGHT = 169;
 const NUM_VOICES = 16;
@@ -30,6 +34,9 @@ const NUM_BUFFERS = 16;
 // Mirrors Model.CONST in docs/ARCHITECTURE.md (validate-patchers.js re-parses the doc).
 const BEAT_DIVS = ['1/16', '1/16T', '1/8', '1/8T', '1/4', '1/4T', '1/2', '1/2T', '1 Bar', '2 Bars', '4 Bars'];
 const REPEAT_DIVS = ['1/4', '1/8', '1/8T', '1/16', '1/16T', '1/32', '1/32T', '1/64'];
+const GEST_RATES = ['off'].concat(REPEAT_DIVS);
+const GEST_BEATS_LABELS = ['1/16 bar', '1/8 bar', '1 beat', '2 beats', '1 bar', '2 bars', '4 bars'];
+const CAPTURE_BARS = ['1/2 Bar', '1 Bar', '2 Bars', '4 Bars', '8 Bars'];
 
 const APP_VERSION = { major: 9, minor: 0, revision: 0, architecture: 'x64', modernui: 1 };
 
@@ -66,7 +73,7 @@ function ioFor(text) {
     case 'buffer~': return [1, ['float', 'bang']];
     case 'route': return [args.length === 1 ? 2 : 1, new Array(args.length + 1).fill('')];
     case 't': case 'trigger': return [1, args.map((a) => ({ b: 'bang', i: 'int', f: 'float' }[a] || ''))];
-    case 'v8': return [1, ['', '', '', '']];
+    case 'v8': return [1, ['', '', '', '', '']]; // glue: poly~, buffers, controls, jsui, recorder
     case 'dict': return [2, ['dictionary', '', '', 'bang']];
     case 'loadbang': return [1, ['bang']];
     case 'thispoly~': return [1, ['int', 'int', 'int']];
@@ -77,7 +84,7 @@ function ioFor(text) {
     case 'out~': return [1, []];
     case 'out': return [1, []];
     case 'poly~': return [1, ['signal', 'signal', '']]; // voice patch: in/in~ 1 -> 1 inlet; out~ 1, out~ 2, out 3
-    case 'gen~': return [1, ['signal', 'signal', 'signal']];
+    case 'gen~': return [1, ['signal', 'signal', 'signal']]; // voice; the recorder gen~ is built with newobj()
     default: throw new Error('build-patchers: no I/O entry for object "' + name + '"');
   }
 }
@@ -177,6 +184,20 @@ class Patcher {
     return this._live('live.text', 1, ['', ''], s, rect, pres, {
       mode: s.t === 'toggle' ? 1 : 0, text: s.text, texton: s.text, fontsize: 9.0,
     });
+  }
+
+  /**
+   * Classic umenu (not a Live parameter). Outlets: 0 = item index (int), 1 = item text, 2 = dumpout.
+   * The glue fills it with raw `clear` / `append <item>` messages.
+   */
+  umenu(s, rect, pres) {
+    const b = {
+      maxclass: 'umenu', numinlets: 1, numoutlets: 3, outlettype: ['int', '', ''],
+      parameter_enable: 0, fontsize: 9.0, patching_rect: rect,
+    };
+    this._present(b, pres);
+    b.varname = s.v;
+    return this._add(b);
   }
 
   liveDrop(s, rect, pres) {
@@ -281,10 +302,11 @@ function valueOf(s) {
 
 // ------------------------------------------------------------------------------------------------
 // Control table (mirror of PROTOCOL.md "UI controls"; validate-patchers.js checks it against the doc)
-//   t: dial | tab | menu | numbox | toggle | button | drop | gain | jsui
-//   send: text of [prepend ...] (dial/tab/menu/numbox/toggle) or of the [message( box (button)
+//   t: dial | tab | menu | numbox | toggle | button | umenu | drop | gain | jsui
+//   send: text of [prepend ...] (dial/tab/menu/numbox/toggle/umenu) or of the [message( box (button)
 //   fb: feedback name routed from glue outlet 2 -> [prepend set] -> control
-//   vis: A (automatable) | H (hidden). init is only given to automatable params.
+//       (raw: true -> the route outlet goes straight into the control, no [prepend set])
+//   vis: A (automatable) | H (hidden) | '-' (not a Live parameter). init is only given to automatable params.
 // ------------------------------------------------------------------------------------------------
 
 const dial = (v, name, short, min, max, send, fb, o) => Object.assign(
@@ -299,6 +321,8 @@ const toggle = (v, name, text, send, fb, o) => Object.assign(
   { v, t: 'toggle', name, short: text, text, send, fb, vis: 'H' }, o);
 const button = (v, name, text, send, o) => Object.assign(
   { v, t: 'button', name, short: text, text, send, vis: 'H' }, o);
+// umenu: not a Live parameter; `fb` is a raw feedback (route outlet -> umenu inlet, no [prepend set])
+const umenu = (v, send, fb) => ({ v, t: 'umenu', send, fb, raw: true, vis: '-' });
 
 const SLOTS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
 
@@ -314,6 +338,8 @@ const SAMPLE_CONTROLS = [
   toggle('sk_src_snap', 'Slice Snap', 'Snap', 'source snap', 'src_snap'),
   button('sk_src_reslice', 'Slice Reslice', 'Reslice', 'source reslice'),
   button('sk_src_remove', 'Sample Remove', 'Remove', 'source remove'),
+  button('sk_simplerscan', 'Find Simplers', 'Find Simplers', 'source simplerscan'),
+  umenu('sk_simplers', 'source fromsimpler', 'src_simplers'),
 ];
 
 const PAD_CONTROLS = [
@@ -377,14 +403,49 @@ const KIT_CONTROLS = [
   toggle('sk_pressure', 'Pressure To Level', 'Press', 'kit pressure2level', 'kit_pressure2level'),
 ];
 
+// MORPH / SCAN (two automatable dials + the B-values editing buttons), CAPTURE and the clip helpers
+const MORPH_CONTROLS = [
+  dial('sk_morph', 'Morph', 'Morph', 0, 100, 'kit morph', null, { vis: 'A', unit: 'pct', init: 0 }),
+  dial('sk_scan', 'Scan', 'Scan', 0, 100, 'kit scan', null, { vis: 'A', unit: 'pct', init: 0 }),
+  toggle('sk_morphedit', 'Morph Edit B', 'Edit B', 'kit morphedit', 'kit_morphedit'),
+  button('sk_morphcopy', 'Morph Copy A To B', 'A→B', 'pad morphcopy'),
+  button('sk_morphclear', 'Morph Clear B', 'Clr B', 'pad morphclear'),
+  button('sk_morphcopyall', 'Morph Copy All A To B', 'All A→B', 'kit morphcopyall'),
+  button('sk_morphclearall', 'Morph Clear All B', 'All Clr B', 'kit morphclearall'),
+];
+
+const CAPTURE_CONTROLS = [
+  button('sk_capture', 'Capture', 'Capture', 'kit capture'),
+  menu('sk_capturebars', 'Capture Length', 'Cap Bars', CAPTURE_BARS, 'kit capturebars', 'kit_capturebars'),
+  toggle('sk_keepclip', 'Keep Clip', 'Keep clip', 'kit keepclip', 'kit_keepclip'),
+  button('sk_remapclip', 'Remap Clip', 'Remap clip', 'kit remapclip'),
+];
+
+// GESTURE editor: select tab + one set of editors for the selected gesture
+const GESTURE_CONTROLS = [
+  tab('sk_gest_sel', 'Gesture Select', 'Gesture', ['1', '2', '3', '4'], 'gest sel', 'gest_sel'),
+  menu('sk_gest_beats', 'Gesture Length', 'Length', GEST_BEATS_LABELS, 'gest beats', 'gest_beats'),
+  menu('sk_gest_ratefrom', 'Gesture Rate From', 'Rate From', GEST_RATES, 'gest ratefrom', 'gest_ratefrom'),
+  menu('sk_gest_rateto', 'Gesture Rate To', 'Rate To', GEST_RATES, 'gest rateto', 'gest_rateto'),
+  dial('sk_gest_cutfrom', 'Gesture Cutoff From', 'From', 20, 20000, 'gest cutfrom', 'gest_cutfrom', { unit: 'hz', exp: 3 }),
+  dial('sk_gest_cutto', 'Gesture Cutoff To', 'To', 20, 20000, 'gest cutto', 'gest_cutto', { unit: 'hz', exp: 3 }),
+  dial('sk_gest_pitchfrom', 'Gesture Pitch From', 'From', -48, 48, 'gest pitchfrom', 'gest_pitchfrom', { ptype: 'int', unit: 'st' }),
+  dial('sk_gest_pitchto', 'Gesture Pitch To', 'To', -48, 48, 'gest pitchto', 'gest_pitchto', { ptype: 'int', unit: 'st' }),
+  dial('sk_gest_ampfrom', 'Gesture Amp From', 'From', 0, 100, 'gest ampfrom', 'gest_ampfrom', { unit: 'pct' }),
+  dial('sk_gest_ampto', 'Gesture Amp To', 'To', 0, 100, 'gest ampto', 'gest_ampto', { unit: 'pct' }),
+  dial('sk_gest_curve', 'Gesture Curve', 'Curve', 0, 100, 'gest curve', 'gest_curve', { unit: 'pct' }),
+];
+
 const SPECIAL = {
   drop: { v: 'sk_drop', t: 'drop' },
   load: button('sk_load', 'Load Sample', 'Load', 'load'),
+  capfolder: button('sk_capfolder', 'Capture Folder', 'Folder…', 'kit capturefolder'),
   ui: { v: 'sk_ui', t: 'jsui' },
   out: { v: 'sk_out', t: 'gain', name: 'Output', short: 'Output', min: -70, max: 6, ptype: 'float', unit: 'db', vis: 'A', init: 0 },
 };
 
-const GRID_CONTROLS = SAMPLE_CONTROLS.concat(PAD_CONTROLS, PERFORM_CONTROLS, KIT_CONTROLS);
+const GRID_CONTROLS = SAMPLE_CONTROLS.concat(PAD_CONTROLS, PERFORM_CONTROLS, KIT_CONTROLS,
+  MORPH_CONTROLS, CAPTURE_CONTROLS, GESTURE_CONTROLS);
 
 // ------------------------------------------------------------------------------------------------
 // Presentation layout (device is 169 px high; everything below is absolute device coordinates)
@@ -397,12 +458,15 @@ function presentationLayout() {
   const labels = [];
   const H = DEVICE_HEIGHT;
 
-  const section = (ox, w, title) => {
-    panels.push([ox, 2, w, H - 4]);
-    titles.push({ text: title, rect: [ox + 6, 4, Math.max(40, w - 12), 13] });
+  // a panel + its title; y0/h default to the full device height (stacked panels pass their own)
+  const section = (ox, w, title, y0, h) => {
+    y0 = y0 === undefined ? 2 : y0;
+    h = h === undefined ? H - 4 : h;
+    panels.push([ox, y0, w, h]);
+    titles.push({ text: title, rect: [ox + 6, y0 + 2, Math.max(40, w - 12), 13] });
   };
   const put = (v, ox, x, y, w, h) => { pres[v] = [ox + x, y, w, h]; };
-  const label = (text, ox, x, y, w) => labels.push({ text, rect: [ox + x, y, w, 12] });
+  const label = (text, ox, x, y, w, h) => labels.push({ text, rect: [ox + x, y, w, h || 12] });
 
   let ox = 2;
 
@@ -435,6 +499,8 @@ function presentationLayout() {
   put('sk_src_minslice', ox, 50, 119, 40, 15);
   put('sk_src_snap', ox, 94, 118, 44, 16);
   put('sk_src_reslice', ox, 142, 118, 56, 16);
+  put('sk_simplerscan', ox, 6, 142, 70, 16);
+  put('sk_simplers', ox, 80, 142, 158, 17);
   ox += 244 + 4;
 
   // --- PAD -------------------------------------------------------------------------------------
@@ -503,7 +569,50 @@ function presentationLayout() {
   label('Rate', ox, 102, 74, 72);
   put('sk_rate', ox, 102, 87, 72, 17);
   put('sk_alt', ox, 102, 108, 72, 16);
+  label('Rewrite clip on map change', ox, 6, 128, 168);
+  put('sk_keepclip', ox, 6, 141, 84, 16);
+  put('sk_remapclip', ox, 94, 141, 80, 16);
   ox += 180 + 4;
+
+  // --- MORPH / SCAN (top) + CAPTURE (bottom), one stacked column --------------------------------
+  section(ox, 176, 'MORPH / SCAN', 2, 110);
+  put('sk_morph', ox, 6, 19, 41, 48);
+  put('sk_scan', ox, 50, 19, 41, 48);
+  put('sk_morphedit', ox, 98, 21, 70, 18);
+  put('sk_morphcopy', ox, 6, 72, 80, 16);
+  put('sk_morphclear', ox, 90, 72, 80, 16);
+  put('sk_morphcopyall', ox, 6, 92, 80, 16);
+  put('sk_morphclearall', ox, 90, 92, 80, 16);
+  section(ox, 176, 'CAPTURE', 114, 53);
+  put('sk_capture', ox, 6, 137, 52, 18);
+  put('sk_capturebars', ox, 62, 137, 58, 17);
+  put('sk_capfolder', ox, 124, 137, 46, 18);
+  ox += 176 + 4;
+
+  // --- GESTURE ---------------------------------------------------------------------------------
+  section(ox, 322, 'GESTURE');
+  label('Gesture', ox, 6, 19, 100);
+  label('Length', ox, 110, 19, 68);
+  label('Rate from', ox, 182, 19, 62);
+  label('Rate to', ox, 248, 19, 62);
+  put('sk_gest_sel', ox, 6, 32, 100, 18);
+  put('sk_gest_beats', ox, 110, 32, 68, 17);
+  put('sk_gest_ratefrom', ox, 182, 32, 62, 17);
+  put('sk_gest_rateto', ox, 248, 32, 62, 17);
+  label('Cutoff', ox, 6, 56, 84);
+  label('Pitch', ox, 96, 56, 84);
+  label('Amp', ox, 186, 56, 84);
+  label('Curve', ox, 276, 56, 41);
+  put('sk_gest_cutfrom', ox, 6, 70, 41, 48);
+  put('sk_gest_cutto', ox, 49, 70, 41, 48);
+  put('sk_gest_pitchfrom', ox, 96, 70, 41, 48);
+  put('sk_gest_pitchto', ox, 139, 70, 41, 48);
+  put('sk_gest_ampfrom', ox, 186, 70, 41, 48);
+  put('sk_gest_ampto', ox, 229, 70, 41, 48);
+  put('sk_gest_curve', ox, 276, 70, 41, 48);
+  label('Hold a gesture key (G1-G4 in the Mods zone): the sweep runs From -> To over Length, Curve bends the ramp.',
+    ox, 6, 126, 310, 36);
+  ox += 322 + 4;
 
   // --- Output ----------------------------------------------------------------------------------
   section(ox, 48, '');
@@ -522,15 +631,17 @@ const GRID_X0 = 400; // patching grid columns start here (inputs live in the col
 const COL_W = 176;
 const COLS = 7;
 
-function buildDevice() {
+function buildDevice(recorderCode, warnings) {
   const p = new Patcher({ rect: [50, 80, 1500, 900] });
   const lay = presentationLayout();
   const size = (v) => [lay.pres[v][2], lay.pres[v][3]];
   const specs = {};
-  GRID_CONTROLS.concat([SPECIAL.drop, SPECIAL.load, SPECIAL.ui, SPECIAL.out]).forEach((s) => { specs[s.v] = s; });
+  GRID_CONTROLS.concat([SPECIAL.drop, SPECIAL.load, SPECIAL.capfolder, SPECIAL.ui, SPECIAL.out])
+    .forEach((s) => { specs[s.v] = s; });
 
-  // glue first (everything feeds it); its position is fixed once the grid height is known
-  const glue = p.obj('v8 slicekit.js ---src ---skstate ---skview', [GRID_X0, 0, 380, 22]);
+  // glue first (everything feeds it); its position is fixed once the grid height is known.
+  // Arguments: buffer prefix, state dict, view dict, capture ring buffer name. 5 outlets (4 = recorder).
+  const glue = p.obj('v8 slicekit.js ---src ---skstate ---skview ---cap', [GRID_X0, 0, 380, 22]);
 
   // ---- INPUTS (left column) -----------------------------------------------------------------
   p.comment('INPUTS  (everything below feeds inlet 0 of the glue)', [20, 14, 340, 20]);
@@ -558,15 +669,22 @@ function buildDevice() {
   p.connect(drop, 0, pDrop, 0);
   p.connect(pDrop, 0, glue, 0);
 
-  const load = p.liveText(SPECIAL.load, [20, 372, 80, 18], lay.pres.sk_load);
-  const loadOnce = p.obj('route bang 1', [110, 372, 0, 22]);
-  const dlg = p.obj('opendialog sound', [20, 404, 0, 22]);
-  const pLoad = p.obj('prepend load', [20, 440, 0, 22]);
-  p.connect(load, 0, loadOnce, 0);
-  p.connect(loadOnce, 0, dlg, 0);
-  p.connect(loadOnce, 1, dlg, 0);
-  p.connect(dlg, 0, pLoad, 0);
-  p.connect(pLoad, 0, glue, 0);
+  // button -> [route bang 1] (once per click) -> [opendialog <type>] -> [prepend <msg>] -> glue
+  const dialogChain = (spec, y, dlgText, prependText) => {
+    const btn = p.liveText(spec, [20, y, 80, 18], lay.pres[spec.v]);
+    const once = p.obj('route bang 1', [110, y, 0, 22]);
+    const dialog = p.obj(dlgText, [20, y + 32, 0, 22]);
+    const pre = p.obj(prependText, [20, y + 68, 0, 22]);
+    p.connect(btn, 0, once, 0);
+    p.connect(once, 0, dialog, 0);
+    p.connect(once, 1, dialog, 0);
+    p.connect(dialog, 0, pre, 0);
+    p.connect(pre, 0, glue, 0);
+    return btn;
+  };
+  dialogChain(SPECIAL.load, 372, 'opendialog sound', 'prepend load');
+  p.comment('CAPTURE FOLDER  (folder chooser)', [20, 484, 220, 20]);
+  dialogChain(SPECIAL.capfolder, 508, 'opendialog fold', 'prepend kit capturefolder');
 
   // ---- CONTROL BANDS (grid) -----------------------------------------------------------------
   const routes = []; // { box, names }
@@ -579,14 +697,20 @@ function buildDevice() {
       case 'menu': return p.liveMenu(c, rect, pr);
       case 'numbox': return p.liveNumbox(c, rect, pr);
       case 'toggle': case 'button': return p.liveText(c, rect, pr);
+      case 'umenu': return p.umenu(c, rect, pr);
       default: throw new Error('unknown control type ' + c.t);
     }
   };
 
   const bands = [
-    { title: 'SAMPLE  - source <param>   (feedback src_* -> prepend set)', list: SAMPLE_CONTROLS },
+    { title: 'SAMPLE  - source <param>   (feedback src_* -> prepend set; src_simplers -> umenu directly)', list: SAMPLE_CONTROLS },
     { title: 'PAD  - pad <param>   (feedback pad_* -> prepend set)', list: PAD_CONTROLS },
     { title: 'PERFORM + KIT  - kit <param>   (feedback kit_* -> prepend set)', list: PERFORM_CONTROLS.concat(KIT_CONTROLS) },
+    {
+      title: 'MORPH / SCAN / CAPTURE / CLIP  - kit|pad <param>   (feedback kit_* -> prepend set; Folder... is in the INPUTS column)',
+      list: MORPH_CONTROLS.concat(CAPTURE_CONTROLS),
+    },
+    { title: 'GESTURE  - gest <param>   (feedback gest_* -> prepend set)', list: GESTURE_CONTROLS },
   ];
 
   let y = 50;
@@ -604,7 +728,11 @@ function buildDevice() {
         const [w, h] = size(c.v);
         const box = makeControl(c, [x, ry + 30, w, h]);
         controlBoxes[c.v] = box;
-        if (c.fb) {
+        if (c.fb && c.raw) {
+          // raw feedback (umenu: `clear` / `append <item>`): straight from the route into the control
+          p.connect(route, names.indexOf(c.fb), box, 0);
+          p.comment('raw: clear / append', [x, ry, 130, 20]);
+        } else if (c.fb) {
           const ps = p.obj('prepend set', [x, ry, 0, 22]);
           p.connect(route, names.indexOf(c.fb), ps, 0);
           p.connect(ps, 0, box, 0);
@@ -632,7 +760,7 @@ function buildDevice() {
   // ---- GLUE ---------------------------------------------------------------------------------
   const G = y + 30;
   glue.patching_rect = [GRID_X0, G, 380, 22];
-  p.comment('GLUE  outlet 0 -> poly~ | 1 -> buffers | 2 -> feedback routes | 3 -> jsui', [GRID_X0, G - 26, 520, 20]);
+  p.comment('GLUE  outlet 0 -> poly~ | 1 -> buffers | 2 -> feedback routes | 3 -> jsui | 4 -> capture recorder', [GRID_X0, G - 26, 620, 20]);
 
   routes.forEach((r) => p.connect(glue, 2, r.box, 0));
 
@@ -657,6 +785,25 @@ function buildDevice() {
   p.connect(poly, 1, out, 1);
   p.connect(out, 0, plugout, 0);
   p.connect(out, 1, plugout, 1);
+
+  // ---- CAPTURE: recorder gen~ writes the (pre-gain) output into a 40 s ring buffer --------------
+  const CX = GRID_X0 + 70;
+  p.comment('CAPTURE  poly~ L/R (before live.gain~) -> recorder gen~ -> ring buffer ---cap; glue outlet 4 binds the buffers (cap / wpb)',
+    [CX, G + 276, 760, 20]);
+  const rec = buildRecorder(recorderCode, warnings);
+  const recorder = p.newobj('gen~', 2, 1, ['signal'], [CX, G + 304, 130, 22], {
+    patcher: rec,
+    saved_object_attributes: { globalpatchername: '' },
+  });
+  p.connect(poly, 0, recorder, 0);
+  p.connect(poly, 1, recorder, 1);
+  p.connect(glue, 4, recorder, 0);
+  p.obj('buffer~ ---cap 40000 2', [CX + 160, G + 304, 0, 22]);
+  p.obj('buffer~ ---capwp 10 1', [CX + 330, G + 304, 0, 22]);
+  p.obj('buffer~ ---capout 1000 2', [CX + 490, G + 304, 0, 22]);
+  p.comment('ring 40 s stereo', [CX + 160, G + 332, 140, 20]);
+  p.comment('write position (frame 0)', [CX + 330, G + 332, 150, 20]);
+  p.comment('export staging (.wav)', [CX + 490, G + 332, 150, 20]);
 
   // ---- STATE DICTS --------------------------------------------------------------------------
   p.comment('STATE (saved with the Live Set) / VIEW MODEL (jsui)', [GRID_X0 + 70, G + 176, 360, 20]);
@@ -740,6 +887,13 @@ const PLACEHOLDER_CODE = [
   '',
 ].join('\n');
 
+const RECORDER_PLACEHOLDER_CODE = [
+  '// SliceKit recorder PLACEHOLDER - max/recorder.genexpr was not found at build time.',
+  '// Records nothing: Capture would produce silence.',
+  'out1 = in1 * 0 + in2 * 0;',
+  '',
+].join('\n');
+
 function stripComments(src) {
   return src.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/\/\/[^\n]*/g, ' ');
 }
@@ -752,28 +906,52 @@ function maxIndex(code, prefix) {
   return m;
 }
 
-function buildVoice(code, warnings) {
-  // ---- inner gen~ patcher ---------------------------------------------------------------------
+/**
+ * Inner dsp.gen patcher: `in 1..boxIns` -> codebox -> `out 1..boxOuts`.
+ * The codebox gets as many inlets / outlets as the code uses (in<N> / out<N>); padIns raises the inlet
+ * count to boxIns so every `in` object can be wired even if the code ignores the last ones.
+ * @returns {{json: object, nIn: number, nOut: number}}
+ */
+function genPatcher(code, boxIns, boxOuts, padIns) {
   const nIn = maxIndex(code, 'in');
   const nOut = maxIndex(code, 'out');
-  if (nIn < 1) warnings.push('voice code does not reference in1 (host beat phase) - gen~ inlet left unconnected');
-  if (nOut < 3) {
-    warnings.push('voice code references only out1..out' + nOut + ' (need out1 L, out2 R, out3 active) - missing gen~ outputs are silent');
-  }
+  const cbIn = padIns ? Math.max(nIn, boxIns) : nIn;
   const lines = code.split('\n').length;
   const boxH = Math.min(520, Math.max(140, lines * 16 + 24));
 
   const g = new Patcher({ classnamespace: 'dsp.gen', rect: [60, 90, 760, boxH + 190] });
-  const gIn = g.newobj('in 1', 0, 1, [''], [30, 20, 40, 22]);
-  const cb = g.codebox(code, nIn, nOut, [30, 56, 640, boxH]);
-  if (nIn >= 1) g.connect(gIn, 0, cb, 0);
+  const ins = [];
+  for (let i = 1; i <= boxIns; i++) ins.push(g.newobj('in ' + i, 0, 1, [''], [30 + (i - 1) * 90, 20, 40, 22]));
+  const cb = g.codebox(code, cbIn, nOut, [30, 56, 640, boxH]);
+  ins.forEach((b, i) => { if (i < cbIn) g.connect(b, 0, cb, i); });
   const outY = 56 + boxH + 24;
-  for (let i = 1; i <= 3; i++) {
+  for (let i = 1; i <= boxOuts; i++) {
     const o = g.newobj('out ' + i, 1, 0, [], [30 + (i - 1) * 90, outY, 46, 22]);
     if (i <= nOut) g.connect(cb, i - 1, o, 0);
   }
-  const innerJson = g.toJSON({ openinpresentation: 0, default_fontsize: 12.0, default_fontname: 'Arial' }).patcher;
-  innerJson.originid = 'pat-1';
+  const json = g.toJSON({ openinpresentation: 0, default_fontsize: 12.0, default_fontname: 'Arial' }).patcher;
+  json.originid = 'pat-1';
+  return { json, nIn, nOut };
+}
+
+/** The capture recorder: in1/in2 = L/R, out1 = write position. Returns the inner dsp.gen patcher. */
+function buildRecorder(code, warnings) {
+  const g = genPatcher(code, 2, 1, true);
+  if (g.nIn < 2) {
+    warnings.push('recorder code references only in1..in' + g.nIn + ' (need in1 L, in2 R) - missing inputs are not recorded');
+  }
+  if (g.nOut < 1) warnings.push('recorder code does not reference out1 (write position) - gen~ outlet left unconnected');
+  return g.json;
+}
+
+function buildVoice(code, warnings) {
+  // ---- inner gen~ patcher ---------------------------------------------------------------------
+  const inner = genPatcher(code, 1, 3, false);
+  if (inner.nIn < 1) warnings.push('voice code does not reference in1 (host beat phase) - gen~ inlet left unconnected');
+  if (inner.nOut < 3) {
+    warnings.push('voice code references only out1..out' + inner.nOut + ' (need out1 L, out2 R, out3 active) - missing gen~ outputs are silent');
+  }
+  const innerJson = inner.json;
 
   // ---- voice patcher --------------------------------------------------------------------------
   const v = new Patcher({ rect: [60, 80, 760, 560] });
@@ -834,41 +1012,45 @@ function writeJsonAtomic(file, obj) {
   fs.renameSync(tmp, file);
 }
 
-function readVoiceCode(voiceSrc, warnings) {
+/** Read a gen~ source file; missing/empty -> warning + placeholder code. */
+function readGenCode(src, what, placeholder, warnings) {
   let code = null;
   try {
-    code = fs.readFileSync(voiceSrc, 'utf8');
+    code = fs.readFileSync(src, 'utf8');
   } catch (e) {
     code = null;
   }
   if (code === null || code.trim() === '') {
-    warnings.push('voice source ' + voiceSrc + (code === null ? ' not found' : ' is empty')
+    warnings.push(what + ' source ' + src + (code === null ? ' not found' : ' is empty')
       + ' - embedding a silent placeholder codebox');
-    return PLACEHOLDER_CODE;
+    return placeholder;
   }
   return code.replace(/\r\n/g, '\n');
 }
 
 /**
  * Build both patchers.
- * @param {{outDir?: string, voiceSrc?: string, quiet?: boolean}} [opts]
+ * @param {{outDir?: string, voiceSrc?: string, recorderSrc?: string, quiet?: boolean}} [opts]
  * @returns {{device: object, voice: object, files: string[], warnings: string[], devicewidth: number}}
  */
 function build(opts) {
   opts = opts || {};
   const outDir = opts.outDir || DEFAULT_OUT_DIR;
   const voiceSrc = opts.voiceSrc || DEFAULT_VOICE_SRC;
+  const recorderSrc = opts.recorderSrc || DEFAULT_RECORDER_SRC;
   const warnings = [];
 
   // parameter long names must be unique (Live would silently rename duplicates)
   const seen = new Set();
-  GRID_CONTROLS.concat([SPECIAL.load, SPECIAL.out]).forEach((c) => {
+  GRID_CONTROLS.concat([SPECIAL.load, SPECIAL.capfolder, SPECIAL.out]).forEach((c) => {
+    if (c.vis === '-') return; // not a Live parameter (umenu)
     if (seen.has(c.name)) throw new Error('duplicate parameter_longname: ' + c.name);
     seen.add(c.name);
   });
 
-  const code = readVoiceCode(voiceSrc, warnings);
-  const device = buildDevice();
+  const code = readGenCode(voiceSrc, 'voice', PLACEHOLDER_CODE, warnings);
+  const recorderCode = readGenCode(recorderSrc, 'recorder', RECORDER_PLACEHOLDER_CODE, warnings);
+  const device = buildDevice(recorderCode, warnings);
   const voice = buildVoice(code, warnings);
 
   const deviceFile = path.join(outDir, 'SliceKit.maxpat');
@@ -885,9 +1067,10 @@ function build(opts) {
 module.exports = {
   build,
   // exposed for tests / tooling
-  CONTROLS: GRID_CONTROLS.concat([SPECIAL.load, SPECIAL.out]),
+  CONTROLS: GRID_CONTROLS.concat([SPECIAL.load, SPECIAL.capfolder, SPECIAL.out]),
   DEVICE_HEIGHT,
   PLACEHOLDER_CODE,
+  RECORDER_PLACEHOLDER_CODE,
 };
 
 if (require.main === module) {

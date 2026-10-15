@@ -928,7 +928,7 @@ const GEN_RESERVED = [
   'if', 'else', 'for', 'while', 'break', 'continue', 'return', 'function', 'var', 'let', 'const', 'true', 'false',
   'null', 'param', 'history', 'buffer', 'data', 'delay'
 ];
-const ALLOWED_CALLS = ['floor', 'abs', 'min', 'max', 'tanh', 'exp', 'tan', 'sqrt', 'peek', 'dim', 'channels'];
+const ALLOWED_CALLS = ['floor', 'abs', 'min', 'max', 'tanh', 'exp', 'log', 'tan', 'sqrt', 'peek', 'dim', 'channels'];
 const KEYWORDS = ['if', 'else'];
 const BUILTIN_VALUES = ['in1', 'samplerate'];
 const OUTPUTS = ['out1', 'out2', 'out3'];
@@ -1129,7 +1129,7 @@ function compileGenExpr(raw) {
   let fn = null;
   if (errors.length === 0) {
     fn = new Function('P', 'H', bufferName || 'src', 'samplerate', 'in1',
-      'floor', 'abs', 'min', 'max', 'tanh', 'exp', 'tan', 'sqrt', 'peek', 'dim', 'channels', code);
+      'floor', 'abs', 'min', 'max', 'tanh', 'exp', 'tan', 'sqrt', 'peek', 'dim', 'channels', 'log', code);
   }
   return { errors: errors, warnings: warnings, params: params, histories: histories, bufferName: bufferName, order: order, fn: fn, code: code };
 }
@@ -1167,7 +1167,7 @@ function createGenVoice(compiled, opts) {
       for (let i = 0; i < n; i++) {
         const ph = phaseFn ? phaseFn(i, count) : 0;
         const o = compiled.fn(P, H, buf, samplerate, ph, Math.floor, Math.abs, Math.min, Math.max,
-          Math.tanh, Math.exp, Math.tan, Math.sqrt, peek, dim, channels);
+          Math.tanh, Math.exp, Math.tan, Math.sqrt, peek, dim, channels, Math.log);
         left[i] = o[0]; right[i] = o[1]; active[i] = o[2];
         count++;
       }

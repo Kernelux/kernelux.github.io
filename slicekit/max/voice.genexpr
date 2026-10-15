@@ -45,7 +45,10 @@
 //                      0.5 + 0.25*rptswing
 //   rptalt    0/1      alternate direction on every repeat
 //   cutoff    Hz       2-pole low-pass (Simper TPT SVF, Q = 0.7071);
-//                      >= 19000 = bypass
+//                      >= 19000 = bypass. Smoothed: one-pole (~10 ms) on
+//                      log2(Hz), snapped to the target at every (re)start. The
+//                      bypass is decided on the smoothed value and cross-faded
+//                      in 2 ms.
 //   drive     0..1     y = tanh(x*(1+9*drive))/tanh(1+9*drive) when > 0
 //                      (signal chain: filter -> drive -> envelope/fades -> amp)
 //   tape      0/1      1: rate factor falls linearly to 0 in `tapems`;
@@ -127,6 +130,8 @@ History h_ic1l(0);
 History h_ic2l(0);
 History h_ic1r(0);
 History h_ic2r(0);
+History h_cs(14.29);
+History h_byp(1);
 
 // ---------------------------------------------------------------------
 // Per-sample temporaries. All assigned here, at top level, because GenExpr
@@ -148,6 +153,8 @@ endfade_len = 0.002 * sr;
 tape_back_step = 1 / (0.01 * sr);
 loopexit_step = 1 / (0.001 * sr);
 ampcoef = 1 - exp(-1 / (0.005 * sr));
+cscoef = 1 - exp(-1 / (0.01 * sr));
+bypstep = 1 / (0.002 * sr);
 
 // ---- load state ------------------------------------------------------
 st = h_st;
@@ -181,6 +188,8 @@ ic1l = h_ic1l;
 ic2l = h_ic2l;
 ic1r = h_ic1r;
 ic2r = h_ic2r;
+cs = h_cs;
+byp = h_byp;
 
 // other temporaries (declared here for scope)
 trigreq = 0;
@@ -220,6 +229,10 @@ a1 = 0;
 b1 = 0;
 xl = 0;
 xr = 0;
+ctgt = 0;
+lcut = 0;
+fh = 0;
+bt = 0;
 fc = 0;
 gf = 0;
 a1f = 0;
@@ -236,6 +249,13 @@ dw = 0;
 outl = 0;
 outr = 0;
 outa = 0;
+
+// cutoff target (Hz) for the smoother: the bypass range (>= 19000) aims above
+// it so that the bypass is reached in finite time
+ctgt = max(cutoff, 10);
+if (cutoff >= 19000) {
+  ctgt = 24000;
+}
 
 // ---- 1. host events: kill and trig ------------------------------------
 if (kill != seenkill) {
@@ -373,6 +393,12 @@ if (dorestart > 0.5) {
   ic2l = 0;
   ic1r = 0;
   ic2r = 0;
+  // every hit starts exactly at its cutoff (smoother snapped, bypass decided)
+  cs = log(ctgt) * 1.4426950408889634;
+  byp = 0;
+  if (ctgt >= 19000) {
+    byp = 1;
+  }
   dd = 1;
   if (dir < 0) {
     dd = -1;
@@ -583,9 +609,22 @@ if (st == 1) {
       xr = xr * (1 - lw) + (a1 + (b1 - a1) * f1) * lw;
     }
 
+    // cutoff smoothing: one-pole (~10 ms) on log2(Hz), so gesture sweeps that
+    // update `cutoff` every ~15 ms do not zipper
+    lcut = log(ctgt) * 1.4426950408889634;
+    cs = cs + (lcut - cs) * cscoef;
+    fh = exp(cs * 0.6931471805599453);
+    // bypass (>= 19000 Hz) is decided on the smoothed value; the filtered and
+    // dry signals are cross-faded in 2 ms so the switch never clicks
+    bt = 0;
+    if (fh >= 19000) {
+      bt = 1;
+    }
+    byp = min(max(bt, byp - bypstep), byp + bypstep);
+
     // 2-pole TPT low-pass (Simper SVF) on the raw signal. It always runs so
-    // its state is warm; cutoff >= 19000 bypasses its output.
-    fc = min(max(cutoff, 10), 0.45 * sr);
+    // its state is warm; byp = 1 outputs the dry signal.
+    fc = min(max(fh, 10), 0.45 * sr);
     gf = tan(3.141592653589793 * fc / sr);
     a1f = 1 / (1 + gf * (gf + 1.4142135623730951));
     a2f = gf * a1f;
@@ -602,10 +641,8 @@ if (st == 1) {
     ic1r = 2 * v1 - ic1r;
     ic2r = 2 * v2 - ic2r;
     yr = v2;
-    if (cutoff >= 19000) {
-      yl = xl;
-      yr = xr;
-    }
+    yl = yl * (1 - byp) + xl * byp;
+    yr = yr * (1 - byp) + xr * byp;
 
     // drive
     // the shaped signal fades in over drive 0..0.1, so there is no level
@@ -690,6 +727,8 @@ h_ic1l = ic1l;
 h_ic2l = ic2l;
 h_ic1r = ic1r;
 h_ic2r = ic2r;
+h_cs = cs;
+h_byp = byp;
 
 out1 = outl;
 out2 = outr;

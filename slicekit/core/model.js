@@ -33,6 +33,32 @@
 //    (the base pad must stay with its slice); on a non-base pad it edits in place.
 //  * Locks follow the pad in swapKeys; clearKey also removes the lock.
 //  * seed values above 9999 wrap (modulo 10000) so "seed + 1" never sticks.
+//
+// v2 additions (see docs/ARCHITECTURE.md "v2 additions"):
+//  * The mod zone is MOD_ZONE_SIZE = 16 keys (modZoneStart 0..112); layout, shuffle,
+//    spread, findBest and occupiedKeys skip all 16 keys.
+//  * Pad.morph = { <MORPH_PARAMS name>: B value }, only for params that were set.
+//    setPadMorphParam/copyPadToMorph/clearPadMorph/copyAllToMorph/clearAllMorph/
+//    applyMorphParamToSource are undoable and notify 'pads'. Pad copies (duplicate,
+//    flip, spread, similar-swap) deep-copy morph; undo snapshots hold it (pads do).
+//    copyPadToMorph/clearPadMorph -> true for a known pad (false otherwise), also when
+//    nothing changed; copyAllToMorph/clearAllMorph/applyMorphParamToSource -> number of
+//    pads changed (0 = no undo step, no notification).
+//    applyMorphParamToSource is a no-op (0) when the pad has no B value for the param.
+//  * effectivePad(padId, m) is the single place that blends A and B (m clamped 0..1;
+//    m <= 0 gives exactly A, m >= 1 exactly B, so endpoints carry no float error).
+//  * New globals: morph, morphEdit, scan, keepClip, captureBars, captureFolder,
+//    gestureSel (plain setGlobal, 'globals' notification, not layout-affecting, not
+//    undoable) and globals.gestures (4 Gesture objects). Gestures are edited with
+//    setGestureParam (notifies 'globals', not undoable). getGesture(i) returns the LIVE
+//    gesture object (like getPad/globals) - read-only for callers; null for a bad index.
+//    setGlobal('gestures', x) is refused (false).
+//  * Gesture beats: a number that is in GEST_BEATS is read as a VALUE first (so 1 means
+//    1 beat and 2 means 2 beats), otherwise an integer 0..6 is an INDEX into GEST_BEATS
+//    (0,3,5,6 -> 0.25, 2, 8, 16), otherwise a GEST_BEATS_LABELS string; anything else is
+//    refused. 4 is both value and index and means 4 either way. fromJSON reads beats as a
+//    value only (snapped to the nearest GEST_BEATS entry).
+//  * fromJSON fills every v2 field with defaults for v1 states and clamps the rest.
 
 var prng = require('./prng');
 
@@ -43,7 +69,16 @@ var BEAT_DIV_BEATS = [0.25, 1 / 6, 0.5, 1 / 3, 1, 2 / 3, 2, 4 / 3, 4, 8, 16];
 var REPEAT_DIVS = ['1/4', '1/8', '1/8T', '1/16', '1/16T', '1/32', '1/32T', '1/64'];
 var REPEAT_PER_BEAT = [1, 2, 3, 4, 6, 8, 12, 16];
 var MOD_ACTIONS = ['rpt:1/4', 'rpt:1/8', 'rpt:1/8T', 'rpt:1/16', 'rpt:1/16T', 'rpt:1/32',
-  'rpt:1/64', 'reverse', 'octdown', 'octup', 'tape', 'chaos'];
+  'rpt:1/64', 'reverse', 'octdown', 'octup', 'tape', 'chaos',
+  'gest:0', 'gest:1', 'gest:2', 'gest:3'];
+var MOD_ZONE_SIZE = 16;
+var GEST_BEATS = [0.25, 0.5, 1, 2, 4, 8, 16];
+var GEST_BEATS_LABELS = ['1/16 bar', '1/8 bar', '1 beat', '2 beats', '1 bar', '2 bars', '4 bars'];
+var GEST_RATES = ['off', '1/4', '1/8', '1/8T', '1/16', '1/16T', '1/32', '1/32T', '1/64'];
+var CAPTURE_BARS = ['1/2 Bar', '1 Bar', '2 Bars', '4 Bars', '8 Bars'];
+var CAPTURE_BEATS = [2, 4, 8, 16, 32];
+var MORPH_PARAMS = ['pitch', 'fine', 'gainDb', 'attackMs', 'decayMs', 'sustain', 'releaseMs',
+  'startOffsetMs', 'loopSizeMs', 'loopPos', 'cutoffHz', 'drive', 'reverse', 'loopOn'];
 var MAX_SOURCES = 16;
 var NUM_SLOTS = 8;
 var NUM_KEYS = 128;
@@ -56,6 +91,13 @@ var CONST = {
   REPEAT_DIVS: REPEAT_DIVS,
   REPEAT_PER_BEAT: REPEAT_PER_BEAT,
   MOD_ACTIONS: MOD_ACTIONS,
+  MOD_ZONE_SIZE: MOD_ZONE_SIZE,
+  GEST_BEATS: GEST_BEATS,
+  GEST_BEATS_LABELS: GEST_BEATS_LABELS,
+  GEST_RATES: GEST_RATES,
+  CAPTURE_BARS: CAPTURE_BARS,
+  CAPTURE_BEATS: CAPTURE_BEATS,
+  MORPH_PARAMS: MORPH_PARAMS,
   MAX_SOURCES: MAX_SOURCES,
   NUM_SLOTS: NUM_SLOTS,
   NUM_KEYS: NUM_KEYS,
@@ -81,6 +123,11 @@ var PAD_RANGES = {
   drive: [0, 1]
 };
 var PAD_BOOLS = { reverse: true, loopOn: true };
+var MORPH_SET = {};
+(function () {
+  var i;
+  for (i = 0; i < MORPH_PARAMS.length; i++) MORPH_SET[MORPH_PARAMS[i]] = true;
+}());
 // every user-editable pad field, in schema order
 var PAD_PARAM_NAMES = ['reverse', 'pitch', 'fine', 'gainDb', 'attackMs', 'decayMs', 'sustain', 'releaseMs',
   'startOffsetMs', 'loopOn', 'loopSizeMs', 'loopPos', 'cutoffHz', 'drive'];
@@ -111,17 +158,25 @@ var GLOBAL_DEFS = {
   seed: { t: 'seed', def: 1 },
   flipPct: { t: 'num', min: 0, max: 100, def: 0 },
   modZoneOn: { t: 'bool', def: false },
-  modZoneStart: { t: 'int', min: 0, max: 116, def: 96 },
+  modZoneStart: { t: 'int', min: 0, max: 128 - MOD_ZONE_SIZE, def: 96 },
   velSens: { t: 'num', min: 0, max: 100, def: 50 },
   pressureToLevel: { t: 'bool', def: false },
   bestN: { t: 'int', min: 4, max: 64, def: 16 },
   spreadParam: { t: 'enum', vals: SPREAD_PARAMS, def: 'pitch' },
   spreadCount: { t: 'int', min: 2, max: 16, def: 16 },
-  spreadStep: { t: 'num', min: -24, max: 24, def: 1 }
+  spreadStep: { t: 'num', min: -24, max: 24, def: 1 },
+  morph: { t: 'num', min: 0, max: 100, def: 0 },
+  morphEdit: { t: 'bool', def: false },
+  scan: { t: 'num', min: 0, max: 100, def: 0 },
+  keepClip: { t: 'bool', def: false },
+  captureBars: { t: 'enum', vals: CAPTURE_BARS, def: '2 Bars' },
+  captureFolder: { t: 'string', def: '' },
+  gestureSel: { t: 'int', min: 0, max: 3, def: 0 }
 };
 var GLOBAL_NAMES = ['rootKey', 'layout', 'zoneAlign', 'sortBy', 'chokeScope', 'chaos', 'repeatOn', 'repeatDiv',
   'swing', 'repeatAlt', 'shuffleMode', 'shuffleScope', 'seed', 'flipPct', 'modZoneOn', 'modZoneStart',
-  'velSens', 'pressureToLevel', 'bestN', 'spreadParam', 'spreadCount', 'spreadStep'];
+  'velSens', 'pressureToLevel', 'bestN', 'spreadParam', 'spreadCount', 'spreadStep',
+  'morph', 'morphEdit', 'scan', 'keepClip', 'captureBars', 'captureFolder', 'gestureSel'];
 var LAYOUT_KEYS = { rootKey: true, layout: true, zoneAlign: true, sortBy: true, modZoneOn: true, modZoneStart: true };
 
 // ---------------------------------------------------------------- helpers
@@ -200,6 +255,103 @@ function validateGlobal(name, value) {
       if (n < 0) n = 0;
       if (n > 9999) n = n % 10000;
       return { value: n };
+    case 'string':
+      return typeof value === 'string' ? { value: value } : null;
+  }
+  return null;
+}
+
+// ---- gestures
+
+var GEST_NAME_MAX = 32;
+var GEST_FIELDS = ['name', 'beats', 'rateFrom', 'rateTo', 'cutFrom', 'cutTo', 'pitchFrom', 'pitchTo',
+  'ampFrom', 'ampTo', 'curve'];
+var GEST_RANGES = {
+  cutFrom: [20, 20000], cutTo: [20, 20000],
+  pitchFrom: [-48, 48], pitchTo: [-48, 48],
+  ampFrom: [0, 1], ampTo: [0, 1],
+  curve: [0, 1]
+};
+var GEST_DEFAULTS = [
+  { name: 'Build', beats: 4, rateFrom: '1/8', rateTo: '1/64', cutFrom: 20000, cutTo: 1200, pitchFrom: 0, pitchTo: 0, ampFrom: 1, ampTo: 1, curve: 0.3 },
+  { name: 'Rise', beats: 4, rateFrom: '1/16', rateTo: '1/16', cutFrom: 20000, cutTo: 20000, pitchFrom: 0, pitchTo: 12, ampFrom: 1, ampTo: 1, curve: 0 },
+  { name: 'Drop', beats: 2, rateFrom: 'off', rateTo: 'off', cutFrom: 20000, cutTo: 600, pitchFrom: 0, pitchTo: -24, ampFrom: 1, ampTo: 0.6, curve: 0.5 },
+  { name: 'Fade', beats: 4, rateFrom: '1/32', rateTo: '1/32', cutFrom: 20000, cutTo: 20000, pitchFrom: 0, pitchTo: 0, ampFrom: 1, ampTo: 0, curve: 0 }
+];
+
+function defaultGesture(i) {
+  return copyObj(GEST_DEFAULTS[i]);
+}
+
+function defaultGestures() {
+  var out = [];
+  var i;
+  for (i = 0; i < GEST_DEFAULTS.length; i++) out.push(defaultGesture(i));
+  return out;
+}
+
+// beats from a user value: a number in GEST_BEATS is a value, else an integer 0..6 is an
+// index into GEST_BEATS, else a GEST_BEATS_LABELS string. -> number or null
+function gestBeatsValue(v) {
+  var i, n;
+  if (typeof v === 'string') {
+    i = GEST_BEATS_LABELS.indexOf(v);
+    if (i >= 0) return GEST_BEATS[i];
+  }
+  if (typeof v === 'boolean') return null;
+  n = toNum(v);
+  if (!isFinite(n)) return null;
+  if (GEST_BEATS.indexOf(n) >= 0) return n;
+  if (n === Math.floor(n) && n >= 0 && n < GEST_BEATS.length) return GEST_BEATS[n];
+  return null;
+}
+
+// beats from saved JSON: always a value, snapped to the nearest GEST_BEATS entry. -> number or null
+function gestBeatsFromJSON(v) {
+  var i, n, best, bestD, d;
+  if (typeof v === 'string') {
+    i = GEST_BEATS_LABELS.indexOf(v);
+    if (i >= 0) return GEST_BEATS[i];
+  }
+  if (typeof v === 'boolean') return null;
+  n = toNum(v);
+  if (!isFinite(n)) return null;
+  best = GEST_BEATS[0];
+  bestD = Math.abs(n - best);
+  for (i = 1; i < GEST_BEATS.length; i++) {
+    d = Math.abs(n - GEST_BEATS[i]);
+    if (d < bestD) {
+      bestD = d;
+      best = GEST_BEATS[i];
+    }
+  }
+  return best;
+}
+
+// -> { value } or null. fromJSON: beats is read as a value only.
+function validateGestureParam(name, value, fromJSON) {
+  var n, s, e, r;
+  if (name === 'name') {
+    if (typeof value === 'number' && isFinite(value)) value = String(value);
+    if (typeof value !== 'string') return null;
+    s = value.replace(/^\s+|\s+$/g, '');
+    if (s === '') return null;
+    return { value: s.length > GEST_NAME_MAX ? s.substring(0, GEST_NAME_MAX) : s };
+  }
+  if (name === 'beats') {
+    n = fromJSON ? gestBeatsFromJSON(value) : gestBeatsValue(value);
+    return n === null ? null : { value: n };
+  }
+  if (name === 'rateFrom' || name === 'rateTo') {
+    e = enumValue(GEST_RATES, value);
+    return e === null ? null : { value: e };
+  }
+  if (typeof name === 'string' && hasOwn(GEST_RANGES, name)) {
+    if (typeof value === 'boolean') return null;
+    n = toNum(value);
+    if (!isFinite(n)) return null;
+    r = GEST_RANGES[name];
+    return { value: clamp(n, r[0], r[1]) };
   }
   return null;
 }
@@ -224,6 +376,7 @@ function defaultGlobals() {
   var g = {};
   var i;
   for (i = 0; i < GLOBAL_NAMES.length; i++) g[GLOBAL_NAMES[i]] = GLOBAL_DEFS[GLOBAL_NAMES[i]].def;
+  g.gestures = defaultGestures();
   return g;
 }
 
@@ -238,7 +391,8 @@ function defaultPad(id, sourceId, sliceId, base) {
     attackMs: 0, decayMs: 300, sustain: 1, releaseMs: 30,
     startOffsetMs: 0, loopOn: false, loopSizeMs: 30, loopPos: 0,
     cutoffHz: 20000, drive: 0,
-    layers: [], origSliceId: null, simIndex: 0
+    layers: [], origSliceId: null, simIndex: 0,
+    morph: {}
   };
 }
 
@@ -328,6 +482,19 @@ function sanitizeState(raw) {
         if (r) st.globals[name] = r.value;
       }
     }
+    if (Array.isArray(raw.globals.gestures)) {
+      for (i = 0; i < st.globals.gestures.length && i < raw.globals.gestures.length; i++) {
+        var rg = raw.globals.gestures[i];
+        if (!rg || typeof rg !== 'object') continue;
+        for (j = 0; j < GEST_FIELDS.length; j++) {
+          name = GEST_FIELDS[j];
+          if (hasOwn(rg, name)) {
+            r = validateGestureParam(name, rg[name], true);
+            if (r) st.globals.gestures[i][name] = r.value;
+          }
+        }
+      }
+    }
   }
 
   // sources + slices
@@ -409,6 +576,15 @@ function sanitizeState(raw) {
       pad.origSliceId = rp.origSliceId;
       v = toInt(rp.simIndex);
       pad.simIndex = (isNaN(v) || v < 0) ? 0 : v;
+    }
+    if (rp.morph && typeof rp.morph === 'object' && !Array.isArray(rp.morph)) {
+      for (j = 0; j < MORPH_PARAMS.length; j++) {
+        name = MORPH_PARAMS[j];
+        if (hasOwn(rp.morph, name)) {
+          r = validatePadParam(name, rp.morph[name]);
+          if (r) pad.morph[name] = r.value;
+        }
+      }
     }
     st.pads[pid] = pad;
   }
@@ -544,7 +720,7 @@ function createModel(state, deps) {
 
   function isModKeyRaw(k) {
     var g = state.globals;
-    return g.modZoneOn && k >= g.modZoneStart && k <= g.modZoneStart + 11;
+    return g.modZoneOn && k >= g.modZoneStart && k < g.modZoneStart + MOD_ZONE_SIZE;
   }
 
   function padOnKey(key, slotIndex) {
@@ -589,6 +765,7 @@ function createModel(state, deps) {
     c.layers = p.layers.slice();
     c.origSliceId = p.origSliceId;
     c.simIndex = p.simIndex;
+    c.morph = copyObj(p.morph);
     return c;
   }
 
@@ -1429,6 +1606,170 @@ function createModel(state, deps) {
     return changed;
   };
 
+  // ---- morph (A = the pad's own params, B = pad.morph)
+
+  // set the B value of one MORPH_PARAMS param (same validation / clamps as setPadParam)
+  api.setPadMorphParam = function (padId, name, value) {
+    var pad = getPad(padId);
+    if (!pad || typeof name !== 'string' || !hasOwn(MORPH_SET, name)) return false;
+    var r = validatePadParam(name, value);
+    if (!r) return false;
+    if (hasOwn(pad.morph, name) && pad.morph[name] === r.value) return true;
+    beginOp('padmorph:' + pad.id + ':' + name, null);
+    pad.morph[name] = r.value;
+    mark('pads');
+    flush();
+    return true;
+  };
+
+  // B := A for every MORPH_PARAMS param. -> true for a known pad
+  api.copyPadToMorph = function (padId) {
+    var pad = getPad(padId);
+    if (!pad) return false;
+    var token = beginOp(null, null);
+    var changed = false;
+    var i, name;
+    for (i = 0; i < MORPH_PARAMS.length; i++) {
+      name = MORPH_PARAMS[i];
+      if (!hasOwn(pad.morph, name) || pad.morph[name] !== pad[name]) {
+        pad.morph[name] = pad[name];
+        changed = true;
+      }
+    }
+    if (!changed) {
+      cancelOp(token);
+      return true;
+    }
+    mark('pads');
+    flush();
+    return true;
+  };
+
+  // remove every B value of the pad. -> true for a known pad
+  api.clearPadMorph = function (padId) {
+    var pad = getPad(padId);
+    if (!pad) return false;
+    var names = Object.keys(pad.morph);
+    if (!names.length) return true;
+    var i;
+    beginOp(null, null);
+    for (i = 0; i < names.length; i++) delete pad.morph[names[i]];
+    mark('pads');
+    flush();
+    return true;
+  };
+
+  // B := A on every pad. -> number of pads changed
+  api.copyAllToMorph = function () {
+    var token = beginOp(null, null);
+    var changed = 0;
+    var id, p, i, name, padChanged;
+    for (id in state.pads) {
+      if (!hasOwn(state.pads, id)) continue;
+      p = state.pads[id];
+      padChanged = false;
+      for (i = 0; i < MORPH_PARAMS.length; i++) {
+        name = MORPH_PARAMS[i];
+        if (!hasOwn(p.morph, name) || p.morph[name] !== p[name]) {
+          p.morph[name] = p[name];
+          padChanged = true;
+        }
+      }
+      if (padChanged) changed++;
+    }
+    if (!changed) {
+      cancelOp(token);
+      return 0;
+    }
+    mark('pads');
+    flush();
+    return changed;
+  };
+
+  // remove the B values of every pad. -> number of pads changed
+  api.clearAllMorph = function () {
+    var token = beginOp(null, null);
+    var changed = 0;
+    var id, p, names, i;
+    for (id in state.pads) {
+      if (!hasOwn(state.pads, id)) continue;
+      p = state.pads[id];
+      names = Object.keys(p.morph);
+      if (!names.length) continue;
+      for (i = 0; i < names.length; i++) delete p.morph[names[i]];
+      changed++;
+    }
+    if (!changed) {
+      cancelOp(token);
+      return 0;
+    }
+    mark('pads');
+    flush();
+    return changed;
+  };
+
+  // copy this pad's B value of `name` to every other pad of the same source (no-op when
+  // this pad has no B value for it). -> number of pads changed
+  api.applyMorphParamToSource = function (padId, name) {
+    var pad = getPad(padId);
+    if (!pad || typeof name !== 'string' || !hasOwn(MORPH_SET, name) || !hasOwn(pad.morph, name)) return 0;
+    var token = beginOp(null, null);
+    var changed = 0;
+    var id, p;
+    for (id in state.pads) {
+      if (!hasOwn(state.pads, id)) continue;
+      p = state.pads[id];
+      if (p.sourceId === pad.sourceId && p.id !== pad.id && (!hasOwn(p.morph, name) || p.morph[name] !== pad.morph[name])) {
+        p.morph[name] = pad.morph[name];
+        changed++;
+      }
+    }
+    if (!changed) {
+      cancelOp(token);
+      return 0;
+    }
+    mark('pads');
+    flush();
+    return changed;
+  };
+
+  // The pad with the morph applied at amount m (0..1): a new plain object with every Pad
+  // field. Numbers blend linearly, cutoffHz geometrically, booleans switch at m >= 0.5;
+  // a param without a B value stays A. m <= 0 is exactly A, m >= 1 exactly B. null for an
+  // unknown pad.
+  api.effectivePad = function (padId, m) {
+    var pad = getPad(padId);
+    if (!pad) return null;
+    var t = toNum(m);
+    t = isFinite(t) ? clamp(t, 0, 1) : 0;
+    var out = {};
+    var f, i, name, a, b;
+    for (f in pad) {
+      if (!hasOwn(pad, f)) continue;
+      if (f === 'layers') out.layers = pad.layers.slice();
+      else if (f === 'morph') out.morph = copyObj(pad.morph);
+      else out[f] = pad[f];
+    }
+    for (i = 0; i < MORPH_PARAMS.length; i++) {
+      name = MORPH_PARAMS[i];
+      if (!hasOwn(pad.morph, name)) continue;
+      a = pad[name];
+      b = pad.morph[name];
+      if (hasOwn(PAD_BOOLS, name)) {
+        out[name] = t >= 0.5 ? b : a;
+      } else if (t <= 0) {
+        out[name] = a;
+      } else if (t >= 1) {
+        out[name] = b;
+      } else if (name === 'cutoffHz' && a > 0 && b > 0) {
+        out[name] = a * Math.pow(b / a, t);
+      } else {
+        out[name] = a + (b - a) * t;
+      }
+    }
+    return out;
+  };
+
   api.duplicatePad = function (fromKey, toKey_) {
     var from = toKey(fromKey);
     var to = toKey(toKey_);
@@ -1842,6 +2183,28 @@ function createModel(state, deps) {
     state.globals[name] = r.value;
     mark('globals');
     if (hasOwn(LAYOUT_KEYS, name)) relayoutAutoSlots();
+    flush();
+    return true;
+  };
+
+  // ---- gestures (globals.gestures; notify 'globals', never undo steps)
+
+  // the LIVE gesture object (read-only for callers), or null when index is not 0..3
+  api.getGesture = function (index) {
+    var i = toInt(index);
+    if (isNaN(i) || i < 0 || i >= state.globals.gestures.length) return null;
+    return state.globals.gestures[i];
+  };
+
+  // -> true when valid (also when unchanged), false for a bad index / name / value
+  api.setGestureParam = function (index, name, value) {
+    var g = api.getGesture(index);
+    if (!g || typeof name !== 'string') return false;
+    var r = validateGestureParam(name, value, false);
+    if (!r) return false;
+    if (g[name] === r.value) return true;
+    g[name] = r.value;
+    mark('globals');
     flush();
     return true;
   };

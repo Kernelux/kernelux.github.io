@@ -9,6 +9,16 @@ const prng = require('../core/prng');
 
 const CONST = Model.CONST;
 
+// the documented v2 gesture defaults (docs/ARCHITECTURE.md "v2 additions")
+function defaultGestures() {
+  return [
+    { name: 'Build', beats: 4, rateFrom: '1/8', rateTo: '1/64', cutFrom: 20000, cutTo: 1200, pitchFrom: 0, pitchTo: 0, ampFrom: 1, ampTo: 1, curve: 0.3 },
+    { name: 'Rise', beats: 4, rateFrom: '1/16', rateTo: '1/16', cutFrom: 20000, cutTo: 20000, pitchFrom: 0, pitchTo: 12, ampFrom: 1, ampTo: 1, curve: 0 },
+    { name: 'Drop', beats: 2, rateFrom: 'off', rateTo: 'off', cutFrom: 20000, cutTo: 600, pitchFrom: 0, pitchTo: -24, ampFrom: 1, ampTo: 0.6, curve: 0.5 },
+    { name: 'Fade', beats: 4, rateFrom: '1/32', rateTo: '1/32', cutFrom: 20000, cutTo: 20000, pitchFrom: 0, pitchTo: 0, ampFrom: 1, ampTo: 0, curve: 0 }
+  ];
+}
+
 // ---------------------------------------------------------------- helpers
 
 // Small deterministic stand-in for core/features.js (centroidHz is the only
@@ -150,12 +160,27 @@ function checkInvariants(m) {
       assert.notEqual(l, p.id);
     });
     if (p.origSliceId !== null) assert.ok(sliceOwner[p.origSliceId] !== undefined, 'dangling origSliceId');
+    assert.ok(p.morph && typeof p.morph === 'object' && !Array.isArray(p.morph), 'pad ' + p.id + ' has a morph object');
+    Object.keys(p.morph).forEach((name) => {
+      assert.ok(CONST.MORPH_PARAMS.indexOf(name) >= 0, 'morph key ' + name + ' is a MORPH_PARAMS name');
+      if (name === 'reverse' || name === 'loopOn') assert.equal(typeof p.morph[name], 'boolean', 'morph.' + name);
+      else {
+        const r = Model.PAD_RANGES[name];
+        assert.ok(typeof p.morph[name] === 'number' && p.morph[name] >= r[0] && p.morph[name] <= r[1], 'morph.' + name + ' in range');
+      }
+    });
     if (p.base) baseCount[p.sliceId] = (baseCount[p.sliceId] || 0) + 1;
   });
   st.sources.forEach((s) => s.slices.forEach((sl) => {
     assert.equal(baseCount[sl.id], 1, 'slice ' + sl.id + ' must have exactly one base pad');
   }));
   assert.equal(st.slots.length, CONST.NUM_SLOTS);
+  assert.equal(st.globals.gestures.length, 4);
+  assert.ok(st.globals.morph >= 0 && st.globals.morph <= 100);
+  assert.ok(st.globals.scan >= 0 && st.globals.scan <= 100);
+  assert.ok(st.globals.modZoneStart >= 0 && st.globals.modZoneStart <= 128 - CONST.MOD_ZONE_SIZE);
+  assert.ok(CONST.CAPTURE_BARS.indexOf(st.globals.captureBars) >= 0);
+  assert.ok([0, 1, 2, 3].indexOf(st.globals.gestureSel) >= 0);
   const referenced = new Set();
   st.slots.forEach((slot) => {
     assert.equal(slot.keys.length, CONST.NUM_KEYS);
@@ -190,8 +215,10 @@ test('Model.CONST has the documented constants', () => {
   assert.deepEqual(CONST.REPEAT_DIVS, ['1/4', '1/8', '1/8T', '1/16', '1/16T', '1/32', '1/32T', '1/64']);
   assert.deepEqual(CONST.REPEAT_PER_BEAT, [1, 2, 3, 4, 6, 8, 12, 16]);
   assert.deepEqual(CONST.MOD_ACTIONS, ['rpt:1/4', 'rpt:1/8', 'rpt:1/8T', 'rpt:1/16', 'rpt:1/16T', 'rpt:1/32',
-    'rpt:1/64', 'reverse', 'octdown', 'octup', 'tape', 'chaos']);
-  assert.equal(CONST.MOD_ACTIONS.length, 12);
+    'rpt:1/64', 'reverse', 'octdown', 'octup', 'tape', 'chaos', 'gest:0', 'gest:1', 'gest:2', 'gest:3']);
+  assert.equal(CONST.MOD_ACTIONS.length, 16);
+  assert.equal(CONST.MOD_ZONE_SIZE, 16);
+  assert.equal(CONST.MOD_ACTIONS.length, CONST.MOD_ZONE_SIZE);
   assert.equal(CONST.MAX_SOURCES, 16);
   assert.equal(CONST.NUM_SLOTS, 8);
   assert.equal(CONST.NUM_KEYS, 128);
@@ -224,7 +251,9 @@ test('a fresh model has the documented empty state and Globals defaults', () => 
     chaos: 0, repeatOn: false, repeatDiv: '1/16', swing: 0, repeatAlt: false,
     shuffleMode: 'chaos', shuffleScope: 'all', seed: 1, flipPct: 0,
     modZoneOn: false, modZoneStart: 96, velSens: 50, pressureToLevel: false,
-    bestN: 16, spreadParam: 'pitch', spreadCount: 16, spreadStep: 1
+    bestN: 16, spreadParam: 'pitch', spreadCount: 16, spreadStep: 1,
+    morph: 0, morphEdit: false, scan: 0, keepClip: false, captureBars: '2 Bars', captureFolder: '', gestureSel: 0,
+    gestures: defaultGestures()
   });
   assert.equal(m.globals(), m.state.globals);
   assert.equal(m.currentSlot(), 0);
@@ -257,7 +286,8 @@ test('Pad defaults', () => {
     attackMs: 0, decayMs: 300, sustain: 1, releaseMs: 30,
     startOffsetMs: 0, loopOn: false, loopSizeMs: 30, loopPos: 0,
     cutoffHz: 20000, drive: 0,
-    layers: [], origSliceId: null, simIndex: 0
+    layers: [], origSliceId: null, simIndex: 0,
+    morph: {}
   });
   assert.equal(m.getPad(pad.id), pad);
   assert.equal(m.getPad(999999), null);
@@ -591,16 +621,16 @@ test('mod-zone keys are skipped by layout and left empty', () => {
   const m = mk();
   addSrc(m, 'a', 6);
   m.setGlobal('modZoneStart', 38);
-  m.setGlobal('modZoneOn', true);
+  m.setGlobal('modZoneOn', true); // 38..53 (16 keys)
   assert.deepEqual(tags(m, 36, 39), ['a0', 'a1', null, null]);
-  assert.deepEqual(tags(m, 48, 54), [null, null, 'a2', 'a3', 'a4', 'a5', null]);
-  for (let k = 38; k <= 49; k++) assert.equal(m.getPadOnKey(k), null);
-  assert.deepEqual(m.occupiedKeys(), [36, 37, 50, 51, 52, 53]);
+  assert.deepEqual(tags(m, 52, 58), [null, null, 'a2', 'a3', 'a4', 'a5', null]);
+  for (let k = 38; k <= 53; k++) assert.equal(m.getPadOnKey(k), null);
+  assert.deepEqual(m.occupiedKeys(), [36, 37, 54, 55, 56, 57]);
   // moving the zone moves the hole
-  m.setGlobal('modZoneStart', 40);
+  m.setGlobal('modZoneStart', 40); // 40..55
   assert.deepEqual(tags(m, 36, 41), ['a0', 'a1', 'a2', 'a3', null, null]);
-  assert.equal(tag(m, 52), 'a4');
-  assert.equal(tag(m, 53), 'a5');
+  assert.equal(tag(m, 56), 'a4');
+  assert.equal(tag(m, 57), 'a5');
   m.setGlobal('modZoneOn', false);
   assert.deepEqual(tags(m, 36, 41), ['a0', 'a1', 'a2', 'a3', 'a4', 'a5']);
   checkInvariants(m);
@@ -622,10 +652,10 @@ test('overflow past key 127 is dropped and counted', () => {
   // mod-zone keys count against capacity
   m.setGlobal('rootKey', 100);
   m.setGlobal('modZoneStart', 110);
-  m.setGlobal('modZoneOn', true);
+  m.setGlobal('modZoneOn', true); // 110..125
   assert.deepEqual(m.applyLayout(0), { placed: 12, dropped: 0 });
   assert.deepEqual(tags(m, 100, 111), Array.from({ length: 10 }, (_, i) => 'a' + i).concat([null, null]));
-  assert.deepEqual(tags(m, 122, 123), ['a10', 'a11']);
+  assert.deepEqual(tags(m, 126, 127), ['a10', 'a11']);
 });
 
 test('applyLayout(slot) returns {placed, dropped}, sets auto and works on any slot', () => {
@@ -726,15 +756,15 @@ test('appended reslice pads skip locked and mod-zone keys, and drop at the end o
   m.shuffle({ seed: 1 });
   m.setLock(38, true); // empty locked key right after the occupied range
   m.setGlobal('modZoneStart', 39);
-  m.setGlobal('modZoneOn', true); // 39..50
+  m.setGlobal('modZoneOn', true); // 39..54
   m.setSlices(s.id, ranges(8, 1000));
-  // occupied: 36,37 -> new pads at 51.. (38 locked, 39..50 mod zone)
+  // occupied: 36,37 -> new pads at 55.. (38 locked, 39..54 mod zone)
   const keys = m.getSlotKeys(0);
   assert.equal(keys[38], null);
-  for (let k = 39; k <= 50; k++) assert.equal(keys[k], null);
+  for (let k = 39; k <= 54; k++) assert.equal(keys[k], null);
   const placed = [];
-  for (let k = 51; k < 128; k++) if (keys[k] !== null) placed.push(k);
-  assert.deepEqual(placed, [51, 52, 53, 54, 55, 56]);
+  for (let k = 55; k < 128; k++) if (keys[k] !== null) placed.push(k);
+  assert.deepEqual(placed, [55, 56, 57, 58, 59, 60]);
   checkInvariants(m);
 
   const m2 = mk();
@@ -981,7 +1011,7 @@ test('locked keys and mod-zone keys are not touched by shuffle', () => {
   m.setLock(38, true);
   m.setLock(44, true);
   m.setGlobal('modZoneStart', 46);
-  m.setGlobal('modZoneOn', true); // 46..57
+  m.setGlobal('modZoneOn', true); // 46..61
   // park a pad on a mod key by hand
   const parked = m.getPadOnKey(36);
   m.assignPad(50, parked.id);
@@ -1599,10 +1629,10 @@ test('spread skips locked and mod-zone keys, stops at 127, ignores bad input', (
   const m = spreadKit();
   m.setLock(38, true);
   m.setGlobal('modZoneStart', 40);
-  m.setGlobal('modZoneOn', true); // 40..51
+  m.setGlobal('modZoneOn', true); // 40..55
   const lockedPad = m.getPadOnKey(38);
   const keys = m.spread(36, 'pitch', 5, 1);
-  assert.deepEqual(keys, [37, 39, 52, 53]);
+  assert.deepEqual(keys, [37, 39, 56, 57]);
   assert.equal(m.getPadOnKey(38), lockedPad);
   assert.deepEqual(keys.map((k) => m.getPadOnKey(k).pitch), [1, 2, 3, 4]);
   // slot 0 is manual: the pads parked on the (new) mod-zone keys 40..43 are left alone, not overwritten
@@ -1770,17 +1800,17 @@ test('findBest keeps locked keys, leaves mod-zone keys alone, honours rootKey an
   m.setGlobal('rootKey', 50);
   m.applyLayout(0);
   m.setGlobal('modZoneStart', 53);
-  m.setGlobal('modZoneOn', true); // 53..64
+  m.setGlobal('modZoneOn', true); // 53..68
   const parked = m.getPadOnKey(51);
   m.assignPad(55, parked.id); // stale pad on a mod key
   m.setLock(52, true);
   const lockedPad = m.getPadOnKey(52);
   const res = m.findBest(4);
-  // best by rmsDb desc: a7, a6, a5, a4 -> keys 50, 51, (52 locked), then 53..64 mod -> 65, 66
+  // best by rmsDb desc: a7, a6, a5, a4 -> keys 50, 51, (52 locked), then 53..68 mod -> 69, 70
   assert.deepEqual(res, { placed: 4 });
   assert.equal(m.getPadOnKey(52), lockedPad);
   assert.equal(m.getPadOnKey(55), parked, 'mod-zone keys are not cleared');
-  assert.deepEqual([50, 51, 65, 66].map((k) => tag(m, k)), ['a7', 'a6', 'a5', 'a4']);
+  assert.deepEqual([50, 51, 69, 70].map((k) => tag(m, k)), ['a7', 'a6', 'a5', 'a4']);
   assert.equal(m.getPadOnKey(53), null);
   assert.equal(m.getPadOnKey(54), null);
   const m2 = mk();
@@ -2156,26 +2186,34 @@ test('isModKey / modOffset follow modZoneOn and modZoneStart', () => {
   assert.equal(m.isModKey(95), false);
   assert.equal(m.isModKey(96), true);
   assert.equal(m.isModKey(107), true);
-  assert.equal(m.isModKey(108), false);
+  assert.equal(m.isModKey(108), true, 'the zone is 16 keys: 96..111');
+  assert.equal(m.isModKey(111), true);
+  assert.equal(m.isModKey(112), false);
   assert.equal(m.modOffset(95), -1);
   assert.equal(m.modOffset(96), 0);
   assert.equal(m.modOffset(100), 4);
   assert.equal(m.modOffset(107), 11);
-  assert.equal(m.modOffset(108), -1);
+  assert.equal(m.modOffset(108), 12);
+  assert.equal(m.modOffset(111), 15);
+  assert.equal(m.modOffset(112), -1);
   assert.equal(m.isModKey(-1), false);
   assert.equal(m.isModKey(128), false);
   assert.equal(m.isModKey('x'), false);
   assert.equal(m.modOffset(200), -1);
-  m.setGlobal('modZoneStart', 116);
+  m.setGlobal('modZoneStart', 112);
   assert.equal(m.isModKey(127), true);
-  assert.equal(m.modOffset(127), 11);
-  assert.equal(m.isModKey(115), false);
+  assert.equal(m.modOffset(127), 15);
+  assert.equal(m.modOffset(112), 0);
+  assert.equal(m.isModKey(111), false);
   m.setGlobal('modZoneStart', 200);
-  assert.equal(m.globals().modZoneStart, 116, 'start is clamped so the zone fits the keyboard');
+  assert.equal(m.globals().modZoneStart, 112, 'start is clamped so the zone fits the keyboard');
+  m.setGlobal('modZoneStart', 116);
+  assert.equal(m.globals().modZoneStart, 112);
   m.setGlobal('modZoneStart', -3);
   assert.equal(m.globals().modZoneStart, 0);
   assert.equal(m.modOffset(11), 11);
-  assert.equal(m.modOffset(12), -1);
+  assert.equal(m.modOffset(15), 15);
+  assert.equal(m.modOffset(16), -1);
 });
 
 test('occupiedKeys excludes mod-zone keys, even with a parked pad', () => {
@@ -2413,7 +2451,7 @@ test('setGlobal validates names and clamps / coerces values', () => {
     assert.equal(g[name], (lo + hi) / 2 + 0.25, name + ' floats are kept');
     assert.equal(m.setGlobal(name, NaN), false);
   });
-  [['modZoneStart', 0, 116], ['bestN', 4, 64], ['spreadCount', 2, 16]].forEach(([name, lo, hi]) => {
+  [['modZoneStart', 0, 112], ['bestN', 4, 64], ['spreadCount', 2, 16]].forEach(([name, lo, hi]) => {
     m.setGlobal(name, lo - 50);
     assert.equal(g[name], lo, name);
     m.setGlobal(name, hi + 50);
@@ -2599,6 +2637,24 @@ function complexModel() {
   m.setGlobal('seed', 321);
   m.setGlobal('flipPct', 15);
   m.addSlicePoint(m.listSources()[2].id, 2500);
+  // v2 state: B values, gestures and the new globals
+  const ids = padIds(m);
+  m.setPadMorphParam(ids[0], 'pitch', 7);
+  m.setPadMorphParam(ids[0], 'cutoffHz', 2500);
+  m.setPadMorphParam(ids[1], 'reverse', true);
+  m.setPadMorphParam(ids[1], 'drive', 0.25);
+  m.copyPadToMorph(ids[2]);
+  m.setGestureParam(1, 'name', 'Lift');
+  m.setGestureParam(1, 'beats', 8);
+  m.setGestureParam(2, 'rateFrom', '1/16T');
+  m.setGestureParam(3, 'curve', 0.75);
+  m.setGlobal('morph', 35);
+  m.setGlobal('morphEdit', true);
+  m.setGlobal('scan', 12.5);
+  m.setGlobal('keepClip', true);
+  m.setGlobal('captureBars', '4 Bars');
+  m.setGlobal('captureFolder', '/tmp/caps');
+  m.setGlobal('gestureSel', 2);
   return m;
 }
 

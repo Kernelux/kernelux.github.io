@@ -29,6 +29,7 @@ var MODULES = [
   'core/features.js',
   'core/model.js',
   'core/engine.js',
+  'core/remap.js',
   'max/glue.js'
 ];
 
@@ -69,11 +70,23 @@ var SHIM = [
   ''
 ].join('\n');
 
+// The footer runs in the js/v8 object's own global scope, so `this` at its top
+// level is the object that owns `patcher`. The glue needs that patcher to find
+// the device's folder (capture default), but its functions are plain calls where
+// `this` may be another object. So the footer keeps the top-level `this` in
+// __skThis and exposes __skPatcher(), which reads `this.patcher` lazily (the
+// patcher may not be reachable yet when the file is first loaded). The glue
+// reads it through hostFromGlobals().patcherPath().
 var FOOTER = [
   '// ---- Max entry points ----',
   'inlets = 1;',
-  'outlets = 4;',
+  'outlets = 5;   // 0 voices, 1 buffers, 2 controls, 3 jsui, 4 recorder (cap / wpb)',
   'autowatch = 0;',
+  '',
+  'var __skThis = this;',
+  'function __skPatcher() {',
+  '  try { return __skThis && __skThis.patcher ? __skThis.patcher : null; } catch (e) { return null; }',
+  '}',
   '',
   'var __skGlue = null;',
   'try {',
