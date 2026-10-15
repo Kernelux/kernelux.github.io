@@ -5,7 +5,7 @@ does and why. For module boundaries and data shapes see `ARCHITECTURE.md`. For M
 message names and UI controls see `PROTOCOL.md`. For the manual test list see
 `TESTING.md`.
 
-Sections marked **v2** or **v3** are not part of the first release.
+Sections marked **v2** are implemented. Sections marked **v3** are planned and not built yet.
 
 ---
 
@@ -42,6 +42,8 @@ The reasons for building it:
 | Modifier key | A key in the modifier zone. It makes no sound; it changes how other notes play. |
 | Lock | A key that the layout and shuffle leave alone. |
 | Root key | The key where the layout starts. Default 36 (C1 in Live). |
+| Gesture | A ramp that runs while its modifier key is held (v2, section 13). |
+| A and B settings | A pad's normal settings, and an optional second set that Morph moves toward (v2, section 14). |
 
 ## 3. Working with the device
 
@@ -53,6 +55,7 @@ The reasons for building it:
   tools. The Performance panel holds chaos, repeat, swing and the modifier zone.
 - A status line at the bottom reports the last action, errors and anything dropped
   (for example, slices that did not fit on the keyboard).
+- The v2 tools (Capture, Gestures, Morph, Scan, Simpler import, Keep clip) are described in sections 12 to 17.
 
 ## 4. The three layers
 
@@ -77,6 +80,7 @@ every pad that plays the same source, use **→ Sample**.
   The color shows on its keys.
 - A new source is sliced with its own slicing settings (default: Transient). Adding
   or removing a source re-lays out the auto maps (see section 8).
+- Capture (section 12) and Simpler import (section 16) add samples the same way.
 
 Play mode, trigger/gate and slicing settings belong to each source.
 
@@ -186,6 +190,7 @@ Notes:
 
 - Decay, sustain and release shape the level over the hit. A long sample with
   sustain at 0 and a short decay becomes a blip.
+- Each setting above can also have a B value, which Morph moves toward (section 14).
 - Lock and similar-swap are not pad settings. They are described in sections 8 and 10.
 
 ### 7.2 Reverse
@@ -271,6 +276,7 @@ or slices.
   The original pad is not changed, and other slots are not affected.
 - **Reverse travels.** Reverse is a pad setting, so a reversed pad that moves stays
   reversed.
+- **Keep clip.** With Keep clip on (section 17), the notes of the current clip move with their pads after a shuffle.
 
 ## 10. Performance
 
@@ -280,6 +286,7 @@ or slices.
 - Each new hit has that chance of playing a random slice from the whole pool, instead
   of the slice on its key. At 0 nothing changes. At 100 every hit is random.
 - The modifier action **chaos** (section 10.4) makes every hit random while held.
+- Scan (section 15) picks the pad first, and chaos is applied after it, so chaos still works on top of Scan.
 
 ### 10.2 Repeat
 
@@ -297,6 +304,8 @@ or slices.
 
 Repeat, rate, swing and alt are all automatable.
 
+A gesture (section 13) can set the repeat rate while its key is held. A gesture's rate overrides the Repeat toggle and the repeat modifiers (section 10.4).
+
 ### 10.3 Aftertouch
 
 - **Press** (pressure to level) is off by default. When it is on, channel aftertouch
@@ -308,7 +317,7 @@ Repeat, rate, swing and alt are all automatable.
 
 ### 10.4 Modifier zone
 
-The modifier zone is a row of 12 keys. Its first key is the **Mods start** key, which
+The modifier zone is a row of 16 keys. Its first key is the **Mods start** key, which
 defaults to 96 (C6 in Live's naming). When the zone is on (**Mods** toggle), its keys:
 
 - make no sound and are skipped by the layout;
@@ -332,9 +341,15 @@ Default layout of the zone (offset from the start key):
 | 9 | 105 | octave up | Plays one octave higher. |
 | 10 | 106 | tape | Playing sounds slow to a stop over one beat. On release they speed back up. |
 | 11 | 107 | chaos | Every hit is a random slice from the pool. |
+| 12 | 108 | gesture 1 (Build) | Runs the ramp of gesture 1 while held (section 13). |
+| 13 | 109 | gesture 2 (Rise) | Runs the ramp of gesture 2 while held. |
+| 14 | 110 | gesture 3 (Drop) | Runs the ramp of gesture 3 while held. |
+| 15 | 111 | gesture 4 (Fade) | Runs the ramp of gesture 4 while held. |
 
 Modifier keys can be played live or drawn into a Live clip. A clip note on a modifier
 key acts as holding that key for the length of the note.
+
+The start key can be set from 0 to 112, so the zone always fits on the keyboard (its last key is 127). A Set saved before v2 with Mods on and pads on keys 108 to 111 now has gesture keys there. Those pads are silent until you turn Mods off or move the start key.
 
 ## 11. Kit-building tools
 
@@ -392,7 +407,161 @@ Inspired by Serato Sample's search for the strongest samples.
 - The unlocked keys of the current slot are cleared first, and the picks go on the
   keys from the root key upward. Locked keys stay. Undo restores the previous map.
 
-## 12. Inspirations
+## 12. Capture (v2)
+
+Capture keeps what the device has just played, so a moment you did not plan to record
+can still become a new sample.
+
+- **Always recording.** While the device is loaded, it records its own output into a
+  40-second stereo ring. Only this device is recorded. The recording is taken before
+  the Output control, so the output level does not change it.
+- **Length.** Capture length is the last ½, 1, 2, 4 or 8 bars. The default is 2 bars.
+  Bars are counted at Live's tempo, so 2 bars at 120 BPM is 4 seconds.
+- **Capture** saves that stretch of the ring as a stereo WAV file and loads it as a new
+  sample, about 0.3 seconds later. The new sample is sliced like any other (section 5).
+  The status line reads "Captured N bars" followed by the sample's name.
+- **Folder.** Files go to the capture folder. By default that is the folder that holds
+  the device. If the device has no folder, it is the folder of the first sample. Press
+  **Folder…** to choose another. Files are named `SliceKit Capture YYYYMMDD-HHMMSS.wav`.
+- A capture is a sample like any other, so it uses one of the 16 source slots.
+
+Capture fits into a normal session: play the kit, capture what came out, chop the
+capture, play the chops, and capture again.
+
+## 13. Gestures (v2)
+
+A gesture is a ramp that runs while you hold its key. There are four gestures, on the
+modifier zone as keys G1 to G4 (offsets 12 to 15, so keys 108 to 111 with the default
+start key, section 10.4). Each one has a name and these defaults:
+
+| Key | Name | Length | Repeat rate | Cutoff | Pitch | Level | Curve |
+|---|---|---|---|---|---|---|---|
+| G1 (108) | Build | 1 bar | 1/8 to 1/64 | 20 kHz to 1.2 kHz | 0 to 0 | 100 to 100 % | 30 % |
+| G2 (109) | Rise | 1 bar | 1/16 to 1/16 | 20 kHz to 20 kHz | 0 to +12 | 100 to 100 % | 0 % |
+| G3 (110) | Drop | 2 beats | off to off | 20 kHz to 600 Hz | 0 to −24 | 100 to 60 % | 50 % |
+| G4 (111) | Fade | 1 bar | 1/32 to 1/32 | 20 kHz to 20 kHz | 0 to 0 | 100 to 0 % | 0 % |
+
+Each pair of values runs from the start of the ramp to its end. Pitch is in semitones.
+
+To edit a gesture, choose its tab (1 to 4) and set:
+
+- **Length:** 1/16 bar, 1/8 bar, 1 beat, 2 beats, 1 bar, 2 bars or 4 bars.
+- **Repeat from / to:** off, or any repeat rate in section 10.2.
+- **Cutoff from / to:** 20 Hz to 20 kHz.
+- **Pitch from / to:** −48 to +48 semitones.
+- **Level from / to:** 0 to 100 %.
+- **Curve:** 0 to 100 %.
+
+How a gesture plays:
+
+- The ramp starts when you press the gesture's key, and lasts its length at Live's
+  tempo. When the ramp ends, the gesture keeps its end values until you let go.
+- **Curve** shapes the ramp. At 0 % it is a straight line. Higher values keep the start
+  value for longer and make most of the change near the end.
+- **Repeat.** If both ends are rates, the repeat rate moves between them on a
+  logarithmic scale and snaps to the nearest repeat rate, so 1/8 to 1/64 speeds the
+  repeats up steadily. If one end is off, the other is used for the whole gesture. If
+  both are off, the gesture does not touch the repeat.
+- **Cutoff** scales the pad's own cutoff. At 20 kHz nothing changes. A lower value
+  closes the filter on every pad by the same ratio; 600 Hz multiplies each pad's cutoff
+  by 0.03.
+- **Pitch** is added to the pad's pitch, on top of the octave modifiers.
+- **Level** multiplies the pad's level.
+- The gesture applies to notes that are already sounding and to notes that start while
+  its key is held. When the key is released, everything goes back to normal.
+- **Priority.** A gesture's repeat rate overrides the Repeat toggle and the repeat
+  modifiers (keys 96 to 102). If two gestures are held, the one pressed last is active.
+  Releasing it makes the one still held active again.
+- Gesture keys can be drawn into clips, like the other modifier keys.
+
+## 14. Morph (v2)
+
+Each pad has its A settings, the normal settings of section 7.1. A pad can also have B
+settings. The **Morph** knob moves the pad's sound from A toward B.
+
+- **Morph** runs from 0 % to 100 %, and it is automatable. At 0 % a pad plays A. At
+  100 % it plays B. In between, each setting that has a B value moves part of the way.
+  A pad with no B values does not change.
+- **Which settings morph:** pitch, fine, gain, attack, decay, sustain, release, start
+  offset, loop size, loop position, cutoff, drive, reverse and loop. The slice a pad
+  plays never changes; only its sound settings do.
+- Numbers move in a straight line from A to B. **Cutoff** moves on a log scale, so at
+  50 % it is the geometric middle of A and B. For A = 20 kHz and B = 500 Hz, that is
+  about 3.2 kHz.
+- **Reverse** and **Loop** are switches. They take their B value from 50 % upward.
+- **Live update.** Notes that are already sounding follow pitch, level, cutoff and drive
+  as the knob moves. The other settings (envelope, loop, start offset, reverse) apply
+  from the next hit.
+
+Editing B:
+
+- **Edit B** (toggle). While it is on, the pad controls edit the pad's B settings and
+  show B. A setting with no B value shows its A value.
+- **A→B** copies the selected pad's A settings to B. Afterwards B equals A, so Morph
+  has no effect until you change a B value.
+- **Clr B** removes the selected pad's B settings. The pad is then A only.
+- **All A→B** and **All Clr B** do the same for every pad.
+- Copies made by Duplicate, Spread and Flip keep their B settings. Similar ‹ › keeps
+  them too, because it keeps the pad's settings.
+
+## 15. Scan (v2)
+
+Scan rotates the whole kit under the keys. One knob moves each key to a different pad.
+
+- **Scan** runs from 0 % to 100 %, and it is automatable. At 0 % nothing changes.
+- The pads of the current map are taken in key order, counting only keys that hold a
+  pad (modifier keys are skipped). Each key plays the pad a number of places along that
+  order, wrapping around at the ends. The number of places grows with the knob.
+- Scan changes what sounds, not the map. Keys keep showing the same pads, and the clip
+  is not rewritten (section 17).
+- Scan is applied before chaos (section 10.1), so chaos still works on top of it.
+- A held note switches to the new slice at once, without a new attack. A note that
+  repeats (section 10.2) picks up the new slice at its next hit. This lets you sweep
+  through the pool while a note repeats.
+
+## 16. Importing from a Simpler (v2)
+
+A Simpler's sample and slice points can come into SliceKit as a source, so you do not
+chop it again by hand.
+
+- **Find Simplers** fills a menu with every Simpler in the Live Set. The list covers
+  Simplers on tracks and Simplers one level inside a rack. A Simpler nested deeper is
+  not listed. Each item reads `track name / device name`, so give your tracks distinct
+  names.
+- Choose a Simpler from the menu. SliceKit adds a new source with:
+  - the Simpler's sample, by file path, as for any other source;
+  - the Simpler's slice points, as manual slices (section 5.4), so the source is in
+    Manual mode;
+  - the Simpler's playback mode, Mono, Poly or Thru (section 6.1).
+- A Simpler with no slice points gives a source that is sliced normally, with the usual
+  slicing settings.
+- The import is a copy taken when you choose the item. Later changes in the Simpler do
+  not reach SliceKit.
+
+## 17. Keep clip (v2)
+
+Changing the map can make a clip play different sounds. Keep clip rewrites the notes of
+the clip so the same pads keep playing.
+
+- **Keep clip** (toggle). When it is on, each map change on the current slot rewrites
+  the current clip. The map changes are: shuffle; changing the layout, the root key or
+  zone align, and the Layout button; swapping two keys; clearing a key; Find best;
+  Spread; placing a pad on a key; and undo and redo.
+- **Which clip.** The clip open in Live's detail view, if it is a MIDI clip on this
+  device's track. Otherwise, the clip playing on this device's track.
+- **Which notes move.** A note on a key whose pad moved goes to the nearest key where
+  that pad now sits. Notes on keys whose pad did not move stay put, and so do notes
+  whose pad is gone. Notes on modifier keys never move.
+- **Remap clip** (button) applies the last map change to the clip now, whether or not
+  Keep clip is on. Use it after a shuffle made with Keep clip off.
+- The status line reads "Clip remapped: N notes", where N is the number of notes that
+  moved.
+- Switching slots never rewrites the clip. The notes stay on their keys, so the clip
+  plays whatever the new slot holds on those keys.
+- Only the map changes listed above are followed. Adding, removing or re-slicing a
+  source is not one of them.
+
+## 18. Inspirations
 
 | Product | What SliceKit takes from it |
 |---|---|
@@ -407,7 +576,7 @@ Inspired by Serato Sample's search for the strongest samples.
 | FL Studio Slicex | Two decks, meaning several sources playing side by side (zones and interleave layouts). |
 | Ableton Live 12.3 | Stem separation (stem-linked sources, v3). |
 
-## 13. Limits
+## 19. Limits
 
 | Item | Limit |
 |---|---|
@@ -419,8 +588,12 @@ Inspired by Serato Sample's search for the strongest samples.
 | Layers per key | 3 extra, so up to 4 slices per key |
 | Output | One stereo output (Max for Live). No per-slice outputs in v1. |
 | Undo steps | 50 |
+| Capture ring | 40 s, stereo. Recorded all the time from this device's output |
+| Capture length | ½ to 8 bars. A capture longer than the ring is shortened (8 bars below 48 BPM) |
+| Gestures | 4, on the modifier keys G1 to G4 |
+| Modifier zone | 16 keys. Start key 0 to 112 |
 
-### 13.1 Saving
+### 19.1 Saving
 
 - The instrument's state is saved with the Live Set: sources, slices, pads, map
   slots and settings.
@@ -428,32 +601,36 @@ Inspired by Serato Sample's search for the strongest samples.
   not loaded and the rest of the kit still works. Drop the file again to restore it.
 - Before moving a set, use **File > Collect All and Save**. This copies the samples
   into the project folder.
+- Settings from v2 are saved too: Morph and each pad's B settings, Scan, Keep clip, the
+  gestures, and the capture folder and length. A Set saved before v2 opens with these at
+  their defaults.
+- Captured WAV files are referenced by path, like any other sample. The 40-second ring is
+  not saved with the Set. Live's Collect All and Save may not copy capture files, so
+  check that the capture folder moves with the Set.
 
-## 14. Non-goals for v1
+## 20. Non-goals
 
 - No pattern sequencer. Use Live's clips.
 - No time-stretching. Pitch changes speed.
 - No separate outputs per slice.
 - No sample editing beyond slicing (no fades, normalizing or trimming).
 
-## 15. Roadmap
+## 21. Roadmap
 
-### v1
+### v1 (implemented)
 
-Everything in this document.
+The features in sections 3 to 11.
 
-### v2
+### v2 (implemented)
 
-- **Capture.** Skip-back: resample the last few seconds of the device output into a
-  new source.
-- **Gestures with ramps.** For example, a repeat that speeds up over time, or a
-  filter sweep while a key is held.
-- **Morph knob.** Move between two settings sets.
-- **Scan knob.** Step through the slices with one control.
-- **Import slice points from a Simpler.** Read a Simpler's slice points through the
-  Live API.
-- **Keep clip sounding the same.** When the map changes, remap the notes in clips so
-  the same sounds still play.
+- **Capture.** Skip-back of the device output into a new sample (section 12).
+- **Gestures with ramps.** A repeat that speeds up, or a filter, pitch or level sweep,
+  while a key is held (section 13).
+- **Morph knob.** Move between two settings per pad (section 14).
+- **Scan knob.** Step through the slices with one control (section 15).
+- **Import slice points from a Simpler** (section 16).
+- **Keep clip sounding the same.** After a map change, the notes of the clip move so the
+  same sounds still play (section 17).
 
 ### v3
 
@@ -463,7 +640,7 @@ Everything in this document.
   close together.
 - **Pitch-detected layout.** Place pads by detected pitch, for melodic material.
 
-## 16. Legal note
+## 22. Legal note
 
 Clearing samples is your responsibility when you release music, and in the EU even
 very short, recognizable fragments need permission (Pelham v Hütter, CJEU 2019).

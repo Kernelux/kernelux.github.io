@@ -364,10 +364,10 @@ Set the tempo back to 120 BPM for the next steps.
 
 With the default start at 96, the modifier keys are 96 (rpt 1/4), 97 (rpt 1/8),
 98 (rpt 1/8T), 99 (rpt 1/16), 100 (rpt 1/16T), 101 (rpt 1/32), 102 (rpt 1/64),
-103 (reverse), 104 (octave down), 105 (octave up), 106 (tape) and 107 (chaos).
+103 (reverse), 104 (octave down), 105 (octave up), 106 (tape) and 107 (chaos). Keys 108 to 111 are the gesture keys G1 to G4 (group 26), so the zone is 16 keys, 96 to 111.
 
-96. Turn Mods on. Play keys 96 to 107 one at a time.
-    Expected: they make no sound and show as modifier keys on the grid.
+96. Turn Mods on. Play keys 96 to 111 one at a time.
+    Expected: they make no sound and show as modifier keys on the grid. Keys 108 to 111 show as G1 to G4.
 97. Hold key 97 and, while it is held, play a pad.wav key for about one second.
     Expected: the note retriggers at 1/8 while key 97 is held. When you release key 97,
     the retriggers stop.
@@ -387,7 +387,7 @@ With the default start at 96, the modifier keys are 96 (rpt 1/4), 97 (rpt 1/8),
      transport running.
      Expected: repeats at 1/8 play while the note sounds. Key 97 itself makes no sound.
 103. Turn Mods off.
-     Expected: keys 96 to 107 act as normal keys. They play whatever pad is on them, or
+     Expected: keys 96 to 111 act as normal keys. They play whatever pad is on them, or
      nothing if empty. Turn Mods back on.
 
 ## 20. Aftertouch
@@ -446,6 +446,246 @@ Skip this section if you have no keyboard or controller with aftertouch.
      Expected: no dropouts. Note the CPU reading at the start and the end.
 116. Stop the transport while notes are held with Repeat on. Release all keys.
      Expected: the repeats stop. No note stays stuck after all keys are released.
+
+## 24. Capture (skip-back)
+
+Groups 24 to 31 test v2. Start them with a fresh Set: one SliceKit on an empty MIDI
+track, with drums.wav, pad.wav and word.wav loaded (as in group 2). Group 23 fills all
+16 source slots, and a capture needs a free one. Capture records what this device plays,
+so keep drums.wav sounding during these steps.
+
+117. Set the tempo to 120 BPM and Capture length to 2 Bars. Play drums.wav (a clip or held
+     keys) with the transport running for about 10 seconds, then press **Capture**.
+     Expected: about 0.3 seconds later a new source appears in the Sources list, named
+     SliceKit Capture followed by a date and time. Its keys are filled after the other
+     sources. The status line reads Captured 2 bars, followed by the name.
+118. Find the capture file in the folder that holds SliceKit.amxd. Play it in Finder or a
+     player.
+     Expected: a file named SliceKit Capture YYYYMMDD-HHMMSS.wav is there. It is stereo,
+     about 4 seconds long, and plays the drums from just before you pressed Capture.
+119. Select the new source. Set its mode to Beat, BPM 120, division 1/4. Play a few of its
+     keys.
+     Expected: eight cuts, one per beat. Each key plays one beat of the captured audio.
+120. Play a few keys of the captured source, then set Capture length to 1 Bar and press
+     Capture.
+     Expected: a second capture file and a second new source appear. The first captured
+     source is unchanged. No error lines in the Max Console.
+121. Press **Folder…**, choose another folder, set Capture length to 1 Bar, and press
+     Capture.
+     Expected: the new WAV file is written to the folder you chose, not to the folder that
+     holds the device.
+122. Set the tempo to 40 BPM and Capture length to 8 Bars. Play for about 50 seconds, then
+     press Capture. Set the tempo back to 120 BPM.
+     Expected: a capture file is still written and loaded, with no error. Its length is
+     under 48 seconds (what 8 bars at 40 BPM would be), because the ring holds 40 seconds.
+
+## 25. Import from a Simpler
+
+This group needs two Simplers in the Set. Name the tracks Track Drums and Track Rack, so
+the menu items are easy to tell apart.
+
+123. On a MIDI track named Track Drums, add a Simpler, load drums.wav, switch it to Slice
+     mode with Transient slicing, and set its playback mode to Mono. Note how many slice
+     markers it shows.
+     Expected: the Simpler shows slice markers on drums.wav.
+124. On a MIDI track named Track Rack, put a Simpler inside an Instrument Rack or Drum Rack.
+     Load pad.wav into it, in Classic mode.
+     Expected: the Simpler sits in the rack's chain. No error lines in the Max Console.
+125. In SliceKit, press **Find Simplers**, then open the Simpler menu.
+     Expected: the menu lists Track Drums / Simpler and Track Rack / Simpler. The Simpler
+     inside the rack is listed.
+126. Choose Track Drums / Simpler.
+     Expected: a new source named drums.wav appears. Its cut marks match the Simpler's slice
+     markers (same count, same positions). Its slicing mode reads Manual, and its play mode
+     reads Mono.
+127. Choose Track Rack / Simpler.
+     Expected: a new source named pad.wav appears. It has no slice points from the Simpler,
+     so SliceKit slices it normally (Transient). Play one of its keys: it sounds like the
+     Simpler's sample.
+128. In Live, set the Simpler on Track Drums to Poly. In SliceKit, choose Track Drums /
+     Simpler again.
+     Expected: a second drums source is added, and its play mode reads Poly. The first
+     drums source is unchanged.
+
+## 26. Gestures
+
+Turn Mods on for these steps (start key 96). Keys 108 to 111 are G1 to G4. Use a pad.wav
+key for the held-note tests. At 120 BPM, one bar is 2 seconds, two beats are 1 second,
+and 1/16 bar is 0.125 seconds.
+
+129. Turn Mods on. Play keys 108 to 111 one at a time.
+     Expected: they make no sound. The grid shows them as G1, G2, G3 and G4.
+130. Select gesture tab 1, then tabs 2, 3 and 4, and read each gesture's settings.
+     Expected: 1 Build: length 1 bar, repeat 1/8 to 1/64, cutoff 20 kHz to 1.2 kHz, pitch 0
+     to 0, level 100 to 100 %, curve 30 %. 2 Rise: 1 bar, 1/16 to 1/16, 20 kHz to 20 kHz,
+     pitch 0 to +12, level 100 to 100 %, curve 0 %. 3 Drop: 2 beats, off to off, 20 kHz to
+     600 Hz, pitch 0 to -24, level 100 to 60 %, curve 50 %. 4 Fade: 1 bar, 1/32 to 1/32,
+     20 kHz to 20 kHz, pitch 0 to 0, level 100 to 0 %, curve 0 %.
+131. Rise: press and hold a pad.wav key. While it is held, press G2 (key 109) and keep it
+     down for about 2 seconds, then release G2 and keep the note.
+     Expected: the pitch climbs smoothly to one octave higher over the first 2 seconds, and
+     stays there while G2 is held. When you release G2, the pitch returns to normal at once.
+132. Drop: with Repeat off, hold a pad.wav key. While it is held, press G3 (key 110) for
+     about one second.
+     Expected: the note falls two octaves in about a second, gets darker, and gets about 40 %
+     quieter. It does not repeat.
+133. Build: with Repeat off, hold a drums key. While it is held, press G1 (key 108) for one
+     bar (2 seconds).
+     Expected: the hits come closer together through the bar, so the repeat speeds up from
+     1/8 to 1/64, and the sound gets darker. Releasing G1 stops the repeats.
+134. Fade: hold a pad.wav key. While it is held, press G4 (key 111) for one bar.
+     Expected: the note repeats at 1/32 through the bar and fades to silence by its end.
+     Release G4 early: the level returns to normal at once.
+135. Set Build's length to 1/16 bar. Hold a drums key and press G1 briefly.
+     Expected: the whole ramp is over in 0.125 seconds. Set Build's length back to 1 bar.
+136. Priority: set Repeat on at 1/4. Hold key 97 (the 1/8 repeat modifier) and a pad.wav key.
+     While both are held, press G4 (key 111).
+     Expected: the note repeats at 1/32, the gesture's rate. It does not use 1/4 or 1/8.
+     Set Repeat off.
+137. Most recent wins: hold a pad.wav key. Press G3 and keep it down. While G3 is still held,
+     press G2.
+     Expected: Rise is active, so the pitch climbs. Release G2 while G3 is still held:
+     Drop applies again, so the pitch falls. Release G3 and everything is back to normal.
+138. Set Mods start to 112. Check that keys 112 to 127 are modifier keys, with G1 on key 120
+     and G4 on key 127. Then set Mods start back to 96.
+     Expected: keys 108 to 111 are ordinary keys again and play whatever pads are on them.
+
+## 27. Gestures while repeating
+
+Transport playing at 120 BPM. Mods on (start key 96).
+
+139. Set Repeat on at 1/16. Hold a drums key and press G1 (Build) for one bar.
+     Expected: repeats start at 1/8 and speed up through the bar, reaching 1/64 at the end.
+     The repeat follows the gesture, not the 1/16 setting.
+140. Keep Repeat on at 1/16. Hold a pad.wav key and press G3 (Drop) for about one second.
+     Expected: the note keeps repeating at 1/16, because Drop does not change the repeat
+     rate, while its pitch and level fall.
+141. Set Repeat off. Hold a pad.wav key and press G1 (Build).
+     Expected: the note still repeats. A gesture with a rate overrides the Repeat toggle.
+142. Set Repeat on at 1/16. Hold a pad.wav key and press G1. While the key is still held,
+     release G1.
+     Expected: the repeats return to the global 1/16 at once, and keep going while the key is
+     held. Release the key and they stop. Set Repeat off.
+
+## 28. Morph
+
+Use one pad.wav key for steps 143 to 151. Before step 143, check that the pad's pitch is
+0, its cutoff is 20000 Hz, its Reverse is off, and it has no B settings.
+
+143. Select the pad and press **A→B**. Set Morph to 100 %, play the key, then set Morph back
+     to 0 %.
+     Expected: the pad now has B settings equal to its A settings, so the sound is the same
+     at 0 % and at 100 %.
+144. Turn **Edit B** on. Set Pitch to +12 and Cutoff to 500 Hz. Turn Edit B off.
+     Expected: with Edit B on, the Pitch and Cutoff controls show +12 and 500 Hz. With Edit B
+     off they show 0 and 20000 Hz again, the A settings.
+145. With Morph at 0 %, play the key. Then set Morph to 100 % and play it. Then set Morph to
+     50 % and play it.
+     Expected: at 0 % the normal sound. At 100 % one octave up and dull. At 50 % a tritone up
+     (6 semitones), with the cutoff at about 3.2 kHz, the middle of 20 kHz and 500 Hz on a log
+     scale. A straight-line middle would be about 10 kHz, which is much brighter.
+146. Turn Edit B on and set Reverse on, which sets the B value only. Turn Edit B off. Set
+     Morph to 49 % and play the key, then set Morph to 50 % and play it.
+     Expected: at 49 % the note plays forward. At 50 % it plays reversed. Set Morph to 0 %.
+     The Reverse control shows off, the A value.
+147. Hold the key for about 3 seconds with Morph at 0 %. While it is held, move Morph slowly
+     to 100 %.
+     Expected: the held note's pitch and brightness follow the knob. The note does not
+     restart. Reverse and Loop do not switch on a held note; they take effect on the next hit.
+148. Arm **Dup**, select this pad, and click an empty key outside the modifier zone. Set Morph
+     to 100 %, then play the copy and the original.
+     Expected: the copy has the same B settings, so it sounds the same as the original at every
+     Morph setting. Press Undo to remove the copy.
+149. Press **Clr B** on this pad. Set Morph to 100 % and play the key.
+     Expected: the pad sounds like its A settings again: pitch 0, cutoff 20000 Hz.
+150. Press **All A→B**, then set Morph to 100 %. Then press **All Clr B** and set Morph to
+     100 % again.
+     Expected: after All A→B, Morph changes no pad, because every B equals its A. After
+     All Clr B, Morph changes no pad either, because no pad has B settings.
+151. In Live, draw an automation curve on the Morph knob from 0 to 100 % over four bars. First
+     set this pad's B to pitch +12 and cutoff 500 Hz, as in step 144. Play a clip that holds
+     the pad's key.
+     Expected: the sound moves from A to B over four bars, in a smooth curve. Notes already
+     sounding follow the curve. Each new note starts at the Morph value of the moment it starts.
+
+## 29. Scan
+
+Setup: drums, pad and word in the Zones layout, auto map, Mods off, Repeat off, Morph 0 %,
+Scan 0 %, Chaos 0 %. Before step 152, note what key 36 (a drums key) and a pad.wav key sound
+like.
+
+152. Set Scan to 0 %. Play key 36 and a pad.wav key.
+     Expected: they sound as before. Nothing changes.
+153. Set Scan to 25 % with the transport stopped. Play key 36, then the pad.wav key.
+     Expected: key 36 plays a different slice from elsewhere in the kit. Its colour on the grid
+     does not change, because the map did not change. Set Scan back to 0 %: key 36 plays its
+     own slice again.
+154. Set Scan to 100 %. Play each of the three keys (one from each source).
+     Expected: each key plays a slice that is not its own. Set Scan back to 0 %.
+155. Hold a pad.wav key for about 3 seconds with Scan at 0 %. While it is still held, move
+     Scan to 50 %.
+     Expected: the held note changes to a different slice at once. No new hit starts, and the
+     attack does not repeat.
+156. Set Repeat on at 1/16 and Scan to 0 %, with the transport playing. Hold a pad.wav key.
+     Over about 8 bars, move Scan slowly from 0 to 100 %. Then set Repeat off.
+     Expected: the repeated hits change one by one. Each change comes at the next repeat, not in
+     the middle of a hit.
+157. In Live, draw an automation curve on Scan from 0 to 100 % over four bars. Play a clip with
+     notes on several keys.
+     Expected: the kit rotates as the curve runs. Notes already sounding switch slice without
+     retriggering. No note stays stuck when the clip stops.
+158. Set Scan to 50 % and Chaos to 100 %. Play one key ten times. Then set both back to 0 %.
+     Expected: every hit plays a random slice, so chaos still applies on top of Scan.
+
+## 30. Keep clip sounding the same
+
+Setup: Mods on. On a MIDI track, make a clip one bar long, with one note each on keys 36, 40
+and 44 (one per beat), and one note on key 97 that covers the whole bar. Use slot A (auto).
+Transport playing. Keep clip starts off.
+
+159. Keep clip off. Press Shuffle (Chaos, All, seed 1). Look at the clip in the piano roll,
+     then play it.
+     Expected: the sounds on keys 36, 40 and 44 have changed, but the notes in the clip have
+     not moved. They are still on keys 36, 40 and 44.
+160. Press **Remap clip**.
+     Expected: the status line reads Clip remapped: N notes. N counts the notes that moved (at
+     most 3; the note on key 97 is not counted). The notes move to the keys where their sounds
+     now are, so the clip sounds as it did before the shuffle. The note on key 97 stays on 97.
+161. Press Undo, then press **Remap clip**.
+     Expected: the map is back to its original state, and the notes return to keys 36, 40 and 44.
+162. Set Keep clip on. Press Shuffle (Chaos, All, seed 2).
+     Expected: the notes move at once to the keys where their sounds went. The status line reads
+     Clip remapped. The note on key 97 does not move.
+163. With Keep clip still on, press Undo.
+     Expected: the notes move back to keys 36, 40 and 44.
+164. With Keep clip on, change Layout from Zones to Interleave, then back to Zones.
+     Expected: after each change the notes follow their sounds, so the clip sounds the same as
+     before the change.
+165. With Keep clip on, switch to slot B, then back to slot A.
+     Expected: switching does not rewrite the clip. The notes stay on their keys. On slot B the
+     clip plays whatever B holds on those keys. Back on A, the clip sounds as before.
+166. Create a second clip on the device's track, with a note on key 40, and open it in the
+     detail view. With Keep clip on, press Shuffle.
+     Expected: the clip open in the detail view is rewritten. The first clip is not changed.
+
+## 31. Save and reopen with v2 settings
+
+167. Set Morph to 40 %, and give a pad B settings (pitch +12, cutoff 500 Hz, as in group 28).
+     Set Build's length to 2 beats and Drop's level to 30 %. Turn Keep clip on. Set Capture
+     length to 4 Bars and choose a capture folder with **Folder…**. Set Scan to 35 % and Chaos
+     to 30 %. Set Repeat on at 1/8T and turn Mods on. Save the Live Set, close it, and reopen it.
+     Expected: everything comes back: Morph at 40 %, the pad's B settings (with Edit B on), Build's
+     length of 2 beats, Drop's level of 30 %, Keep clip on, Capture length 4 Bars and the capture
+     folder, Scan at 35 %, Chaos at 30 %, and the Repeat settings. No error lines in the Max Console.
+168. Play the pad at Morph 40 % and Scan 35 %, and compare it with the sound before you saved.
+     Expected: the same sound.
+169. With Keep clip on, press Shuffle.
+     Expected: the clip is remapped (status: Clip remapped), so the setting survived the reopen.
+170. Open a Set saved before v2, for example the one from step 106.
+     Expected: it opens with no error lines. Morph is 0 %, Scan is 0 %, Keep clip is off, Capture
+     length is 2 Bars, and the gestures are at their defaults (Build, Rise, Drop, Fade). Its pads
+     sound as before. If the Set has Mods on and pads on keys 108 to 111, those pads are now
+     gesture keys and make no sound. Turn Mods off to play them.
 
 ---
 
