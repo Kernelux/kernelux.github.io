@@ -195,6 +195,7 @@ npm run check     # build dist/, ES5 lint, patcher validation, all tests
 | `max/ui.js` | jsui view |
 | `max/voice.genexpr` | gen~ voice DSP |
 | `tools/` | bundler, patcher generator, validators |
+| `HANDOFF.md` | state, priorities and conventions for whoever continues the work |
 | `docs/` | [SPEC](docs/SPEC.md), [ARCHITECTURE](docs/ARCHITECTURE.md), [PROTOCOL](docs/PROTOCOL.md), [VOICE](docs/VOICE.md), [TESTING](docs/TESTING.md) |
 
 Don't edit `dist/` by hand: change the sources and run `npm run build`.
