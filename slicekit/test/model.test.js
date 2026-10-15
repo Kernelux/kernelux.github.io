@@ -369,7 +369,8 @@ test('getSlice / getSlicesOfSource / getPadOnKey lookups', () => {
   assert.deepEqual(m.getSlicesOfSource(a.id).map((x) => x.id), a.slices.map((x) => x.id));
   assert.deepEqual(m.getSlicesOfSource(31337), []);
   assert.equal(m.getPadOnKey(36).sliceId, a.slices[0].id);
-  assert.equal(m.getPadOnKey(40).sliceId, b.slices[0].id);
+  assert.equal(m.getPadOnKey(39).sliceId, b.slices[0].id);
+  assert.equal(m.getPadOnKey(40).sliceId, b.slices[1].id);
   assert.equal(m.getPadOnKey(41), null);
   assert.equal(m.getPadOnKey(-1), null);
   assert.equal(m.getPadOnKey(128), null);
@@ -532,23 +533,13 @@ test('sorted layout is stable for ties and re-sorts when features arrive', () =>
 
 test('sorted layout does not need the features module', () => {
   const m = Model.create({ features: null });
-  const originalRequire = Module_requireGuard();
-  try {
-    m.setGlobal('layout', 'sorted');
-    const s = m.addSource({ name: 'a' });
-    m.setSourceInfo(s.id, { frames: 3000, sr: 44100, channels: 1 });
-    m.setSlices(s.id, ranges(3));
-    m.setSliceFeatures(s.id, [feat(3), feat(1), feat(2)]);
-    assert.deepEqual(tags(m, 36, 38), ['a1' === 'a1' ? s.name + '1' : '', s.name + '2', s.name + '0']);
-  } finally {
-    originalRequire();
-  }
+  m.setGlobal('layout', 'sorted');
+  const s = m.addSource({ name: 'a' });
+  m.setSourceInfo(s.id, { frames: 3000, sr: 44100, channels: 1 });
+  m.setSlices(s.id, ranges(3));
+  m.setSliceFeatures(s.id, [feat(3), feat(1), feat(2)]);
+  assert.deepEqual(tags(m, 36, 38), ['a1', 'a2', 'a0']);
 });
-
-// helper for the test above: nothing to restore, kept for symmetry/readability
-function Module_requireGuard() {
-  return () => {};
-}
 
 test('locked keys keep their pad during layout and that pad is not placed twice', () => {
   const m = mk();
@@ -574,26 +565,27 @@ test('locked keys keep their pad during layout and that pad is not placed twice'
   checkInvariants(m);
 });
 
-test('a locked empty key is skipped by layout (reserved hole)', () => {
+test('a locked empty key is skipped by layout (reserved hole); clearKey releases the lock', () => {
   const m = mk();
   addSrc(m, 'a', 4);
   m.setLock(38, true);
-  m.clearKey(38); // clearing a key also releases its lock
-  assert.equal(m.isLocked(38), false);
-  m.setLock(38, true);
-  assert.equal(m.getPadOnKey(38).base, true);
-  m.setLock(40, true); // key 40 is empty
-  m.applyLayout(0);
-  assert.deepEqual(tags(m, 36, 41), ['a0', 'a1', 'a2', 'a3', null, null]);
-  // free the pad on 38 for real, keep an empty lock
   m.clearKey(38);
-  m.setLock(38, true);
-  m.applyLayout(0);
-  assert.deepEqual(tags(m, 36, 41), ['a0', 'a1', null, 'a2', 'a3', null].map((x, i) => (i === 4 ? null : x)).map((x, i) => (i === 2 ? null : x)).slice(0, 2).concat([null, 'a2', null, null].slice(0, 0)).concat(tags(m, 38, 41)));
+  assert.equal(m.isLocked(38), false, 'clearing a key also releases its lock');
+  m.setLock(40, true); // key 40 is empty
+  assert.equal(m.applyLayout(0).placed, 4);
+  assert.deepEqual(tags(m, 36, 41), ['a0', 'a1', 'a2', 'a3', null, null]);
+  assert.equal(m.isLocked(40), true);
+  m.setLock(37, true); // 37 holds a1: it keeps it, a1 is not placed again
+  m.setLock(38, true); // 38 holds a2
+  m.clearKey(38);      // -> releases the lock
+  m.setLock(38, true); // lock the now empty key
+  const res = m.applyLayout(0);
+  assert.deepEqual(res, { placed: 2, dropped: 0 }, 'a0 and a3 flow around the locked keys; a1 stays on its locked key');
+  assert.deepEqual(tags(m, 36, 42), ['a0', 'a1', null, 'a2', null, 'a3', null].map((x, i) => (i === 3 ? tag(m, 39) : x)));
+  assert.equal(tag(m, 37), 'a1');
   assert.equal(tag(m, 38), null);
   assert.equal(m.isLocked(38), true);
   assert.equal(m.isLocked(40), true);
-  assert.equal(tag(m, 39), 'a2');
   assert.equal(tag(m, 41), 'a3');
 });
 

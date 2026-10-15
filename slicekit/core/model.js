@@ -814,14 +814,24 @@ function createModel(state, deps) {
     };
   }
 
+  // Objects that exist both now and in the snapshot are updated in place, so
+  // references callers hold (pads, slices, slots, slicing settings) stay valid.
   function restore(snap) {
-    var k, i, j;
+    var k, i, j, f, cur;
     var pads = JSON.parse(snap.pads);
     for (k in state.pads) {
-      if (hasOwn(state.pads, k)) delete state.pads[k];
+      if (hasOwn(state.pads, k) && !hasOwn(pads, k)) delete state.pads[k];
     }
     for (k in pads) {
-      if (hasOwn(pads, k)) state.pads[k] = pads[k];
+      if (!hasOwn(pads, k)) continue;
+      if (hasOwn(state.pads, k)) {
+        cur = state.pads[k];
+        for (f in pads[k]) {
+          if (hasOwn(pads[k], f)) cur[f] = pads[k][f];
+        }
+      } else {
+        state.pads[k] = pads[k];
+      }
     }
     var slots = JSON.parse(snap.slots);
     for (i = 0; i < NUM_SLOTS; i++) {
@@ -833,12 +843,29 @@ function createModel(state, deps) {
     }
     state.currentSlot = snap.currentSlot;
     var ss = JSON.parse(snap.sources);
+    var src, existing, list, ns, ex;
     for (i = 0; i < ss.length; i++) {
-      var src = getSource(ss[i].id);
-      if (src) {
-        src.slicing = ss[i].slicing;
-        src.slices = ss[i].slices;
+      src = getSource(ss[i].id);
+      if (!src) continue;
+      for (f in ss[i].slicing) {
+        if (hasOwn(ss[i].slicing, f)) src.slicing[f] = ss[i].slicing[f];
       }
+      existing = {};
+      for (j = 0; j < src.slices.length; j++) existing[src.slices[j].id] = src.slices[j];
+      list = [];
+      for (j = 0; j < ss[i].slices.length; j++) {
+        ns = ss[i].slices[j];
+        ex = hasOwn(existing, ns.id) ? existing[ns.id] : null;
+        if (ex) {
+          ex.start = ns.start;
+          ex.end = ns.end;
+          ex.features = ns.features;
+          list.push(ex);
+        } else {
+          list.push(ns);
+        }
+      }
+      src.slices = list;
     }
     touchSlices();
     relayoutAutoSlots();
