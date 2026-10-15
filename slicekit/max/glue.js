@@ -1611,7 +1611,13 @@ function create(host) {
     var api, nTracks, t, tp, tname, nDev, d, dp, nCh, c, cp, cname, nChDev, j, jp, i;
 
     function at(path) { api.path = path; return api; }
-    function isSimpler(path) { return lstr(first(at(path).get('class_name'))) === SIMPLER_CLASS; }
+    // class_name is 'OriginalSimpler' in the Live Object Model; class_display_name ('Simpler')
+    // is checked too in case a Live version reports a different internal name.
+    function isSimpler(path) {
+      var api = at(path);
+      if (lstr(first(api.get('class_name'))) === SIMPLER_CLASS) { return true; }
+      try { return lstr(first(api.get('class_display_name'))) === 'Simpler'; } catch (e) { return false; }
+    }
 
     if (!host.LiveAPI) { setStatus('Live API not available'); return; }
     try {

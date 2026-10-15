@@ -2135,6 +2135,19 @@ test('source simplerscan lists the Simplers (tracks and one level of rack chains
   assert.equal(w.out(2).length, 4);
 });
 
+test('simplerscan also recognises a Simpler by class_display_name', () => {
+  const w = createWorld({ live: {
+    'live_set': { counts: { tracks: 1 } },
+    'live_set tracks 0': { props: { name: ['Keys'] }, counts: { devices: 2 } },
+    'live_set tracks 0 devices 0': { props: { class_name: ['SimplerV2'], class_display_name: ['Simpler'], name: ['Chops'], can_have_chains: [0] } },
+    'live_set tracks 0 devices 1': { props: { class_name: ['Reverb'], class_display_name: ['Reverb'], name: ['Verb'], can_have_chains: [0] } }
+  } });
+  w.init();
+  w.clear();
+  w.send('source', 'simplerscan');
+  assert.deepEqual(w.out(2), [['src_simplers', 'clear'], ['src_simplers', 'append', 'Keys / Chops']]);
+});
+
 test('simplerscan: no Simplers, no LiveAPI, scan errors', () => {
   const none = createWorld({ live: { 'live_set': { counts: { tracks: 1 } }, 'live_set tracks 0': { props: { name: ['Audio'] }, counts: { devices: 0 } } } });
   none.init();
