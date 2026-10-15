@@ -169,7 +169,9 @@ function newVoice(index) {
     sentCutoff: 20000,
     rpt: 0,           // rptdiv last sent
     trigCount: 0,
-    killCount: 0
+    killCount: 0,
+    jumpCount: 0,     // scan: re-latch the slice and move the playhead now
+    redirCount: 0     // reverse modifier: turn around at the current position
   };
 }
 
@@ -517,7 +519,8 @@ function create(opts) {
     v.padDrive = num(pad.drive, 0);
   }
 
-  function startVoice(v, entry, key, vel, st, g, gv) {
+  /** Full start sequence of a voice; `level` = velocity (or pressure) curve value, linear. */
+  function startVoice(v, entry, key, level, st, g, gv) {
     var pad = entry.pad;
     var source = entry.source;
     var range = playRange(entry, st);
@@ -531,7 +534,7 @@ function create(opts) {
     seqCounter += 1;
     v.seq = seqCounter;
     v.scanPadId = entry.scanPadId;
-    v.level = velCurve(vel, g.velSens);
+    v.level = level;
     trackEntry(v, entry, range);
     v.trigCount = nextCounter(v.trigCount);
 
@@ -573,7 +576,7 @@ function create(opts) {
 
   function noteOn(key, vel) {
     var v0 = num(vel, 0);
-    var st, g, gv, pad, mapped, entries, entry, j, layerPad, out, voice;
+    var st, g, gv, pad, mapped, entries, entry, j, layerPad, out, voice, level;
 
     if (v0 <= 0) { return noteOff(key); }
     if (v0 > 127) { v0 = 127; }
@@ -603,13 +606,35 @@ function create(opts) {
     if (entries.length === 0) { return []; }
 
     gv = gestureValues(g);
+    level = velCurve(v0, g.velSens);
     out = [];
     choke(entries, g, out);
     for (j = 0; j < entries.length; j++) {
       voice = allocate();
-      out.push(startVoice(voice, entries[j], key, v0, st, g, gv));
+      out.push(startVoice(voice, entries[j], key, level, st, g, gv));
     }
     return out;
+  }
+
+  /**
+   * A held voice that already finished (`ended`: a one-shot that ran out while
+   * its key is still down) cannot repeat on its own. When repeat becomes
+   * active for it (its last repeat rate was 0, the effective rate is now > 0)
+   * it is started again from its current pad: the full start sequence with
+   * `held 1` and a new `trig`. Key, main / layer role and stored level are kept.
+   */
+  function needsResume(v, wantRpt) {
+    return v.busy && v.held && v.ended && v.rpt === 0 && wantRpt > 0;
+  }
+
+  /** Start sequence for a resumed voice, or null when its pad can no longer be played. */
+  function resumeVoice(v, st, g, gv) {
+    var pad = (v.padId !== null) ? model.getPad(v.padId) : null;
+    var entry = resolveEntry(pad);
+    if (!entry) { return null; }
+    entry.main = v.main;
+    entry.scanPadId = v.scanPadId;
+    return startVoice(v, entry, v.key, v.level, st, g, gv);
   }
 
   // ----- note off ----------------------------------------------------------
@@ -623,7 +648,7 @@ function create(opts) {
     // been toggled or moved while the key was down.
     if (mi >= 0) {
       removed = modHeld.splice(mi, 1)[0];
-      out = modUpdate(removed.action);
+      out = modUpdate(removed.action, false);
     }
     for (j = 0; j < voices.length; j++) {
       v = voices[j];
@@ -659,26 +684,31 @@ function create(opts) {
       gest: gest,
       start: now()
     });
-    return modUpdate(action);
+    return modUpdate(action, true);
   }
 
   /**
    * Recompute the effective modifier state and push whatever the changed
    * action affects to every sounding voice. Chaos only affects new notes.
    */
-  function modUpdate(action) {
+  function modUpdate(action, pressed) {
     var out = [];
-    var st, g, gv, kind, rpt, j, v, wantDir, pend;
+    var st, g, gv, kind, rpt, j, v, wantDir, pend, wantRpt, cmd;
 
-    if (action.indexOf(GEST_PREFIX) === 0) { return gestureSync(true); }
+    if (action.indexOf(GEST_PREFIX) === 0) { return gestureSync(true, pressed); }
     kind = (action.indexOf('rpt:') === 0) ? 'rpt' : action;
     if (kind === 'chaos') { return out; }
     st = modState();
     g = model.globals() || {};
     gv = gestureValues(g);
+    wantRpt = effectiveRptDiv(st, g, gv);
 
     for (j = 0; j < voices.length; j++) {
       v = voices[j];
+      if (kind === 'rpt' && pressed && needsResume(v, wantRpt)) {
+        cmd = resumeVoice(v, st, g, gv);
+        if (cmd) { out.push(cmd); continue; }
+      }
       if (!isSounding(v)) { continue; }
       if (kind === 'rpt') {
         rpt = repeatParams(st, g, gv);
@@ -693,7 +723,8 @@ function create(opts) {
           } else {
             pend = v.thru ? 0 : v.sliceStart;
           }
-          out.push({ voice: v.index, params: [['dir', wantDir], ['pend', pend]] });
+          v.redirCount = nextCounter(v.redirCount);
+          out.push({ voice: v.index, params: [['dir', wantDir], ['pend', pend], ['redir', v.redirCount]] });
         }
       } else if (kind === 'octup' || kind === 'octdown') {
         v.sentPitch = voicePitch(v, st, gv);
@@ -713,18 +744,24 @@ function create(opts) {
    * the voice has, cutoff / pitch / amp when they differ by more than the
    * epsilon. `exact` = compare (almost) exactly: used at press / release /
    * switch. Also exact once the ramp is complete, so the end value lands.
+   * `resume` (a gesture key press): ended held voices for which the gesture
+   * makes the repeat active are started again (see needsResume).
    */
-  function gestureSync(exact) {
+  function gestureSync(exact, resume) {
     var out = [];
     var g = model.globals() || {};
     var st = modState();
     var gv = gestureValues(g);
     var wantRpt = effectiveRptDiv(st, g, gv);
     var tight = exact || (gv !== null && gv.progress >= 1);
-    var j, v, params, rpt, cutoff, pitch, amp;
+    var j, v, params, rpt, cutoff, pitch, amp, cmd;
 
     for (j = 0; j < voices.length; j++) {
       v = voices[j];
+      if (resume && needsResume(v, wantRpt)) {
+        cmd = resumeVoice(v, st, g, gv);
+        if (cmd) { out.push(cmd); continue; }
+      }
       if (!isSounding(v)) { continue; }
       params = [];
       if (v.rpt !== wantRpt) {
@@ -828,16 +865,25 @@ function create(opts) {
     return [{ voice: -1, params: [['bpm', bpm], ['playing', playing]] }];
   }
 
-  /** Re-send repeat params to held voices (call when repeat globals change). */
+  /**
+   * Re-send repeat params to held voices (call when repeat globals change).
+   * A held voice that already finished is started again when this makes the
+   * repeat active for it (global repeat turned on), see needsResume.
+   */
   function refreshHeld() {
     var st = modState();
     var g = model.globals() || {};
     var gv = gestureValues(g);
+    var wantRpt = effectiveRptDiv(st, g, gv);
     var out = [];
-    var j, v, rpt;
+    var j, v, rpt, cmd;
     for (j = 0; j < voices.length; j++) {
       v = voices[j];
       if (v.busy && v.held) {
+        if (needsResume(v, wantRpt)) {
+          cmd = resumeVoice(v, st, g, gv);
+          if (cmd) { out.push(cmd); continue; }
+        }
         rpt = repeatParams(st, g, gv);
         v.rpt = rpt[0][1];
         out.push({ voice: v.index, params: rpt });
@@ -879,8 +925,9 @@ function create(opts) {
 
   /**
    * Scan changed: every held main voice whose key now maps to another pad
-   * switches to that pad's slice without a retrigger (a repeat picks it up at
-   * its next hit). Layer voices, released voices and chaos substitutions whose
+   * switches to that pad's slice without an envelope restart: the slice params
+   * are followed by `jump <n>` (last), which makes the voice re-latch the slice
+   * and move the playhead at once. Layer voices, released voices and chaos substitutions whose
    * mapping did not change are left alone.
    */
   function refreshScan() {
@@ -899,6 +946,7 @@ function create(opts) {
       range = playRange(entry, st);
       v.scanPadId = pad.id;
       trackEntry(v, entry, range);
+      v.jumpCount = nextCounter(v.jumpCount);
       v.sentPitch = voicePitch(v, st, gv);
       v.sentAmp = voiceAmp(v, gv);
       v.sentCutoff = voiceCutoff(v, gv);
@@ -915,7 +963,8 @@ function create(opts) {
           ['pitch', v.sentPitch],
           ['amp', v.sentAmp],
           ['cutoff', v.sentCutoff],
-          ['drive', v.padDrive]
+          ['drive', v.padDrive],
+          ['jump', v.jumpCount]
         ]
       });
     }

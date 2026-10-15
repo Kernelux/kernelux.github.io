@@ -59,6 +59,21 @@
 //    refused. 4 is both value and index and means 4 either way. fromJSON reads beats as a
 //    value only (snapped to the nearest GEST_BEATS entry).
 //  * fromJSON fills every v2 field with defaults for v1 states and clamps the rest.
+//
+// v2 fixes (docs/PROTOCOL.md "v2 fixes"):
+//  * MAX_SLICES = 128. setSlices (still true/false) truncates a longer range list: the tail
+//    is merged into the 128th range so the slices still cover the same frames, and
+//    lastSliceTruncation() reports how many slice points were dropped by the most recent
+//    setSlices call (0 when nothing was cut). addSlicePoint refuses (false) at 128 slices.
+//    fromJSON does not cut saved sources (pads would lose their slices).
+//  * removeSlicePoint sends the pads of both merged slices to the merged slice, and
+//    moveSlicePoint / addSlicePoint keep every pad on its own slice (explicit id mapping in
+//    the reslice path instead of "nearest start").
+//  * lastLayout() -> { placed, dropped, slot } of the most recent layout pass: applyLayout
+//    (that slot), an automatic re-layout of the auto slots (the current slot's numbers when
+//    it was re-laid out, else the auto slot that dropped most), a reslice that appended new
+//    pads to the current (manual) slot, or findBest (dropped = picked pads that did not
+//    fit). Not serialised; { placed: 0, dropped: 0, slot: 0 } until the first pass.
 
 var prng = require('./prng');
 
@@ -80,6 +95,7 @@ var CAPTURE_BEATS = [2, 4, 8, 16, 32];
 var MORPH_PARAMS = ['pitch', 'fine', 'gainDb', 'attackMs', 'decayMs', 'sustain', 'releaseMs',
   'startOffsetMs', 'loopSizeMs', 'loopPos', 'cutoffHz', 'drive', 'reverse', 'loopOn'];
 var MAX_SOURCES = 16;
+var MAX_SLICES = 128;
 var NUM_SLOTS = 8;
 var NUM_KEYS = 128;
 var MAX_LAYERS = 3;
@@ -99,6 +115,7 @@ var CONST = {
   CAPTURE_BEATS: CAPTURE_BEATS,
   MORPH_PARAMS: MORPH_PARAMS,
   MAX_SOURCES: MAX_SOURCES,
+  MAX_SLICES: MAX_SLICES,
   NUM_SLOTS: NUM_SLOTS,
   NUM_KEYS: NUM_KEYS,
   MAX_LAYERS: MAX_LAYERS
@@ -633,6 +650,8 @@ function createModel(state, deps) {
   var pendingSnap = null;  // { sourceId, snap } taken by setSourceSettings (slicing keys)
   var sliceMap = null;     // sliceId -> { slice, sourceId, index } (lazy)
   var srcSnap = null;      // cached JSON of per-source slices + slicing (lazy)
+  var lastTruncation = 0;  // slice points dropped by the most recent setSlices
+  var lastLayoutRes = { placed: 0, dropped: 0, slot: 0 };  // most recent layout pass
 
   // features are only needed for smart shuffle / similar / find-best: load lazily
   function featuresModule() {
@@ -949,19 +968,40 @@ function createModel(state, deps) {
     return { placed: placed, dropped: dropped };
   }
 
-  function relayoutAutoSlots() {
+  // remember the outcome of a layout pass: the current slot's entry when there is one, else
+  // the entry that dropped most (first on ties). results = [{ slot, placed, dropped }]
+  function recordLayout(results) {
+    var best = null;
+    var i;
+    for (i = 0; i < results.length; i++) {
+      if (results[i].slot === state.currentSlot) {
+        best = results[i];
+        break;
+      }
+      if (best === null || results[i].dropped > best.dropped) best = results[i];
+    }
+    if (best) lastLayoutRes = { placed: best.placed, dropped: best.dropped, slot: best.slot };
+  }
+
+  // re-lay out every auto slot. With `results` the caller collects the outcomes and records
+  // them itself (together with its own entries); without it they are recorded here.
+  function relayoutAutoSlots(results) {
+    var own = !results;
     var items = null;
-    var s;
+    var s, r;
+    if (own) results = [];
     for (s = 0; s < NUM_SLOTS; s++) {
       if (state.slots[s].auto) {
         if (!items) items = layoutOrder();
-        placeLayout(s, items);
+        r = placeLayout(s, items);
+        results.push({ slot: s, placed: r.placed, dropped: r.dropped });
         mark('map');
       }
     }
+    if (own) recordLayout(results);
   }
 
-  // append pads after the highest occupied key of a (non-auto) slot
+  // append pads after the highest occupied key of a (non-auto) slot -> number that did not fit
   function appendPads(slot, pads) {
     var hi = -1;
     var k, i;
@@ -971,10 +1011,11 @@ function createModel(state, deps) {
     var cur = hi >= 0 ? hi + 1 : state.globals.rootKey;
     for (i = 0; i < pads.length; i++) {
       cur = nextFreeKey(slot, cur);
-      if (cur >= NUM_KEYS) break;
+      if (cur >= NUM_KEYS) return pads.length - i;
       slot.keys[cur] = pads[i].id;
       cur++;
     }
+    return 0;
   }
 
   // ---- undo
