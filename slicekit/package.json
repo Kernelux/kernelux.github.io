@@ -1,0 +1,17 @@
+{
+  "name": "slicekit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SliceKit — multi-sample slicer instrument for Max for Live",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "build": "node tools/build.js",
+    "lint": "node tools/check-es5.js",
+    "validate": "node tools/validate-patchers.js",
+    "check": "npm run build && npm run lint && npm run validate && npm test"
+  },
+  "devDependencies": {
+    "acorn": "^8.12.0"
+  }
+}
