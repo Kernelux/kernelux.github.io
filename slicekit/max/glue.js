@@ -782,10 +782,14 @@ function create(host) {
     }
   }
 
+  // Nothing is sent to the controls or the jsui before `init`: a default value
+  // pushed into an automatable control could overwrite what Live just restored.
   function afterEdit() {
-    var force = forceFb;
-    forceFb = false;
+    var force;
     reconcileSelection();
+    if (!initialized) { return; }
+    force = forceFb;
+    forceFb = false;
     syncFeedback(force);
     viewDeb.trigger();
   }
@@ -859,7 +863,7 @@ function create(host) {
 
   function writeView() {
     var d;
-    if (!host.Dict || !model) { return; }
+    if (!host.Dict || !model || !initialized) { return; }
     if (!viewDictObj) { viewDictObj = getDict(viewName); }
     d = viewDictObj;
     d.clear();
@@ -1047,6 +1051,7 @@ function create(host) {
 
     startLive();
     out(3, 'viewdict', viewName);
+    forceFb = false;
     syncFeedback(true);
     writeView();
   }

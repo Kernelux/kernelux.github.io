@@ -1370,6 +1370,24 @@ test('a corrupt or empty state dict is ignored', () => {
   assert.deepEqual(d.out(3)[0], ['viewdict', 'tview']);
 });
 
+test('nothing is sent to controls or jsui before init; init sends everything', () => {
+  const w = createWorld();
+  w.send('loadbang');
+  w.send('kit', 'slot', 2);
+  w.send('kit', 'chaos', 20);
+  w.send('drop', '/audio/early.wav');
+  w.settle();
+  assert.equal(w.out(2).length, 0, 'no feedback');
+  assert.equal(w.out(3).length, 0, 'no view output');
+  assert.equal(w.dicts.tview, undefined);
+  assert.equal(w.dicts.tstate, undefined);
+  w.send('init');
+  assert.equal(w.out(2).length, ALL_FB.length, 'full feedback at init');
+  assert.deepEqual(w.out(3).slice(0, 2), [['viewdict', 'tview'], ['refresh']]);
+  assert.deepEqual(w.out(2).find((m) => m[0] === 'kit_slot'), ['kit_slot', 2]);
+  assert.ok(w.dicts.tview);
+});
+
 test('notifydeleted flushes a pending save and is safe to call twice', () => {
   const w = createWorld();
   w.init();

@@ -137,6 +137,17 @@ function build(opts) {
   var warnings = [];
   var uiSrc, patchersFile, patchers, res;
 
+  // Merge the file list / warnings reported by build-patchers into ours.
+  function collect(r) {
+    var i;
+    if (r && Array.isArray(r.files)) {
+      for (i = 0; i < r.files.length; i++) { files.push(r.files[i]); }
+    }
+    if (r && Array.isArray(r.warnings)) {
+      for (i = 0; i < r.warnings.length; i++) { warnings.push('build-patchers: ' + r.warnings[i]); }
+    }
+  }
+
   fs.mkdirSync(outDir, { recursive: true });
 
   var bundleFile = path.join(outDir, 'slicekit.js');
@@ -163,8 +174,12 @@ function build(opts) {
         say('ran tools/build-patchers.js');
         if (res && typeof res.then === 'function') {
           // build() is allowed to be async; the CLI waits for it.
-          return res.then(function () { return { files: files, warnings: warnings }; });
+          return res.then(function (r) {
+            collect(r);
+            return { files: files, warnings: warnings };
+          });
         }
+        collect(res);
       } else {
         warnings.push('tools/build-patchers.js does not export build(), skipped');
       }
