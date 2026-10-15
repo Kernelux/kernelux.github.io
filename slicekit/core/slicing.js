@@ -9,7 +9,9 @@ var FFT = require('./fft');
 var BEAT_DIVS = ['1/16', '1/16T', '1/8', '1/8T', '1/4', '1/4T', '1/2', '1/2T', '1 Bar', '2 Bars', '4 Bars'];
 var BEAT_DIV_BEATS = [0.25, 1 / 6, 0.5, 1 / 3, 1, 2 / 3, 2, 4 / 3, 4, 8, 16]; // beats per slice
 
-var DEFAULT_MAX_SLICES = 128;
+// Hard per-sample slice limit (also the default for settings.maxSlices).
+var MAX_SLICES = 128;
+var DEFAULT_MAX_SLICES = MAX_SLICES;
 var DEFAULT_MIN_SLICE_MS = 30;
 // Samples whose absolute peak stays below this (about -66 dBFS) are treated as
 // silence by the transient detector (the log-compressed flux is so sensitive
@@ -398,12 +400,14 @@ function beatPoints(frames, sr, opts) {
   return pts;
 }
 
-// n equal regions: [0, total/n, 2*total/n, ...] (rounded, unique).
+// n equal regions: [0, total/n, 2*total/n, ...] (rounded, unique). n is
+// clamped to MAX_SLICES.
 function regionPoints(frames, n) {
   var total = Math.floor(numOr(frames, 0));
   if (!(total > 0)) return [];
   var regions = Math.floor(numOr(n, 1));
   if (regions < 1) regions = 1;
+  if (regions > MAX_SLICES) regions = MAX_SLICES;
   var pts = [0];
   for (var i = 1; i < regions; i++) {
     var p = Math.round(i * total / regions);
@@ -578,7 +582,8 @@ function pointsToRanges(points, totalFrames, minFrames) {
 // ---------------------------------------------------------------- pipeline
 
 // Full pipeline for one source. `settings` = Source.slicing.
-// Returns contiguous [{start, end}] covering [0, frames) ([] when frames is 0).
+// Returns contiguous [{start, end}] covering [0, frames) ([] when frames is 0),
+// at most `settings.maxSlices || 128` ranges in every mode.
 function sliceSource(mono, sr, settings) {
   var s = settings || {};
   var frames = mono.length;
@@ -607,7 +612,18 @@ function sliceSource(mono, sr, settings) {
   if (s.snap) {
     pts = snapToZeroCrossings(mono, pts, Math.max(1, Math.round(0.002 * sr)));
   }
-  return pointsToRanges(pts, frames, minFrames);
+  var ranges = pointsToRanges(pts, frames, minFrames);
+
+  // cap every mode (after snapping and min-length filtering) at maxSlices
+  // ranges: keep the first maxSlices-1 cut points after 0, the last range
+  // runs to the end of the file
+  var cap = Math.floor(numOr(s.maxSlices, 0));
+  if (!(cap >= 1)) cap = MAX_SLICES;
+  if (ranges.length > cap) {
+    ranges.length = cap;
+    ranges[cap - 1].end = frames;
+  }
+  return ranges;
 }
 
 // ---------------------------------------------------------------- overview
@@ -639,6 +655,7 @@ function overview(mono, columns) {
 }
 
 module.exports = {
+  MAX_SLICES: MAX_SLICES,
   BEAT_DIVS: BEAT_DIVS,
   BEAT_DIV_BEATS: BEAT_DIV_BEATS,
   toMono: toMono,

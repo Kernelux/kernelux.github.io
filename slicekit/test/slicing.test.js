@@ -751,6 +751,90 @@ test('sliceSource: silence is one slice, missing settings do not throw', () => {
   assertRanges(dd, x.length, Math.round(0.03 * SR));
 });
 
+// ------------------------------------------------------------------ slice cap
+
+test('MAX_SLICES is exported and equals 128', () => {
+  assert.equal(S.MAX_SLICES, 128);
+});
+
+test('regionPoints: more than MAX_SLICES regions is clamped to 128', () => {
+  const pts = S.regionPoints(1000000, 200);
+  assert.equal(pts.length, 128);
+  assertSortedUniqueInts(pts);
+  assert.equal(pts[0], 0);
+  assert.equal(S.regionPoints(1000000, 128).length, 128);
+  assert.equal(S.regionPoints(1000000, 1e9).length, 128);
+});
+
+test('sliceSource: beat 1/16 on 60 s is capped at 128 ranges that still cover the file', () => {
+  const frames = 60 * SR;
+  const x = new Float32Array(frames);
+  const settings = { mode: 'beat', bpm: 120, beatDiv: '1/16', minSliceMs: 30, snap: false };
+  // the uncapped grid really has 480 points
+  assert.equal(S.beatPoints(frames, SR, { bpm: 120, beatDiv: '1/16' }).length, 480);
+  const r = S.sliceSource(x, SR, settings);
+  assert.equal(r.length, 128);
+  assertRanges(r, frames, Math.round(0.03 * SR));
+  // the first 127 cut points after 0 are kept, the last range runs to the end
+  const grid = S.beatPoints(frames, SR, { bpm: 120, beatDiv: '1/16' });
+  r.forEach((q, i) => assert.equal(q.start, grid[i]));
+  assert.equal(r[127].end, frames);
+  assert.ok(r[127].end - r[127].start > 100 * 5512, 'last range absorbs the rest');
+  // also after snapping
+  const sine = new Float32Array(frames);
+  for (let i = 0; i < frames; i++) sine[i] = 0.5 * Math.sin(2 * Math.PI * 441.7 * i / SR + 0.3);
+  const rs = S.sliceSource(sine, SR, Object.assign({}, settings, { snap: true }));
+  assert.equal(rs.length, 128);
+  assertRanges(rs, frames, Math.round(0.03 * SR));
+});
+
+test('sliceSource: region mode with 200 regions gives 128 ranges', () => {
+  const frames = 128000;
+  const x = new Float32Array(frames);
+  for (const snap of [false, true]) {
+    const r = S.sliceSource(x, SR, { mode: 'region', regions: 200, minSliceMs: 5, snap });
+    assert.equal(r.length, 128, `snap=${snap}`);
+    assertRanges(r, frames, Math.round(0.005 * SR));
+  }
+  const exact = S.sliceSource(x, SR, { mode: 'region', regions: 200, minSliceMs: 5, snap: false });
+  exact.forEach((q) => assert.equal(q.end - q.start, 1000));
+});
+
+test('sliceSource: settings.maxSlices lowers the cap in every mode', () => {
+  const frames = 20 * SR;
+  const x = new Float32Array(frames);
+  const beat = S.sliceSource(x, SR, { mode: 'beat', bpm: 120, beatDiv: '1/16', minSliceMs: 30, snap: false, maxSlices: 10 });
+  assert.equal(beat.length, 10);
+  assertRanges(beat, frames, Math.round(0.03 * SR));
+  const region = S.sliceSource(x, SR, { mode: 'region', regions: 64, minSliceMs: 30, snap: false, maxSlices: 7 });
+  assert.equal(region.length, 7);
+  assertRanges(region, frames, Math.round(0.03 * SR));
+  // 0 / missing means the default of 128
+  const dflt = S.sliceSource(x, SR, { mode: 'beat', bpm: 240, beatDiv: '1/16', minSliceMs: 30, snap: false, maxSlices: 0 });
+  assert.equal(dflt.length, 128);
+  // manual mode is always one range
+  assert.equal(S.sliceSource(x, SR, { mode: 'manual', maxSlices: 5 }).length, 1);
+});
+
+test('sliceSource: transient mode is capped at 128 and otherwise unchanged', () => {
+  const x = silence(20);
+  for (let t = 0.1; t < 19.8; t += 0.05) addClick(x, t, 0.8);
+  const r = S.sliceSource(x, SR, { mode: 'transient', sensitivity: 100, minSliceMs: 30, snap: false });
+  assert.ok(r.length <= 128 && r.length >= 120, `got ${r.length}`);
+  assertRanges(r, x.length, Math.round(0.03 * SR));
+  // identical to the raw detector output (no extra truncation when under the cap)
+  const pts = S.detectTransients(x, SR, { sensitivity: 100, minSliceMs: 30 });
+  assert.deepEqual(r.map((q) => q.start), pts);
+  const five = S.sliceSource(x, SR, { mode: 'transient', sensitivity: 100, minSliceMs: 30, snap: false, maxSlices: 5 });
+  assert.equal(five.length, 5);
+  assertRanges(five, x.length, Math.round(0.03 * SR));
+  // few clicks: unchanged by the cap
+  const y = silence(3);
+  [0.3, 0.8, 1.3, 1.9, 2.4].forEach((t) => addClick(y, t, 0.9));
+  const few = S.sliceSource(y, SR, { mode: 'transient', sensitivity: 50, minSliceMs: 30, snap: false });
+  assert.equal(few.length, 6);
+});
+
 // ------------------------------------------------------------------ overview
 
 test('overview: length, bounds and exactness against brute force', () => {
