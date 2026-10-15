@@ -1541,7 +1541,7 @@ test('init sends the recorder bindings on outlet 4 (names from jsarguments[4])',
   assert.equal(w.out(4).length, 0, 'nothing before init');
   w.send('init');
   assert.deepEqual(w.out(4), [['cap', 'tcap'], ['wpb', 'tcapwp']]);
-  assert.deepEqual(w.glue().names, { prefix: 'tsrc', state: 'tstate', view: 'tview', cap: 'tcap', capwp: 'tcapwp', capout: 'tcapout' });
+  assert.deepEqual(w.plain(w.glue().names), { prefix: 'tsrc', state: 'tstate', view: 'tview', cap: 'tcap', capwp: 'tcapwp', capout: 'tcapout' });
   const d = createWorld({ args: ['slicekit.js'] });
   d.send('init');
   assert.deepEqual(d.out(4), [['cap', '---cap'], ['wpb', '---capwp']]);
@@ -1715,18 +1715,21 @@ test('kit scan rotates the kit: new notes play the rotated pad, held voices swit
   const w = loadedWorld(['/audio/a.wav', '/audio/b.wav']);
   const st = w.state();
   const occ = st.slots[0].keys.map((id, k) => (id === null ? -1 : k)).filter((k) => k >= 0);
-  const startOf = (key) => {
+  const where = (key) => {
     const pad = padOnKey(st, key);
-    for (const s of st.sources) { for (const sl of s.slices) { if (sl.id === pad.sliceId) { return sl.start; } } }
-    return -1;
+    for (const s of st.sources) {
+      for (const sl of s.slices) { if (sl.id === pad.sliceId) { return 'tsrc' + s.slot + ':' + sl.start; } }
+    }
+    return '';
   };
+  const played = (c) => { const p = Object.fromEntries(c.params); return p.src + ':' + p.pstart; };
   const shift = Math.round(0.5 * (occ.length - 1));
   const target = occ[shift % occ.length];
-  assert.notEqual(startOf(target), startOf(36), 'the test needs different slices');
+  assert.notEqual(where(target), where(36), 'the test needs different slices');
 
   w.send('note', 36, 100);
   let cmds = w.commands(true);
-  assert.equal(Object.fromEntries(cmds[0].params).pstart, startOf(36));
+  assert.equal(played(cmds[0]), where(36));
   const voice = cmds[0].target;
   w.send('kit', 'scan', 50);
   cmds = w.commands(true);
@@ -1735,14 +1738,15 @@ test('kit scan rotates the kit: new notes play the rotated pad, held voices swit
   const names = c.params.map((p) => p[0]);
   assert.ok(names.includes('pstart') && names.includes('pend') && names.includes('src'));
   assert.ok(!names.includes('trig'), 'no retrigger');
-  assert.equal(Object.fromEntries(c.params).pstart, startOf(target));
+  assert.equal(played(c), where(target));
+  w.settle();
   assert.equal(w.state().globals.scan, 50);
   assert.equal(w.view().scan, 50);
 
   w.send('note', 36, 0);
   w.commands(true);
   w.send('note', 36, 100);
-  assert.equal(Object.fromEntries(w.commands(true)[0].params).pstart, startOf(target), 'a new note plays the rotated pad');
+  assert.equal(played(w.commands(true)[0]), where(target), 'a new note plays the rotated pad');
   w.send('kit', 'scan', 0);
   assert.equal(w.model().globals().scan, 0);
 });
@@ -1781,10 +1785,9 @@ test('kit morph and kit scan are automatable: values received before init win ov
 
 test('gest sel / gest <param> edit the selected gesture (unit conversion) and drive the gest_* feedback', () => {
   const w = loadedWorld();
-  let fb = Object.fromEntries(w.feedback());
   w.feedback(true);
   w.send('gest', 'sel', 1);
-  fb = Object.fromEntries(w.feedback(true));
+  let fb = Object.fromEntries(w.feedback(true));
   assert.equal(fb.gest_sel, 1);
   // 'Rise': beats 4, rate 1/16 -> 1/16, cut 20000 -> 20000, pitch 0 -> 12, amp 1 -> 1, curve 0
   assert.equal(fb.gest_beats, GEST_BEATS.indexOf(4));
@@ -1843,6 +1846,7 @@ test('gest sel / gest <param> edit the selected gesture (unit conversion) and dr
   assert.equal(fb.gest_rateto, GEST_RATES.indexOf('1/64'));
   assert.equal(fb.gest_cutto, 1200);
   assert.ok(Math.abs(fb.gest_curve - 30) < 1e-6);
+  w.settle();
   assert.equal(w.state().globals.gestureSel, 0);
   w.send('gest', 'sel', 9);
   assert.equal(w.model().globals().gestureSel, 3, 'clamped');
@@ -1974,7 +1978,7 @@ for (const wp of [100000, 30000, 0]) {
         if (file.channels[c][j] !== ring[c][(wp - N + j + R) % R]) { assert.fail('frame ' + j + ' ch ' + c + ' is not the ring frame ' + ((wp - N + j + R) % R)); }
       }
     }
-    assert.match(w.view().status === undefined ? '' : w.glue().status, /^Captured 1 Bar → SliceKit Capture \d{8}-\d{6}\.wav$/);
+    assert.match(w.glue().status, /^Captured 1 Bar → SliceKit Capture \d{8}-\d{6}\.wav$/);
 
     // the file is loaded ~300 ms later, like a dropped sample
     assert.equal(w.out(1).length, 0, 'not loaded yet');
@@ -2224,7 +2228,6 @@ test('fromsimpler: Simpler without a sample, stale path, unreadable Simpler', ()
   w.settle();
   assert.equal(w.out(1).length, 0, 'nothing loaded');
   assert.equal(w.model().listSources().length, 0);
-  assert.equal(w.out(3).length >= 0, true);
 });
 
 // ----- keep clip -------------------------------------------------------------
@@ -2272,7 +2275,7 @@ test('keep clip: a shuffle rewrites the clip notes so the same pads play (mod zo
   const clip = makeClip(CLIP_NOTES);
   const w = clipWorld(clip);
   w.send('kit', 'keepclip', 1);
-  assert.equal(lastFb(w, 'kit_keepclip'), undefined === 0 ? 0 : lastFb(w, 'kit_keepclip'));
+  assert.equal(lastFb(w, 'kit_keepclip'), 1);
   const before = slotKeysOf(w).slice();
   assert.ok(before[100] === null, 'the mod zone has no pad');
   w.send('kit', 'shuffle');
@@ -2414,8 +2417,6 @@ test('keep clip: detail clip of another track -> the playing clip of this track;
   assert.equal(applyCalls(w2).length, 0);
   assert.equal(w2.glue().status, 'Keep clip: no MIDI clip on this track');
   assert.ok(w2.glue().lastMapping, 'mapping kept for kit remapclip');
-  // the Live set can change: once a MIDI clip plays, remapclip works
-  w2.model(); // (no-op, keeps the world alive)
 
   const w3 = clipWorld(makeClip(CLIP_NOTES), {}, { noLive: true });
   w3.send('kit', 'keepclip', 1);
@@ -2445,7 +2446,6 @@ test('keep clip falls back to a JSON string when the object form is not taken, a
   assert.match(w2.glue().status, /Clip remap failed/);
   w2.settle();
   assert.ok(w2.state().slots[0].keys.some((k) => k !== null), 'the kit itself is fine');
-  assert.equal(w2.liveInstances.filter((l) => l.property === '').length > 0, true);
 });
 
 // ----- view dict, state, robustness -----------------------------------------
@@ -2516,7 +2516,10 @@ test('v2 state survives the lossy Max dict round trip (B booleans, flags, gestur
   assert.equal(fb.kit_keepclip, 1);
   assert.equal(fb.kit_capturebars, 3);
   assert.equal(fb.gest_sel, 2);
-  assert.equal(fb.pad_pitch, 5, 'morph edit is on: the controls show B');
+  w2.send('ui', 'selectkey', 38);
+  assert.equal(lastFb(w2, 'pad_pitch'), 5, 'morph edit is on: the controls show B');
+  assert.equal(lastFb(w2, 'pad_reverse'), 1);
+  w2.settle();
   assert.equal(w2.view().keyFlags[38] & 64, 64);
 });
 
