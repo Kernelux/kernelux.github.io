@@ -346,3 +346,25 @@ target at each (re)start) so gesture sweeps don't zipper. No new params.
 `morph` (0..100), `morphEdit` (0/1), `scan` (0..100), `gesture` (index of the active
 gesture or -1), `gestureNames` (4 strings). keyFlags bit 64 = pad has B (morph) values.
 Mod zone is now 16 keys: labels `4 8 8T 16 16T 32 64 Rv O- O+ Tp Ch G1 G2 G3 G4`.
+
+## v2 fixes (from the completeness audit)
+
+- Voice params `jump` and `redir` (counters, like `trig`/`kill`):
+  - `jump` change while sounding: re-latch `pstart`/`pend`/`dir` and move the playhead to
+    the new start (loop start when looping) with the 1 ms declick, **without** restarting
+    the envelope. Used by Scan to switch a held note's slice immediately.
+  - `redir` change while sounding: re-latch `dir`/`pend` only, keep the playhead position.
+    Used by the Reverse modifier so a sounding hit turns around where it is.
+  Engine order: `refreshScan` sends the slice params then `jump <n>` last; the Reverse
+  modifier sends `dir`, `pend`, then `redir <n>`.
+- `ui swap <fromKey> <toKey>`: from the jsui (drag a key onto another key) → `model.swapKeys`
+  (a map change: keep-clip applies). Selection follows to `toKey`.
+- Recorder: `wpb` frame 0 holds the **next** write position (after the advance), so the
+  glue's copy window `[wp−N, wp)` ends at the newest frame.
+- View dict also carries `modStart` (first mod-zone key, -1 when the zone is off).
+- Slice cap: every slicing mode, manual cuts and Simpler import are limited to 128 slices
+  per sample (`MAX_SLICES`); extra points are dropped with a status message.
+- Snap applies to manual cuts (`ui addslice/moveslice`) when the sample's Snap is on.
+- Dropping a file whose name matches a sample that failed to load re-links that sample
+  instead of adding a new one.
+- After loads and layout changes the status reports slices that did not fit on the keys.
