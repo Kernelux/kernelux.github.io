@@ -59,6 +59,16 @@
 //   trig      counter  any change (re)starts the hit (1 ms fade-out first if
 //                      it is sounding). The first value must differ from 0.
 //   kill      counter  any change fades the voice out in 2 ms (choke)
+//   jump      counter  any change while the voice is sounding re-latches
+//                      pstart/pend/dir and moves the playhead to the new start
+//                      (loop start when looping) with the 1 ms declick, without
+//                      restarting the envelope, the direction toggle (rptalt)
+//                      or the repeat grid. Idle / waiting voices only remember
+//                      the counter. (Scan: switches a held note's slice.)
+//   redir     counter  any change while the voice is sounding re-latches dir
+//                      and pend only: the hit turns around where it is (no fade).
+//                      If the new stop is already behind the playhead the hit
+//                      ends with the normal 2 ms end fade. (Reverse modifier.)
 //
 // GenExpr rules followed here (see docs/VOICE.md):
 //   - Param/History/Buffer declarations first; no functions; only `//`
@@ -96,6 +106,8 @@ Param bpm(120, min=1, max=999);
 Param playing(0, min=0, max=1);
 Param trig(0, min=0, max=1000000000);
 Param kill(0, min=0, max=1000000000);
+Param jump(0, min=0, max=1000000000);
+Param redir(0, min=0, max=1000000000);
 
 Buffer src;
 
@@ -126,6 +138,8 @@ History h_rdprev(0);
 History h_swprev(0);
 History h_seentrig(0);
 History h_seenkill(0);
+History h_seenjump(0);
+History h_seenredir(0);
 History h_ic1l(0);
 History h_ic2l(0);
 History h_ic1r(0);
@@ -183,6 +197,8 @@ rdprev = h_rdprev;
 swprev = h_swprev;
 seentrig = h_seentrig;
 seenkill = h_seenkill;
+seenjump = h_seenjump;
+seenredir = h_seenredir;
 ic1l = h_ic1l;
 ic2l = h_ic2l;
 ic1r = h_ic1r;
@@ -229,6 +245,8 @@ b1 = 0;
 xl = 0;
 xr = 0;
 ctgt = 0;
+sold = 0;
+lswap = 0;
 cscoef = 0;
 lcut = 0;
 fh = 0;
@@ -257,7 +275,7 @@ if (cutoff >= 19000) {
   ctgt = 24000;
 }
 
-// ---- 1. host events: kill and trig ------------------------------------
+// ---- 1. host events: kill, jump, redir and trig -----------------------
 if (kill != seenkill) {
   seenkill = kill;
   if (st == 1) {
@@ -266,6 +284,44 @@ if (kill != seenkill) {
   if (st == 2) {
     st = 0;
     mode = 0;
+  }
+}
+// jump: move a sounding hit to the (new) slice start with the 1 ms declick,
+// without restarting envelope, direction toggle or repeat grid. Idle and
+// waiting voices only remember the counter (a repeat reads the params anyway).
+if (jump != seenjump) {
+  seenjump = jump;
+  if (st == 1 && mode == 0) {
+    mode = 1;
+    pkind = 3;
+  }
+}
+// redir: turn a sounding hit around where it is (new direction and stop)
+if (redir != seenredir) {
+  seenredir = redir;
+  if (st == 1 && mode == 0) {
+    dd = 1;
+    if (dir < 0) {
+      dd = -1;
+    }
+    sold = sdir;
+    sdir = dd;
+    sstop = pend;
+    if (looping > 0.5) {
+      if (sdir != sold) {
+        // mirror the loop region so it is traversed in the new direction
+        lswap = lstart;
+        lstart = lend;
+        lend = lswap;
+      }
+    } else {
+      remain = (sstop - pos) * sdir;
+      if (remain <= 0) {
+        // the new stop is already behind the playhead: finish with the normal 2 ms end fade
+        aincr = abs(exp(pitch * 0.05776226504666211) * bufsr / sr * tf);
+        sstop = pos + sdir * aincr * endfade_len;
+      }
+    }
   }
 }
 if (trig != seentrig) {
@@ -359,6 +415,10 @@ if (trigreq > 0.5) {
       pkind = 2;
       mode = 1;
     }
+    // a repeat line while a jump is pending: the repeat restart takes over
+    if (st == 1 && mode == 1 && pkind == 3) {
+      pkind = 2;
+    }
   }
 }
 // fade-out finished: jump now
@@ -380,7 +440,8 @@ if (dorestart > 0.5) {
     alt = 0;
     fr = 0;
     lastk = -1;
-  } else {
+  }
+  if (pkind == 2) {
     // repeat: alternate direction when rptalt is on
     if (rptalt > 0.5) {
       alt = 1 - alt;
@@ -388,16 +449,20 @@ if (dorestart > 0.5) {
       alt = 0;
     }
   }
+  // pkind 3 (jump): direction toggle and repeat clock are left alone
   // every hit starts with a cold filter (the gain stage is after the filter)
   ic1l = 0;
   ic2l = 0;
   ic1r = 0;
   ic2r = 0;
-  // every hit starts exactly at its cutoff (smoother snapped, bypass decided)
-  cs = log(ctgt) * 1.4426950408889634;
-  byp = 0;
-  if (ctgt >= 19000) {
-    byp = 1;
+  if (pkind != 3) {
+    // every hit starts exactly at its cutoff (smoother snapped, bypass decided);
+    // a jump keeps the running smoothing
+    cs = log(ctgt) * 1.4426950408889634;
+    byp = 0;
+    if (ctgt >= 19000) {
+      byp = 1;
+    }
   }
   dd = 1;
   if (dir < 0) {
@@ -428,12 +493,15 @@ if (dorestart > 0.5) {
   if (looping > 0.5) {
     pos = lstart;
   }
-  stage = 1;
-  envv = 0;
+  if (pkind != 3) {
+    // a jump keeps envelope, amp smoothing and tape factor
+    stage = 1;
+    envv = 0;
+    ampsm = amp;
+    tf = 1;
+  }
   g = 0;
   mode = 0;
-  ampsm = amp;
-  tf = 1;
   lw = 0;
   st = 1;
 }
@@ -724,6 +792,8 @@ h_rdprev = rdprev;
 h_swprev = swprev;
 h_seentrig = seentrig;
 h_seenkill = seenkill;
+h_seenjump = seenjump;
+h_seenredir = seenredir;
 h_ic1l = ic1l;
 h_ic2l = ic2l;
 h_ic1r = ic1r;

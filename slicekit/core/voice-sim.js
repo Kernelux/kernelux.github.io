@@ -51,7 +51,9 @@ var PARAMS = {
   bpm: { def: 120, min: 1, max: 999 },
   playing: { def: 0, min: 0, max: 1 },
   trig: { def: 0, min: 0, max: 1000000000 },
-  kill: { def: 0, min: 0, max: 1000000000 }
+  kill: { def: 0, min: 0, max: 1000000000 },
+  jump: { def: 0, min: 0, max: 1000000000 },
+  redir: { def: 0, min: 0, max: 1000000000 }
 };
 
 var floor = Math.floor;
@@ -88,7 +90,7 @@ function create(opts) {
   var h_sstart = 0, h_sstop = 0, h_alt = 0, h_stage = 0, h_envv = 0, h_ampsm = 1;
   var h_tf = 1, h_lw = 0, h_looping = 0, h_lstart = 0, h_lend = 0, h_llen = 1;
   var h_lcprev = 0, h_lastk = -1, h_fr = 0, h_plprev = 0, h_lastph = 0, h_rdprev = 0, h_swprev = 0;
-  var h_seentrig = 0;
+  var h_seentrig = 0, h_seenjump = 0, h_seenredir = 0;
   var h_seenkill = 0, h_ic1l = 0, h_ic2l = 0, h_ic1r = 0, h_ic2r = 0;
   var h_cs = 14.29, h_byp = 1;
 
@@ -139,7 +141,7 @@ function create(opts) {
     var gatemode = P.gatemode, held = P.held, loopon = P.loopon, loopsize = P.loopsize;
     var looppos = P.looppos, rptdiv = P.rptdiv, rptswing = P.rptswing, rptalt = P.rptalt;
     var cutoff = P.cutoff, drive = P.drive, tape = P.tape, tapems = P.tapems, bpm = P.bpm;
-    var playing = P.playing, trig = P.trig, kill = P.kill;
+    var playing = P.playing, trig = P.trig, kill = P.kill, jump = P.jump, redir = P.redir;
 
     var sr = samplerate;
     var nsrc = dim();
@@ -148,13 +150,14 @@ function create(opts) {
     var bypstep;
     var st, mode, pkind, g, pos, sdir, sstart, sstop, alt, stage, envv, ampsm, tf, lw;
     var looping, lstart, lend, llen, lcprev, lastk, fr, plprev, lastph, rdprev, swprev, seentrig, seenkill;
+    var seenjump, seenredir;
     var ic1l, ic2l, ic1r, ic2r, cs, byp;
     var trigreq = 0, ph = 0, pl = 0, rd = 0, kidx = -1, gp = 0, pairs = 0, odd = 0.5;
     var fire = 0, rptact = 0, dorestart = 0, dd = 1, span = 0, lc = 0, remain = 0;
     var ended = 0, finish = 0, incr = 0, aincr = 0, ge = 1, xf = 1, stg = 0;
     var attn = 0, decn = 0, reln = 0, over = 0, vg = 0, p1 = 0, p2 = 0, i0 = 0, f1 = 0;
     var a0 = 0, b0 = 0, a1 = 0, b1 = 0, xl = 0, xr = 0;
-    var ctgt = 0, cscoef = 0, lcut = 0, fh = 0, bt = 0;
+    var ctgt = 0, cscoef = 0, lcut = 0, fh = 0, bt = 0, sold = 0, lswap = 0;
     var fc = 0, gf = 0, a1f = 0, a2f = 0, a3f = 0, v1 = 0, v2 = 0, v3 = 0;
     var yl = 0, yr = 0, da = 1, dn = 1, dw = 0, outl = 0, outr = 0, outa = 0;
 
@@ -200,6 +203,8 @@ function create(opts) {
     swprev = h_swprev;
     seentrig = h_seentrig;
     seenkill = h_seenkill;
+    seenjump = h_seenjump;
+    seenredir = h_seenredir;
     ic1l = h_ic1l;
     ic2l = h_ic2l;
     ic1r = h_ic1r;
@@ -214,7 +219,7 @@ function create(opts) {
       ctgt = 24000;
     }
 
-    // ---- 1. host events: kill and trig ----
+    // ---- 1. host events: kill, jump, redir and trig ----
     if (kill !== seenkill) {
       seenkill = kill;
       if (st === 1) {
@@ -225,6 +230,46 @@ function create(opts) {
         st = 0;
         mode = 0;
         if (logOn) { logEvent('kill'); logEvent('end', { why: 'kill' }); }
+      }
+    }
+    // jump: move a sounding hit to the (new) slice start with the 1 ms declick,
+    // without restarting envelope, direction toggle or repeat grid. Idle and
+    // waiting voices only remember the counter (a repeat reads the params anyway).
+    if (jump !== seenjump) {
+      seenjump = jump;
+      if (st === 1 && mode === 0) {
+        mode = 1;
+        pkind = 3;
+        if (logOn) { logEvent('jumpreq'); }
+      }
+    }
+    // redir: turn a sounding hit around where it is (new direction and stop)
+    if (redir !== seenredir) {
+      seenredir = redir;
+      if (st === 1 && mode === 0) {
+        dd = 1;
+        if (dir < 0) {
+          dd = -1;
+        }
+        sold = sdir;
+        sdir = dd;
+        sstop = pend;
+        if (looping > 0.5) {
+          if (sdir !== sold) {
+            // mirror the loop region so it is traversed in the new direction
+            lswap = lstart;
+            lstart = lend;
+            lend = lswap;
+          }
+        } else {
+          remain = (sstop - pos) * sdir;
+          if (remain <= 0) {
+            // the new stop is already behind the playhead: finish with the normal 2 ms end fade
+            aincr = abs(exp(pitch * 0.05776226504666211) * bufsr / sr * tf);
+            sstop = pos + sdir * aincr * endfade_len;
+          }
+        }
+        if (logOn) { logEvent('redir', { sdir: sdir, looping: looping }); }
       }
     }
     if (trig !== seentrig) {
@@ -313,6 +358,10 @@ function create(opts) {
           pkind = 2;
           mode = 1;
         }
+        // a repeat line while a jump is pending: the repeat restart takes over
+        if (st === 1 && mode === 1 && pkind === 3) {
+          pkind = 2;
+        }
       }
     }
     if (st === 1 && mode === 1 && g <= 0) {
@@ -332,7 +381,8 @@ function create(opts) {
         alt = 0;
         fr = 0;
         lastk = -1;
-      } else {
+      }
+      if (pkind === 2) {
         if (rptalt > 0.5) {
           alt = 1 - alt;
         } else {
@@ -343,11 +393,14 @@ function create(opts) {
       ic2l = 0;
       ic1r = 0;
       ic2r = 0;
-      // every hit starts exactly at its cutoff (smoother snapped, bypass decided)
-      cs = log(ctgt) * 1.4426950408889634;
-      byp = 0;
-      if (ctgt >= 19000) {
-        byp = 1;
+      if (pkind !== 3) {
+        // every hit starts exactly at its cutoff (smoother snapped, bypass decided);
+        // a jump keeps the running smoothing
+        cs = log(ctgt) * 1.4426950408889634;
+        byp = 0;
+        if (ctgt >= 19000) {
+          byp = 1;
+        }
       }
       dd = 1;
       if (dir < 0) {
@@ -378,15 +431,24 @@ function create(opts) {
       if (looping > 0.5) {
         pos = lstart;
       }
-      stage = 1;
-      envv = 0;
+      if (pkind !== 3) {
+        // a jump keeps envelope, amp smoothing and tape factor
+        stage = 1;
+        envv = 0;
+        ampsm = amp;
+        tf = 1;
+      }
       g = 0;
       mode = 0;
-      ampsm = amp;
-      tf = 1;
       lw = 0;
       st = 1;
-      if (logOn) { logEvent('start', { kind: pkind, sdir: sdir, alt: alt, looping: looping }); }
+      if (logOn) {
+        if (pkind === 3) {
+          logEvent('jump', { sdir: sdir, alt: alt, looping: looping });
+        } else {
+          logEvent('start', { kind: pkind, sdir: sdir, alt: alt, looping: looping });
+        }
+      }
     }
 
     // ---- 5. render one sample ----
@@ -670,6 +732,8 @@ function create(opts) {
     h_swprev = swprev;
     h_seentrig = seentrig;
     h_seenkill = seenkill;
+    h_seenjump = seenjump;
+    h_seenredir = seenredir;
     h_ic1l = ic1l;
     h_ic2l = ic2l;
     h_ic1r = ic1r;

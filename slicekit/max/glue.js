@@ -36,6 +36,8 @@ var VIEW_MS = 30;
 var TICK_MS = 15;            // gesture ramp update period while a gesture key is held
 var CAPTURE_LOAD_MS = 300;   // wait between writewave and loading the file
 var SIMPLER_CLASS = 'OriginalSimpler';
+var DEFAULT_MAX_SLICES = 128;
+var DROPPED_NOTE = /\s\u2014\s\d+ slices? (didn't|did not) fit on the keys \(try Find best or another root\)$/;
 
 var PLAY_MODES = ['mono', 'poly', 'thru'];
 var TRIG_MODES = ['trigger', 'gate'];
@@ -386,6 +388,26 @@ function create(host) {
     status = String(s);
   }
 
+  function maxSlices() {
+    return CONST.MAX_SLICES || DEFAULT_MAX_SLICES;
+  }
+
+  // After an operation that lays the kit out again: report slices that did not fit
+  // on the keys (model.lastLayout().dropped), replacing an older such note.
+  function appendDropped() {
+    var ll, n, base;
+    if (!model || typeof model.lastLayout !== 'function') { return; }
+    ll = model.lastLayout();
+    n = ll ? toInt(ll.dropped, 0) : 0;
+    base = status.replace(DROPPED_NOTE, '');
+    if (n > 0) {
+      setStatus(base + ' \u2014 ' + n + (n === 1 ? ' slice' : ' slices') +
+        " didn't fit on the keys (try Find best or another root)");
+    } else {
+      setStatus(base);
+    }
+  }
+
   function sendCommands(cmds) {
     var i, j, c, p, v;
     if (!cmds || typeof cmds.length !== 'number') { return; }
@@ -663,15 +685,21 @@ function create(host) {
   // slicer when there is no usable point. Returns the slice count or -1.
   function importSlices(srcId, points) {
     var src = model.getSource(srcId);
+    var raw = [];
     var pts = [0];
     var i, p, ranges;
     if (!src || !monoCache[srcId]) { return -1; }
     for (i = 0; i < points.length; i++) {
       p = Math.round(num(points[i], 0));
-      if (p > 0 && p < src.frames) { pts.push(p); }
+      if (p > 0 && p < src.frames) { raw.push(p); }
     }
-    if (pts.length < 2) { return resliceSource(srcId); }
-    pts.sort(function (a, b) { return a - b; });
+    if (!raw.length) { return resliceSource(srcId); }
+    raw.sort(function (a, b) { return a - b; });
+    for (i = 0; i < raw.length; i++) {
+      if (raw[i] !== pts[pts.length - 1]) { pts.push(raw[i]); }
+    }
+    // At most MAX_SLICES slices: the points after the cap are dropped.
+    if (pts.length > maxSlices()) { pts = pts.slice(0, maxSlices()); }
     ranges = Slicing.pointsToRanges(pts, src.frames, 1);
     model.setSourceSettings(srcId, { mode: 'manual' });
     model.setSlices(srcId, ranges);
@@ -689,6 +717,7 @@ function create(host) {
     out(1, slot, 'replace', path);
     pending[slot] = { mode: mode, stale: stale, seen: -1, ticks: POLL_TICKS };
     if (extra && extra.importPoints) { pending[slot].importPoints = extra.importPoints; }
+    if (extra && extra.relinked) { pending[slot].relinked = true; }
     ensurePoller();
   }
 
@@ -804,18 +833,52 @@ function create(host) {
         if (key >= 0) { selectKey(key); }
       }
       forceFb = true;
-      setStatus('Loaded ' + src.name + ': ' + count + ' slices');
+      setStatus((p.relinked ? 'Re-linked ' : 'Loaded ') + src.name + ': ' + count + ' slices' +
+        (count >= maxSlices() ? ' \u2014 Limited to ' + maxSlices() + ' slices' : ''));
     } else {
       // Restore: slices are stored, only rebuild the caches.
       seedFeatureCache(src.id);
       count = src.slices.length;
-      if (!Object.keys(pending).length) {
+      if (p.relinked) {
+        setStatus('Re-linked ' + src.name);
+      } else if (!Object.keys(pending).length) {
         setStatus('Restored ' + srcList().length + ' sample' + (srcList().length === 1 ? '' : 's'));
       } else {
         setStatus('Restoring ' + src.name + ' ...');
       }
     }
+    appendDropped();
     viewDeb.trigger();
+  }
+
+  // A source whose file never loaded (no audio cache, nothing loading) and whose file
+  // name matches the dropped file: the user is pointing it at the file's new place.
+  function findMissingSource(path) {
+    var want = basename(path).toLowerCase();
+    var list = srcList();
+    var i, s;
+    for (i = 0; i < list.length; i++) {
+      s = list[i];
+      if (monoCache[s.id] || pending[s.slot]) { continue; }
+      if (basename(s.path || s.name).toLowerCase() === want) { return s; }
+    }
+    return null;
+  }
+
+  // Points the source at a new file and reloads it like a restore (stored slices are
+  // kept unless the frame count changed). The model has no path setter, so
+  // setSourceInfo({path}) is tried first and the field is set directly if the model
+  // did not take it (then the change is announced to the state saver by hand).
+  function relinkSource(src, path) {
+    var p = String(path);
+    model.setSourceInfo(src.id, { path: p });
+    src = model.getSource(src.id);
+    if (src.path !== p) {
+      src.path = p;
+      onModelChange();
+    }
+    requestLoad(src.slot, p, 'restore', { relinked: true });
+    setStatus('Re-linked ' + src.name);
   }
 
   // extra (optional): { importPoints: [frames], playMode: 'mono'|'poly'|'thru' } (Simpler import).
@@ -1700,8 +1763,11 @@ function create(host) {
 
   function onDrop(a) {
     var i;
+    var missing;
     for (i = 0; i < a.length; i++) {
-      if (a[i] !== undefined && a[i] !== null && String(a[i]) !== '') { addSourceFromPath(a[i]); }
+      if (a[i] === undefined || a[i] === null || String(a[i]) === '') { continue; }
+      missing = findMissingSource(a[i]);
+      if (missing) { relinkSource(missing, a[i]); } else { addSourceFromPath(a[i]); }
     }
   }
 
@@ -1749,8 +1815,12 @@ function create(host) {
 
     function reslice() {
       var n = resliceSource(src.id);
-      if (n >= 0) { setStatus(src.name + ': ' + n + ' slices'); }
-      else { setStatus(src.name + ' is not loaded yet'); }
+      if (n >= 0) {
+        setStatus(src.name + ': ' + n + ' slices' + (n >= maxSlices() ? ' \u2014 Limited to ' + maxSlices() + ' slices' : ''));
+        appendDropped();
+      } else {
+        setStatus(src.name + ' is not loaded yet');
+      }
       forceFb = true;
     }
 
@@ -1924,19 +1994,24 @@ function create(host) {
         break;
       case 'layout':
         model.setGlobal('layout', LAYOUTS[clampInt(v, 0, 2)]);
+        appendDropped();
         break;
       case 'zonealign':
         model.setGlobal('zoneAlign', toBool(v));
+        appendDropped();
         break;
       case 'sortby':
         model.setGlobal('sortBy', SORT_BYS[clampInt(v, 0, 2)]);
+        appendDropped();
         break;
       case 'root':
         model.setGlobal('rootKey', clampInt(v, 0, 127));
+        appendDropped();
         break;
       case 'relayout':
         res = model.applyLayout(model.currentSlot());
         setStatus('Layout: ' + res.placed + ' keys' + (res.dropped ? ', ' + res.dropped + ' dropped' : ''));
+        appendDropped();
         break;
       case 'shuffle':
         src = curSource();
@@ -1977,15 +2052,18 @@ function create(host) {
       case 'findbest':
         res = model.findBest(g.bestN);
         setStatus('Find best: ' + (res ? res.placed : 0) + ' slices');
+        appendDropped();
         break;
       case 'chokescope':
         model.setGlobal('chokeScope', CHOKE_SCOPES[clampInt(v, 0, 1)]);
         break;
       case 'modzone':
         model.setGlobal('modZoneOn', toBool(v));
+        appendDropped();
         break;
       case 'modstart':
         model.setGlobal('modZoneStart', clampInt(v, 0, 112));
+        appendDropped();
         break;
       case 'velsens':
         model.setGlobal('velSens', clamp(num(v, 50), 0, 100));
@@ -2083,6 +2161,17 @@ function create(host) {
       }
     }
     forceFb = true;
+    appendDropped();
+  }
+
+  // Manual cuts snap to a zero crossing like the automatic ones when the sample's
+  // Snap is on (and its audio is loaded).
+  function snapFrame(src, frame) {
+    var mono = monoCache[src.id];
+    var snapped;
+    if (!mono || !src.slicing.snap) { return frame; }
+    snapped = Slicing.snapToZeroCrossings(mono, [frame], Math.round(0.002 * (src.sr > 0 ? src.sr : 44100)));
+    return (snapped && snapped.length) ? snapped[0] : frame;
   }
 
   function onUi(a) {
@@ -2152,16 +2241,32 @@ function create(host) {
         return;
       case 'addslice':
         if (!src) { return; }
-        frame = toFrame(a[1], src);
+        if (src.slices.length >= maxSlices()) {
+          setStatus('Limited to ' + maxSlices() + ' slices');
+          forceFb = true;
+          return;
+        }
+        frame = snapFrame(src, toFrame(a[1], src));
         model.addSlicePoint(src.id, frame);
         afterSliceEdit(src, frame);
         return;
       case 'moveslice':
         if (!src) { return; }
         i = toInt(a[1], -1);
-        frame = toFrame(a[2], src);
+        frame = snapFrame(src, toFrame(a[2], src));
         model.moveSlicePoint(src.id, i, frame);
         afterSliceEdit(src, frame);
+        return;
+      case 'swap':
+        // drag a key onto another key: the pads (and locks) trade places
+        k = toInt(a[1], -1);
+        i = toInt(a[2], -1);
+        if (k < 0 || k > 127 || i < 0 || i > 127 || k === i) { return; }
+        if (model.swapKeys(k, i)) {
+          armed = '';
+          selectKey(i);
+          setStatus('Swapped keys ' + k + ' and ' + i);
+        }
         return;
       case 'removeslice':
         if (!src) { return; }

@@ -2568,3 +2568,259 @@ test('notifydeleted stops the ticker and tolerates pending capture loads', () =>
   assert.equal(tickerRunning(w), false);
   assert.doesNotThrow(() => w.advance(1000));
 });
+
+// ===========================================================================
+// v2 fixes: ui swap, snapped manual cuts, re-link on drop, dropped-slice and cap reporting
+// ===========================================================================
+
+const SlicingCore = require('../core/slicing');
+const DROPPED_RE = / — (\d+) slices? (didn't|did not) fit on the keys \(try Find best or another root\)$/;
+
+test('ui swap trades two keys, selection follows to the target key, undo restores', () => {
+  const w = loadedWorld(['/audio/a.wav', '/audio/b.wav']);
+  const before = w.state().slots[0].keys.slice();
+  w.send('ui', 'selectkey', 38);
+  w.send('ui', 'swap', 38, 42);
+  w.settle();
+  const after = w.state().slots[0].keys;
+  assert.equal(after[38], before[42]);
+  assert.equal(after[42], before[38]);
+  assert.equal(after[39], before[39]);
+  assert.equal(w.view().selectedKey, 42, 'selection follows the dragged pad');
+  assert.equal(w.glue().status, 'Swapped keys 38 and 42');
+  assert.equal(w.state().slots[0].auto, false, 'a manual op');
+  w.send('kit', 'undo');
+  w.settle();
+  assert.deepEqual(w.state().slots[0].keys, before);
+
+  // a pad dragged to an empty key moves there
+  w.send('ui', 'swap', 40, 120);
+  w.settle();
+  assert.equal(w.state().slots[0].keys[120], before[40]);
+  assert.equal(w.state().slots[0].keys[40], null);
+  assert.equal(w.view().selectedKey, 120);
+
+  // same key, out of range, garbage: nothing happens
+  const keys = JSON.stringify(w.state().slots[0].keys);
+  for (const m of [['ui', 'swap', 5, 5], ['ui', 'swap', -1, 3], ['ui', 'swap', 3, 200], ['ui', 'swap', 'x', 'y'], ['ui', 'swap']]) {
+    assert.doesNotThrow(() => w.send(...m));
+  }
+  w.settle();
+  assert.equal(JSON.stringify(w.state().slots[0].keys), keys);
+});
+
+test('ui swap is a map change: keep clip rewrites the clip notes', () => {
+  const clip = makeClip(CLIP_NOTES);
+  const w = clipWorld(clip);
+  w.send('kit', 'keepclip', 1);
+  const before = slotKeysOf(w).slice();
+  w.send('ui', 'swap', 36, 37);
+  w.settle();
+  assert.equal(applyCalls(w).length, 1);
+  const changed = w.plain(applyCalls(w)[0].args[0]).notes;
+  assert.deepEqual(changed.map((n) => [n.note_id, n.pitch]).sort(), [[1, 37], [2, 36]]);
+  assert.equal(slotKeysOf(w)[37], before[36]);
+  assert.deepEqual(clip.notes.slice(0, 3).map((n) => n.pitch), [37, 36, 38]);
+  assert.equal(w.glue().status, 'Clip remapped: 2 notes');
+});
+
+test('manual cuts snap to zero crossings when the sample Snap is on, and only then', () => {
+  const w = loadedWorld();
+  const src = w.state().sources[0];
+  const mono = w.glue().monoCache[src.id];
+  const radius = Math.round(0.002 * src.sr);
+  const snapOf = (f) => SlicingCore.snapToZeroCrossings(mono, [f], radius)[0];
+  const pick = (lo, hi) => {
+    for (let f = lo; f < hi; f++) { if (snapOf(f) !== f) { return f; } }
+    throw new Error('no frame that moves when snapped');
+  };
+  assert.equal(src.slicing.snap, true);
+
+  // add: the cut lands on the snapped frame
+  const slice = src.slices[src.slices.length - 1];
+  const f1 = pick(slice.start + 5000, slice.end - 3000);
+  w.send('ui', 'addslice', f1);
+  w.settle();
+  let starts = w.state().sources[0].slices.map((s) => s.start);
+  assert.ok(starts.includes(snapOf(f1)), 'snapped cut present');
+  assert.ok(!starts.includes(f1), 'raw frame is not a cut');
+  assert.equal(w.state().sources[0].slicing.mode, 'manual');
+
+  // move: the dragged cut is snapped too
+  const s = w.state().sources[0];
+  const idx = 1;
+  const f2 = pick(s.slices[idx - 1].start + 400, s.slices[idx].end - 400);
+  w.send('ui', 'moveslice', idx, f2);
+  w.settle();
+  assert.equal(w.state().sources[0].slices[idx].start, snapOf(f2));
+  assert.notEqual(snapOf(f2), f2);
+
+  // Snap off: cuts land exactly where they are put
+  w.send('source', 'snap', 0);
+  w.settle();
+  assert.equal(w.state().sources[0].slicing.snap, false);
+  const s2 = w.state().sources[0];
+  const last = s2.slices[s2.slices.length - 1];
+  const f3 = pick(last.start + 300, last.end - 300);
+  w.send('ui', 'addslice', f3);
+  w.settle();
+  starts = w.state().sources[0].slices.map((x) => x.start);
+  assert.ok(starts.includes(f3), 'exact cut with Snap off');
+  const s3 = w.state().sources[0];
+  const f4 = pick(s3.slices[1].start + 300, s3.slices[1].end - 300);
+  w.send('ui', 'moveslice', 1, f4);
+  w.settle();
+  assert.equal(w.state().sources[0].slices[1].start, f4);
+});
+
+test('dropping a file named like a sample that failed to load re-links that sample (no new source, no reslice)', () => {
+  const w1 = loadedWorld(['/audio/drums.wav']);
+  w1.send('ui', 'selectkey', 38);
+  w1.send('pad', 'pitch', 7);
+  w1.settle();
+  const saved = w1.state();
+
+  const w2 = createWorld({ dicts: w1.dicts, autoload: false });
+  w2.send('init');
+  w2.advance(31000);
+  assert.equal(w2.glue().status, 'Missing file: drums.wav');
+  assert.equal(w2.model().listSources().length, 1, 'the sample is kept');
+  assert.equal(w2.view().sources[0].loaded, 0);
+
+  // a different name does not relink
+  w2.autoload = true;
+  w2.clear();
+  w2.send('drop', '/moved/other.wav');
+  w2.settle();
+  assert.equal(w2.model().listSources().length, 2);
+  w2.send('ui', 'selectsource', 1);
+  w2.send('source', 'remove');
+  w2.settle();
+  assert.equal(w2.model().listSources().length, 1);
+
+  w2.clear();
+  w2.send('drop', '/moved/DRUMS.wav');                      // same name, other folder, other case
+  assert.deepEqual(w2.out(1), [[0, 'replace', '/moved/DRUMS.wav']]);
+  assert.equal(w2.glue().status, 'Re-linked drums.wav');
+  assert.equal(w2.model().listSources().length, 1, 'no duplicate source');
+  w2.settle();
+  const st = w2.state();
+  assert.equal(st.sources.length, 1);
+  assert.equal(st.sources[0].path, '/moved/DRUMS.wav', 'the new path is saved');
+  assert.equal(st.sources[0].id, saved.sources[0].id);
+  assert.deepEqual(st.sources[0].slices, saved.sources[0].slices, 'slices untouched: restored, not resliced');
+  assert.equal(padOnKey(st, 38).pitch, 7, 'pad edits kept');
+  assert.equal(w2.view().sources[0].loaded, 1);
+  assert.equal(w2.glue().status, 'Re-linked drums.wav');
+
+  // now it is loaded: the same name is just another sample
+  w2.send('drop', '/elsewhere/drums.wav');
+  w2.settle();
+  assert.equal(w2.model().listSources().length, 2);
+
+  // a sample that is still loading is not a relink target
+  const w3 = createWorld({ dicts: w1.dicts, autoload: false });
+  w3.send('init');
+  w3.send('drop', '/moved/drums.wav');
+  assert.equal(w3.model().listSources().length, 2);
+});
+
+test('slices that did not fit on the keys are reported after loads, reslices, layout changes and Find best', () => {
+  const w = loadedWorld(['/audio/a.wav']);
+  let dropped = 0;
+  w.glue().model.lastLayout = () => ({ placed: 90, dropped, slot: 0 });   // the model reports the last layout
+  const note = () => { const m = DROPPED_RE.exec(w.glue().status); return m ? Number(m[1]) : 0; };
+  const text = " — 7 slices didn't fit on the keys (try Find best or another root)";
+
+  dropped = 7;
+  w.send('kit', 'root', 100);
+  assert.ok(w.glue().status.endsWith(text), w.glue().status);
+  w.send('kit', 'zonealign', 1);                       // again: replaced, never doubled
+  assert.equal(w.glue().status.split("didn't fit").length, 2);
+  assert.equal(note(), 7);
+  for (const m of [['kit', 'layout', 1], ['kit', 'sortby', 1], ['kit', 'modzone', 1], ['kit', 'modstart', 80], ['kit', 'relayout'],
+    ['kit', 'findbest'], ['source', 'sensitivity', 60], ['source', 'reslice']]) {
+    w.send('kit', 'seed', 1);                            // an unrelated change leaves the status alone
+    dropped = 3;
+    w.send(...m);
+    assert.equal(note(), 3, JSON.stringify(m) + ' -> ' + w.glue().status);
+    dropped = 7;
+  }
+  const unrelated = w.glue().status;
+  w.send('ui', 'selectkey', 40);
+  w.send('kit', 'seed', 9);
+  assert.equal(w.glue().status, unrelated, 'unrelated messages do not touch the status');
+
+  dropped = 1;
+  w.send('kit', 'root', 36);
+  assert.match(w.glue().status, / — 1 slice didn't fit on the keys/);
+  dropped = 0;
+  w.send('kit', 'root', 36);
+  w.send('kit', 'relayout');
+  assert.ok(!/fit on the keys/.test(w.glue().status), w.glue().status);
+
+  // slice edits and loads
+  dropped = 5;
+  w.send('ui', 'addslice', 30000);
+  assert.equal(note(), 5);
+  w.send('drop', '/audio/b.wav');
+  w.settle();
+  assert.match(w.glue().status, /^Loaded b\.wav: \d+ slices — 5 slices didn't fit on the keys/);
+});
+
+test('real layout overflow is reported when the model supports lastLayout()', (t) => {
+  const w = loadedWorld(['/audio/a.wav', '/audio/b.wav']);
+  if (typeof w.model().lastLayout !== 'function') { t.skip('model.lastLayout() not available yet'); return; }
+  w.send('kit', 'root', 100);
+  const ll = w.plain(w.model().lastLayout());
+  assert.ok(ll.dropped > 0, 'two samples do not fit above key 100');
+  assert.match(w.glue().status, new RegExp(' — ' + ll.dropped + ' slices? '));
+  w.send('kit', 'root', 36);
+  assert.ok(!/fit on the keys/.test(w.glue().status));
+});
+
+test('the 128-slice cap is reported: reslice, manual add, Simpler import', () => {
+  const w = loadedWorld(['/audio/drums.wav']);
+  w.send('source', 'minslice', 5);
+  w.send('source', 'slicemode', 2);
+  w.send('source', 'regions', 128);
+  w.settle();
+  const s = w.state().sources[0];
+  assert.equal(s.slices.length, 128);
+  assert.equal(w.glue().status, 'drums.wav: 128 slices — Limited to 128 slices');
+
+  // a manual add beyond the cap is refused with a status
+  w.send('ui', 'addslice', 35000);
+  w.settle();
+  assert.equal(w.glue().status, 'Limited to 128 slices');
+  assert.equal(w.state().sources[0].slices.length, 128);
+  assert.equal(w.state().sources[0].slicing.mode, 'region', 'untouched');
+
+  // below the cap nothing is said
+  w.send('source', 'regions', 20);
+  w.settle();
+  assert.equal(w.glue().status, 'drums.wav: 20 slices');
+  w.send('ui', 'addslice', 35011);
+  w.settle();
+  assert.equal(w.state().sources[0].slices.length, 21);
+  assert.ok(!/Limited/.test(w.glue().status));
+
+  // Simpler import: points beyond the cap are dropped
+  const points = [];
+  for (let i = 0; i < 200; i++) { points.push(i * 300); }                     // 0, 300, ... 59700
+  const live = simplerTree({
+    'live_set tracks 0 devices 0 sample': { id: 9, props: { file_path: ['/audio/many.wav'], slices: points } }
+  });
+  const w2 = createWorld({ live });
+  w2.init();
+  w2.send('source', 'simplerscan');
+  w2.send('source', 'fromsimpler', 0);
+  w2.settle();
+  const imp = w2.state().sources[0];
+  assert.equal(imp.slices.length, 128);
+  assert.deepEqual(imp.slices.slice(0, 3).map((x) => x.start), [0, 300, 600]);
+  assert.equal(imp.slices[127].start, 127 * 300);
+  assert.equal(imp.slices[127].end, imp.frames, 'the last slice takes the rest');
+  assert.equal(imp.slicing.mode, 'manual');
+  assert.equal(w2.glue().status, 'Loaded many.wav: 128 slices — Limited to 128 slices');
+});

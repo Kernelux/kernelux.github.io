@@ -13,6 +13,7 @@
  *     selectsource <index>   selectkey <key>   audition <key> <vel>
  *     auditionoff <key>      selectslice <i>   addslice <frame>
  *     moveslice <i> <frame>  removeslice <i>   lock <key>
+ *     swap <fromKey> <toKey>   (drag a key onto another key)
  *
  * Besides the fields documented in PROTOCOL.md the view may carry
  *     selectedFrames   frame count of the selected source (needed to turn a
@@ -77,6 +78,8 @@ var BLACK_W_SHARE = 0.6;
 var MARKER_TOL = 4;
 var DRAG_THRESHOLD = 3;
 var AUDITION_VEL = 100;
+var SWAP_THRESHOLD = 4;       /* px a key press must travel before it becomes a swap drag */
+var HOVER_MS = 450;           /* dwell on a < > arrow while swap-dragging before the window scrolls */
 
 var FLAG_LOCK = 1;
 var FLAG_REV = 2;
@@ -124,6 +127,7 @@ var COL = {
     editB: [1, 0.45, 0.28],
     morphTxt: [1, 0.66, 0.48],
     scanTxt: [0.56, 0.86, 0.56],
+    swap: [1, 0.42, 0.78],
     sounding: [1, 0.93, 0.37],
     ink: [0.05, 0.05, 0.05],
     inkLight: [0.92, 0.92, 0.92]
@@ -732,6 +736,7 @@ var size = { w: DEFAULT_W, h: DEFAULT_H };
 var gotResize = false;
 var layout = computeLayout(DEFAULT_W, DEFAULT_H);
 var drag = null;        /* active mouse gesture, see onclick() */
+var scrollTask = null;  /* Max Task that scrolls the key window while swap-dragging over < > */
 var ghost = null;       /* {index, norm}: marker shown at its dragged position until the next refresh */
 var note = '';          /* transient status text that replaces view.status until the next refresh */
 var fontSize = -1;
@@ -861,10 +866,113 @@ function abortDrag() {
     if (drag && drag.type === 'audition') {
         emit('auditionoff', drag.key);
     }
+    stopScroll();
     drag = null;
 }
 
-function keyDown(k, cmd, shift) {
+/* ---- swap drag: press a key, drag it onto another key, release ---- */
+
+function stopScroll() {
+    if (scrollTask) {
+        try {
+            scrollTask.cancel();
+        } catch (e) {
+            /* nothing scheduled */
+        }
+    }
+}
+
+/* arm the dwell timer; false when Max's Task is not available */
+function startScroll() {
+    if (typeof Task !== 'function') {
+        return false;
+    }
+    try {
+        if (!scrollTask) {
+            scrollTask = new Task(scrollTick, host);
+        }
+        scrollTask.schedule(HOVER_MS);
+        return true;
+    } catch (e) {
+        scrollTask = null;
+        return false;
+    }
+}
+
+function scrollTick() {
+    if (!drag || drag.type !== 'swap' || !drag.hover) {
+        return;
+    }
+    var before = winStart;
+    shiftWindow(drag.hover);
+    drag.hoverAt = Date.now();
+    if (winStart !== before) {
+        drag.timer = startScroll();
+    }
+}
+
+/* the pointer is over the < (-1) or > (+1) arrow, or over neither (0) */
+function hoverArrow(dir) {
+    if (dir === drag.hover) {
+        /* without a Task the dwell is measured on drag events */
+        if (dir && !drag.timer && Date.now() - drag.hoverAt >= HOVER_MS) {
+            drag.hoverAt = Date.now();
+            shiftWindow(dir);
+        }
+        return;
+    }
+    stopScroll();
+    drag.hover = dir;
+    drag.hoverAt = Date.now();
+    drag.timer = dir ? startScroll() : false;
+    redraw();
+}
+
+/* {from, to} while a key is being dragged away from its place (to = -1: not over a key), else null */
+function swapDrag() {
+    if (drag && drag.type === 'swap' && drag.moved) {
+        return { from: drag.key, to: drag.target };
+    }
+    return null;
+}
+
+function swapText(from, to) {
+    return 'swap ' + noteName(from) + ' \u2192 ' + (to >= 0 ? noteName(to) : '?');
+}
+
+function dragSwap(x, y) {
+    if (!drag.moved) {
+        var dx = x - drag.x0;
+        var dy = y - drag.y0;
+        if (dx * dx + dy * dy < SWAP_THRESHOLD * SWAP_THRESHOLD) {
+            return;
+        }
+        drag.moved = true;
+    }
+    var hit = hitTest(layout, view, winStart, x, y);
+    var target = (hit.zone === 'key' && hit.key !== drag.key) ? hit.key : -1;
+    var dir = hit.zone === 'prev' ? -1 : (hit.zone === 'next' ? 1 : 0);
+    hoverArrow(dir);
+    if (target !== drag.target || !drag.shown) {
+        drag.target = target;
+        drag.shown = true;
+        redraw();
+    }
+}
+
+/* releasing on another key swaps; anywhere else (same key, arrows, outside) cancels */
+function releaseSwap(x, y) {
+    stopScroll();
+    if (!drag.moved) {
+        return;
+    }
+    var hit = hitTest(layout, view, winStart, x, y);
+    if (hit.zone === 'key' && hit.key !== drag.key) {
+        emit('swap', drag.key, hit.key);
+    }
+}
+
+function keyDown(k, cmd, shift, x, y) {
     if (cmd) {
         emit('lock', k);
     } else if (shift) {
@@ -872,6 +980,7 @@ function keyDown(k, cmd, shift) {
         drag = { type: 'audition', key: k };
     } else {
         emit('selectkey', k);
+        drag = { type: 'swap', key: k, x0: x, y0: y, moved: false, target: -1, shown: false, hover: 0, hoverAt: 0, timer: false };
     }
 }
 
@@ -922,7 +1031,7 @@ function onclick(x, y, but, cmd, shift, capslock, option, ctrl) {
     } else if (hit.zone === 'next') {
         shiftWindow(1);
     } else if (hit.zone === 'key') {
-        keyDown(hit.key, cmd || ctrl, shift);
+        keyDown(hit.key, cmd || ctrl, shift, x, y);
     }
 }
 
@@ -967,6 +1076,8 @@ function ondrag(x, y, but, cmd, shift, capslock, option, ctrl) {
     if (but) {
         if (drag.type === 'marker') {
             dragMarker(x);
+        } else if (drag.type === 'swap') {
+            dragSwap(x, y);
         }
         return;
     }
@@ -974,6 +1085,8 @@ function ondrag(x, y, but, cmd, shift, capslock, option, ctrl) {
         releaseMarker(x);
     } else if (drag.type === 'audition') {
         emit('auditionoff', drag.key);
+    } else if (drag.type === 'swap') {
+        releaseSwap(x, y);
     }
     drag = null;
     redraw();
@@ -996,10 +1109,14 @@ function ondblclick(x, y, but, cmd, shift, capslock, option, ctrl) {
     }
 }
 
-/* mouse moves with no button down: a pending audition lost its release */
+/* mouse moves with no button down: a pending audition / swap lost its release */
 function onidle(x, y) {
-    if (drag && drag.type === 'audition') {
+    if (drag && (drag.type === 'audition' || drag.type === 'swap')) {
+        var wasSwap = drag.type === 'swap' && drag.moved;
         abortDrag();
+        if (wasSwap) {
+            redraw();
+        }
     }
 }
 
@@ -1296,6 +1413,12 @@ function paintKey(L, v, k) {
     if (isGesture) {
         fill = mixRgb(fill, COL.gesture, 0.6);
     }
+    var swp = swapDrag();
+    if (swp && k === swp.from) {
+        fill = mixRgb(fill, COL.black, 0.45);     /* picked up */
+    } else if (swp && k === swp.to) {
+        fill = mixRgb(fill, COL.swap, 0.5);       /* drop target */
+    }
     fillRect(r.x, r.y, r.w, r.h, fill, 1);
     strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1, COL.keyLine, 0.9, 1);
 
@@ -1373,8 +1496,8 @@ function paintKey(L, v, k) {
     }
 }
 
-function paintArrow(r, dir, enabled) {
-    fillRect(r.x, r.y, r.w, r.h, COL.chip, enabled ? 1 : 0.5);
+function paintArrow(r, dir, enabled, hot) {
+    fillRect(r.x, r.y, r.w, r.h, hot ? mixRgb(COL.chipSel, COL.swap, 0.35) : COL.chip, enabled ? 1 : 0.5);
     var cx = r.x + r.w / 2;
     var cy = r.y + r.h / 2;
     setRGBA(COL.text, enabled ? 0.9 : 0.25);
@@ -1390,8 +1513,9 @@ function paintKeys(L, v) {
     var ws = winStart;
     var k;
     fillRect(L.board.x, L.board.y, L.board.w, L.board.h, COL.panel, 1);
-    paintArrow(L.prev, -1, ws > 0);
-    paintArrow(L.next, 1, ws < MAX_WIN_START);
+    var sw = swapDrag();
+    paintArrow(L.prev, -1, ws > 0, !!sw && drag.hover === -1);
+    paintArrow(L.next, 1, ws < MAX_WIN_START, !!sw && drag.hover === 1);
 
     for (k = ws; k < ws + WIN_KEYS; k++) {
         if (!isBlackKey(k)) {
@@ -1416,6 +1540,14 @@ function paintKeys(L, v) {
     }
     if (v.selectedKey >= ws && v.selectedKey < ws + WIN_KEYS) {
         strokePoly(keyPolygon(L, ws, v.selectedKey), COL.white, 1, 2);
+    }
+    if (sw) {
+        if (sw.from >= ws && sw.from < ws + WIN_KEYS) {
+            strokePoly(keyPolygon(L, ws, sw.from), COL.swap, 0.9, 1);
+        }
+        if (sw.to >= ws && sw.to < ws + WIN_KEYS) {
+            strokePoly(keyPolygon(L, ws, sw.to), COL.swap, 1, 3);
+        }
     }
 }
 
@@ -1474,7 +1606,8 @@ function paintStatus(L, v) {
      * does not fit at all (then a bare "B"); the others make way for the
      * status text once less than STATUS_MIN_TEXT px would remain for it.
      */
-    var text = note || v.status;
+    var sd = swapDrag();
+    var text = sd ? swapText(sd.from, sd.to) : (note || v.status);
     var left = r.x + 4;
     var inds = statusIndicators(v);
     for (var i = 0; i < inds.length; i++) {
@@ -1504,7 +1637,7 @@ function paintStatus(L, v) {
             }
         }
     }
-    drawText(fitText(text, right - left, 9), left, base, 9, note ? COL.amber : COL.text, 1, 'left');
+    drawText(fitText(text, right - left, 9), left, base, 9, sd ? COL.swap : (note ? COL.amber : COL.text), 1, 'left');
 }
 
 function paint() {
@@ -1533,7 +1666,9 @@ if (typeof module !== 'undefined' && module.exports) {
             FLAG_MORPHB: FLAG_MORPHB,
             GESTURE_COUNT: GESTURE_COUNT,
             GESTURE_OFFSET: GESTURE_OFFSET,
-            STATUS_MIN_TEXT: STATUS_MIN_TEXT
+            STATUS_MIN_TEXT: STATUS_MIN_TEXT,
+            SWAP_THRESHOLD: SWAP_THRESHOLD,
+            HOVER_MS: HOVER_MS
         },
         normalizeView: normalizeView,
         computeLayout: computeLayout,
@@ -1564,6 +1699,7 @@ if (typeof module !== 'undefined' && module.exports) {
         gestureKey: gestureKey,
         morphMarkPoly: morphMarkPoly,
         statusIndicators: statusIndicators,
+        swapText: swapText,
         hexToRgb: hexToRgb,
         fitText: fitText
     };

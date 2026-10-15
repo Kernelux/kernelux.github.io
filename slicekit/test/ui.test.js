@@ -38,6 +38,7 @@ function load(opts) {
   const out = [];
   const posts = [];
   const dicts = {};
+  const tasks = [];
   const mg = { relative_coords: 1, autofill: 1 };
   MG_METHODS.forEach((name) => {
     mg[name] = (...a) => { log.push([name, ...a]); };
@@ -58,11 +59,27 @@ function load(opts) {
     jsarguments: opts.jsarguments || ['slicekit-ui.js'],
     module: { exports: {} }
   };
+  /* Max's Task: schedule(ms) arms it, cancel() disarms it; env.tick() fires the armed ones */
+  if (!opts.noTask) {
+    sandbox.Task = function Task(fn, obj) {
+      this.pending = null;
+      this.cancels = 0;
+      this.schedule = (ms) => { this.pending = ms; };
+      this.cancel = () => { this.pending = null; this.cancels++; };
+      this.fire = () => { this.pending = null; fn.call(obj); };
+      tasks.push(this);
+    };
+  }
   vm.createContext(sandbox);
   vm.runInContext(SRC, sandbox, { filename: 'ui.js' });
 
   const env = {
-    sb: sandbox, ex: sandbox.module.exports, mg, log, out, posts, dicts,
+    sb: sandbox, ex: sandbox.module.exports, mg, log, out, posts, dicts, tasks,
+    tick() {
+      const armed = tasks.filter((t) => t.pending !== null);
+      armed.forEach((t) => t.fire());
+      return armed.length;
+    },
     get: (expr) => vm.runInContext(expr, sandbox),
     set: (name, view) => { dicts[name] = view; },
     show(view, name) {
@@ -1719,4 +1736,493 @@ test('v2 additions keep the file ES5 / ASCII and use only mocked mgraphics calls
   }
   /* no ES6+ syntax slipped into the new code: no arrows, spread, template strings, let/const */
   assert.ok(!/=>|`|\blet\b|\bconst\b/.test(code.replace(/'(?:[^'\\\n]|\\.)*'/g, "''")));
+});
+
+/* ============================================================ drag-to-swap keys */
+
+const ARROW = '→';
+
+function swapEnv(over, opts) {
+  const env = load(opts);
+  env.show(makeView(Object.assign({ selectedKey: -1 }, over || {})));
+  env.clear();
+  return env;
+}
+
+function arrowPoint(env, dir) {
+  const L = env.ex.computeLayout(600, 160);
+  const r = dir < 0 ? L.prev : L.next;
+  return { x: r.x + r.w / 2, y: r.y + r.h / 2 };
+}
+
+/* press `from`, move through `via` (key numbers or {x, y}), release at `to` */
+function dragKeys(env, from, via, to, mods) {
+  const at = (t) => (typeof t === 'number' ? keyPoint(env, t) : t);
+  const p = at(from);
+  env.click(p.x, p.y, mods);
+  via.forEach((t) => { const q = at(t); env.drag(q.x, q.y, mods); });
+  const e = at(to);
+  env.release(e.x, e.y);
+}
+
+/* does the last paint use this rgb for any set_source_rgba? */
+function usesColor(env, rgb) {
+  return env.log.some((c) => c[0] === 'set_source_rgba' && rgb.every((v, i) => Math.abs(c[1 + i] - v) < 1e-9));
+}
+
+test('swap: dragging a key onto another key sends selectkey then swap on release', () => {
+  const pairs = [[60, 62], [60, 61], [61, 60], [62, 65], [36, 83], [83, 36], [40, 41], [37, 38]];
+  for (const [a, b] of pairs) {
+    const env = swapEnv();
+    dragKeys(env, a, [b], b);
+    assert.deepEqual(env.msgs(), [`selectkey ${a}`, `swap ${a} ${b}`], `${a} -> ${b}`);
+    assert.equal(env.get('drag'), null);
+  }
+  /* the pointer may wander over other keys on the way; only the release position counts */
+  const env = swapEnv();
+  dragKeys(env, 60, [62, 64, 66, 47], 71);
+  assert.deepEqual(env.msgs(), ['selectkey 60', 'swap 60 71']);
+  /* a release event without any drag event in between (fast flick) still swaps */
+  const env2 = swapEnv();
+  dragKeys(env2, 60, [], 70);
+  assert.deepEqual(env2.msgs(), ['selectkey 60', 'swap 60 70']);
+  /* nothing is sent while dragging */
+  const env3 = swapEnv();
+  const p = keyPoint(env3, 60);
+  const q = keyPoint(env3, 70);
+  env3.click(p.x, p.y);
+  env3.drag(q.x, q.y);
+  assert.deepEqual(env3.msgs(), ['selectkey 60']);
+  env3.release(q.x, q.y);
+  assert.deepEqual(env3.msgs(), ['selectkey 60', 'swap 60 70']);
+  /* a second drag works too */
+  dragKeys(env3, 70, [72], 72);
+  assert.deepEqual(env3.msgs().slice(2), ['selectkey 70', 'swap 70 72']);
+});
+
+test('swap: a press and release on one key is just selectkey, as before', () => {
+  const env = swapEnv();
+  const expected = [];
+  for (let k = 36; k < 84; k++) {
+    const p = keyPoint(env, k);
+    env.click(p.x, p.y);
+    env.release(p.x, p.y);
+    expected.push('selectkey ' + k);
+  }
+  assert.deepEqual(env.msgs(), expected);
+  /* a few pixels of jitter inside the key too */
+  env.clear();
+  const p = keyPoint(env, 60);
+  env.click(p.x, p.y);
+  env.drag(p.x + 2, p.y + 1);
+  env.release(p.x + 2, p.y + 1);
+  assert.deepEqual(env.msgs(), ['selectkey 60']);
+});
+
+test('swap: releasing on the same key, outside the strip or on an arrow cancels', () => {
+  const lay = load().ex.computeLayout(600, 160);
+  const cancels = {
+    'dragged away and back to the same key': (env) => dragKeys(env, 60, [70, 60], 60),
+    'released on the source key after a long walk': (env) => dragKeys(env, 60, [80, 40, 61], 60),
+    'released in the waveform': (env) => dragKeys(env, 60, [70], { x: 300, y: lay.wave.y + 10 }),
+    'released above the canvas': (env) => dragKeys(env, 60, [70], { x: 300, y: -20 }),
+    'released in the status line': (env) => dragKeys(env, 60, [70], { x: 300, y: lay.status.y + 3 }),
+    'released in the gap under the keys': (env) => dragKeys(env, 60, [70], { x: 300, y: lay.keys.y + lay.keys.h + 0.5 }),
+    'released left of the canvas': (env) => dragKeys(env, 60, [70], { x: -40, y: lay.keys.y + 10 }),
+    'released right of the canvas': (env) => dragKeys(env, 60, [70], { x: 5000, y: lay.keys.y + 10 }),
+    'released on the < arrow': (env) => dragKeys(env, 60, [70], arrowPoint(env, -1)),
+    'released on the > arrow': (env) => dragKeys(env, 60, [70], arrowPoint(env, 1)),
+    'released on the tabs': (env) => dragKeys(env, 60, [70], { x: 20, y: 8 })
+  };
+  for (const [label, run] of Object.entries(cancels)) {
+    const env = swapEnv();
+    run(env);
+    assert.deepEqual(env.msgs(), ['selectkey 60'], label);
+    assert.equal(env.get('drag'), null, label);
+    assert.equal(env.get('winStart'), 36, `${label}: window unchanged`);
+    /* and the view is clean again afterwards */
+    env.paint();
+    assert.ok(!usesColor(env, plain(env.get('COL.swap'))), `${label}: no swap highlight left`);
+    assert.ok(!env.texts().some((t) => /^swap /.test(t)), `${label}: no swap status left`);
+  }
+});
+
+test('swap: a few pixels of movement across a key border is not a swap', () => {
+  const env = swapEnv();
+  const L = env.ex.computeLayout(600, 160);
+  const bx = L.board.x + 15 * L.whiteW;                 /* border of C3 (60) and D3 (62) */
+  const y = L.board.y + L.board.h - 2;                  /* below the black key */
+  assert.equal(env.ex.keyAt(L, 36, bx - 1, y), 60);
+  assert.equal(env.ex.keyAt(L, 36, bx + 1, y), 62);
+  env.click(bx - 1, y);
+  env.drag(bx + 1, y);
+  env.release(bx + 1, y);
+  assert.deepEqual(env.msgs(), ['selectkey 60'], 'under the threshold');
+
+  env.clear();
+  env.click(bx - 2, y);
+  env.drag(bx + 3, y);
+  env.release(bx + 3, y);
+  assert.deepEqual(env.msgs(), ['selectkey 60', 'swap 60 62'], 'over the threshold');
+  assert.equal(env.ex.constants.SWAP_THRESHOLD, 4);
+});
+
+test('swap: shift (audition) and cmd / ctrl (lock) presses never swap', () => {
+  const env = swapEnv();
+  dragKeys(env, 60, [62], 62, { shift: true });
+  assert.deepEqual(env.msgs(), ['audition 60 100', 'auditionoff 60']);
+
+  env.clear();
+  dragKeys(env, 60, [62], 62, { cmd: true });
+  assert.deepEqual(env.msgs(), ['lock 60']);
+  assert.equal(env.get('drag'), null, 'no drag state for a lock click');
+
+  env.clear();
+  dragKeys(env, 60, [62], 62, { ctrl: true });
+  assert.deepEqual(env.msgs(), ['lock 60']);
+
+  /* shift beats nothing: no highlight, no scroll while auditioning over an arrow */
+  env.clear();
+  const p = keyPoint(env, 60);
+  const a = arrowPoint(env, 1);
+  env.click(p.x, p.y, { shift: true });
+  env.drag(a.x, a.y, { shift: true });
+  assert.equal(env.tick(), 0);
+  env.paint();
+  assert.ok(!usesColor(env, plain(env.get('COL.swap'))));
+  env.release(a.x, a.y);
+  assert.deepEqual(env.msgs(), ['audition 60 100', 'auditionoff 60']);
+  assert.equal(env.get('winStart'), 36);
+});
+
+test('swap: other drags and clicks are unaffected', () => {
+  const env = swapEnv();
+  const g = waveGeometry(env);
+  /* marker drag still previews and moves */
+  env.click(g.x(3 / 8), g.y);
+  env.drag(g.x(0.4), g.y);
+  env.release(g.x(0.4), g.y);
+  assert.deepEqual(env.msgs(), ['moveslice 3 ' + Math.round(0.4 * 480000)]);
+  /* a key press starts nothing else, a new press replaces a dangling swap drag */
+  env.clear();
+  const p = keyPoint(env, 60);
+  const q = keyPoint(env, 62);
+  env.click(p.x, p.y);
+  env.click(q.x, q.y);              /* previous release was lost */
+  env.release(q.x, q.y);
+  assert.deepEqual(env.msgs(), ['selectkey 60', 'selectkey 62']);
+  /* tabs and arrows still work after a swap */
+  env.clear();
+  dragKeys(env, 60, [70], 70);
+  const L = env.ex.computeLayout(600, 160);
+  env.click(L.next.x + 5, L.next.y + 10);
+  assert.equal(env.get('winStart'), 48);
+  env.click(env.ex.tabRects(L, 3)[1].x + 3, 8);
+  assert.deepEqual(env.msgs(), ['selectkey 60', 'swap 60 70', 'selectsource 3']);
+});
+
+test('swap: a lost release cancels without a swap; refreshes mid-drag do not disturb it', () => {
+  const env = swapEnv();
+  const p = keyPoint(env, 60);
+  const q = keyPoint(env, 70);
+  env.click(p.x, p.y);
+  env.drag(q.x, q.y);
+  env.sb.onidle(5, 5);
+  assert.deepEqual(env.msgs(), ['selectkey 60'], 'no swap, no auditionoff');
+  assert.equal(env.get('drag'), null);
+  env.release(q.x, q.y);
+  assert.deepEqual(env.msgs(), ['selectkey 60'], 'the late release does nothing');
+
+  /* the glue refreshes the view after selectkey: the drag survives it */
+  env.clear();
+  env.click(p.x, p.y);
+  env.dicts.v = makeView({ selectedKey: 60 });
+  env.sb.refresh();
+  env.drag(q.x, q.y);
+  env.sb.refresh();
+  env.paint();
+  assert.ok(env.texts().includes(`swap C3 ${ARROW} ${'A#'}3`), 'still dragging');
+  env.release(q.x, q.y);
+  assert.deepEqual(env.msgs(), ['selectkey 60', 'swap 60 70']);
+});
+
+test('swap: the status line shows "swap C3 -> D3" while dragging, the plain status otherwise', () => {
+  const { ex } = load();
+  assert.equal(ex.swapText(60, 62), `swap C3 ${ARROW} D3`);
+  assert.equal(ex.swapText(61, 36), `swap C#3 ${ARROW} C1`);
+  assert.equal(ex.swapText(60, -1), `swap C3 ${ARROW} ?`);
+
+  const env = swapEnv({ status: 'Ready - 8 slices' });
+  const p = keyPoint(env, 60);
+  const q = keyPoint(env, 62);
+  env.click(p.x, p.y);
+  env.paint();
+  assert.ok(env.texts().includes('Ready - 8 slices'), 'a bare press shows the normal status');
+  assert.ok(!env.texts().some((t) => /^swap /.test(t)));
+
+  env.drag(q.x, q.y);
+  env.paint();
+  assert.ok(env.texts().includes(`swap C3 ${ARROW} D3`));
+  assert.ok(!env.texts().includes('Ready - 8 slices'));
+  /* the colour of the status text matches the highlight */
+  const i = env.log.findIndex((c) => c[0] === 'show_text' && c[1] === `swap C3 ${ARROW} D3`);
+  assert.deepEqual(env.log[i - 2].slice(1, 4), plain(env.get('COL.swap')));
+
+  env.drag(300, 5);                       /* over the tabs: no target */
+  env.paint();
+  assert.ok(env.texts().includes(`swap C3 ${ARROW} ?`));
+  const r = keyPoint(env, 71);
+  env.drag(r.x, r.y);
+  env.paint();
+  assert.ok(env.texts().includes(`swap C3 ${ARROW} B3`));
+
+  env.release(r.x, r.y);
+  env.paint();
+  assert.ok(env.texts().includes('Ready - 8 slices'));
+  assert.ok(!env.texts().some((t) => /^swap /.test(t)));
+});
+
+test('swap: source and target keys are highlighted while dragging, nothing after', () => {
+  const env = swapEnv();
+  const L = env.ex.computeLayout(600, 160);
+  const swapCol = plain(env.get('COL.swap'));
+  const rectOf = (k) => env.ex.keyRect(L, 36, k);
+  const polyOf = (k) => plain(env.ex.keyPolygon(L, 36, k));
+  const lineWidth = (k) => {
+    const pts = polyOf(k);
+    const i = env.log.findIndex((c, j) => c[0] === 'move_to' && c[1] === pts[0] && c[2] === pts[1] &&
+      env.log[j - 1][0] === 'set_line_width' && env.log[j - 2][0] === 'set_source_rgba' &&
+      swapCol.every((v, n) => Math.abs(env.log[j - 2][1 + n] - v) < 1e-9));
+    return i < 0 ? null : env.log[i - 1][1];
+  };
+
+  env.paint();
+  const base = {};
+  [60, 61, 62, 63].forEach((k) => { base[k] = rectFill(env, rectOf(k)); });
+  assert.ok(!usesColor(env, swapCol));
+
+  const p = keyPoint(env, 60);
+  const q = keyPoint(env, 62);
+  env.click(p.x, p.y);
+  env.drag(p.x + 1, p.y);
+  env.paint();
+  assert.ok(!usesColor(env, swapCol), 'inside the source key nothing is highlighted yet');
+
+  env.drag(q.x, q.y);
+  env.paint();
+  assertSanePaint(env, 'swap drag');
+  assert.equal(polyStrokes(env, polyOf(60), swapCol), 1, 'source outline');
+  assert.equal(polyStrokes(env, polyOf(62), swapCol), 1, 'target outline');
+  assert.equal(polyStrokes(env, polyOf(61), swapCol), 0);
+  assert.equal(polyStrokes(env, polyOf(63), swapCol), 0);
+  assert.equal(lineWidth(60), 1);
+  assert.equal(lineWidth(62), 3, 'the target is outlined more strongly');
+  const lum = (c) => 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
+  const src = rectFill(env, rectOf(60));
+  assert.ok(lum(src) < lum(base[60]), 'source is dimmed');
+  const tgt = rectFill(env, rectOf(62));
+  for (let i = 0; i < 3; i++) {
+    assert.ok(Math.abs(tgt[i] - (base[62][i] + (swapCol[i] - base[62][i]) * 0.5)) < 1e-9, 'target is tinted');
+  }
+  assert.deepEqual(rectFill(env, rectOf(61)), base[61], 'other keys unchanged');
+  assert.deepEqual(rectFill(env, rectOf(63)), base[63]);
+
+  /* moving to another key moves the target highlight */
+  const r = keyPoint(env, 63);
+  env.drag(r.x, r.y);
+  env.paint();
+  assert.equal(polyStrokes(env, polyOf(62), swapCol), 0);
+  assert.equal(polyStrokes(env, polyOf(63), swapCol), 1);
+  assert.equal(polyStrokes(env, polyOf(60), swapCol), 1, 'source stays marked');
+
+  /* off the keys: only the source stays marked */
+  env.drag(300, 5);
+  env.paint();
+  assert.equal(polyStrokes(env, polyOf(63), swapCol), 0);
+  assert.equal(polyStrokes(env, polyOf(60), swapCol), 1);
+
+  /* back on the source key: no target either */
+  env.drag(p.x, p.y);
+  env.paint();
+  assert.equal(polyStrokes(env, polyOf(60), swapCol), 1);
+  assert.equal(env.log.filter((c) => c[0] === 'set_source_rgba' && swapCol.every((v, i) => Math.abs(c[1 + i] - v) < 1e-9) && c[4] === 1).length, 1 /* the status text */);
+
+  env.release(q.x, q.y);
+  env.paint();
+  assert.ok(!usesColor(env, swapCol), 'highlight gone after the release');
+  [60, 61, 62, 63].forEach((k) => { assert.deepEqual(rectFill(env, rectOf(k)), base[k], `key ${k} back to normal`); });
+});
+
+test('swap: highlights work on black keys and next to the gesture / B marks', () => {
+  const v = modZoneView(96, { rootKey: 96, gesture: 1, morphEdit: 1 });
+  v.keyFlags[85] = 64 | 4;
+  v.keys[85] = 2;
+  const env = load();
+  env.show(v);
+  env.clear();
+  const ws = env.get('winStart');
+  const L = env.ex.computeLayout(600, 160);
+  const swapCol = plain(env.get('COL.swap'));
+  const p = env.ex.keyCenter(L, ws, 85);          /* C#: black, has B + layers */
+  const q = env.ex.keyCenter(L, ws, 109);         /* black mod key */
+  env.click(p.x, p.y);
+  env.drag(q.x, q.y);
+  env.paint();
+  assertSanePaint(env, 'swap with marks');
+  assert.equal(polyStrokes(env, plain(env.ex.keyPolygon(L, ws, 85)), swapCol), 1);
+  assert.equal(polyStrokes(env, plain(env.ex.keyPolygon(L, ws, 109)), swapCol), 1);
+  assert.ok(env.texts().includes(`swap ${env.ex.noteName(85)} ${ARROW} ${env.ex.noteName(109)}`));
+  env.release(q.x, q.y);
+  assert.deepEqual(env.msgs().slice(-1), ['swap 85 109']);
+});
+
+test('swap: hovering over an arrow scrolls the window by an octave per dwell (Task)', () => {
+  const env = swapEnv();
+  const p = keyPoint(env, 60);
+  const next = arrowPoint(env, 1);
+  const prev = arrowPoint(env, -1);
+  const arrowRect = env.ex.computeLayout(600, 160).next;
+  const arrowFill0 = (() => { env.paint(); return rectFill(env, arrowRect); })();
+
+  env.click(p.x, p.y);
+  assert.equal(env.tasks.length, 0, 'no timer for a plain press');
+  env.drag(next.x, next.y);
+  assert.equal(env.tasks.length, 1);
+  assert.equal(env.tasks[0].pending, env.ex.constants.HOVER_MS, 'armed with the dwell time');
+  assert.equal(env.get('winStart'), 36, 'nothing scrolls before the dwell');
+  env.drag(next.x + 1, next.y);
+  assert.equal(env.tasks[0].pending, env.ex.constants.HOVER_MS, 'moving on the same arrow does not restart it');
+  env.paint();
+  assert.notDeepEqual(rectFill(env, arrowRect), arrowFill0, 'the hovered arrow lights up');
+
+  assert.equal(env.tick(), 1);
+  assert.equal(env.get('winStart'), 48);
+  assert.equal(env.tasks[0].pending, env.ex.constants.HOVER_MS, 'keeps scrolling while the pointer stays');
+  env.tick();
+  assert.equal(env.get('winStart'), 60);
+
+  /* leaving the arrow stops it */
+  const q = keyPoint(env, 70);
+  env.drag(q.x, q.y);
+  assert.equal(env.tasks[0].pending, null);
+  assert.equal(env.tick(), 0);
+  assert.equal(env.get('winStart'), 60);
+  env.paint();
+  assert.deepEqual(rectFill(env, arrowRect), arrowFill0, 'arrow back to normal');
+
+  /* the window scrolled while dragging: the swap lands on a key that was off-screen */
+  assert.equal(keyPoint(env, 110), null, 'key 110 is off-screen at window 60');
+  env.release(q.x, q.y);
+  assert.deepEqual(env.msgs(), ['selectkey 60', 'swap 60 70']);
+
+  /* second drag: scroll twice, then drop on a key that needed the scroll */
+  env.clear();
+  const s = keyPoint(env, 70);
+  env.click(s.x, s.y);
+  env.drag(next.x, next.y);
+  env.tick();
+  assert.equal(env.get('winStart'), 72);
+  env.tick();
+  assert.equal(env.get('winStart'), 80, 'last window');
+  assert.equal(env.tasks[0].pending, null, 'at the end: no more scrolling');
+  const t = keyPoint(env, 120);
+  env.drag(t.x, t.y);
+  env.paint();
+  assert.equal(polyStrokes(env, plain(env.ex.keyPolygon(env.ex.computeLayout(600, 160), 80, 120)), plain(env.get('COL.swap'))), 1);
+  env.release(t.x, t.y);
+  assert.deepEqual(env.msgs(), ['selectkey 70', 'swap 70 120']);
+
+  /* and back with the < arrow */
+  env.clear();
+  const u = keyPoint(env, 90);
+  env.click(u.x, u.y);
+  env.drag(prev.x, prev.y);
+  env.tick();
+  assert.equal(env.get('winStart'), 72);
+  env.release(prev.x, prev.y);
+  assert.deepEqual(env.msgs(), ['selectkey 90'], 'releasing on the arrow cancels');
+  assert.equal(env.get('winStart'), 72, 'but the scrolled window stays');
+  assert.equal(env.tasks[0].pending, null);
+});
+
+test('swap: the dwell timer is cancelled by release, abort and a lost release', () => {
+  for (const how of ['release', 'idle', 'newpress']) {
+    const env = swapEnv();
+    const p = keyPoint(env, 60);
+    const next = arrowPoint(env, 1);
+    env.click(p.x, p.y);
+    env.drag(next.x, next.y);
+    assert.equal(env.tasks[0].pending, env.ex.constants.HOVER_MS);
+    if (how === 'release') { env.release(next.x, next.y); }
+    if (how === 'idle') { env.sb.onidle(1, 1); }
+    if (how === 'newpress') { env.click(p.x, p.y); }
+    assert.equal(env.tasks[0].pending, null, how);
+    assert.equal(env.tick(), 0, how);
+    assert.equal(env.get('winStart'), 36, how);
+  }
+  /* a stale timer firing after the drag ended does nothing */
+  const env = swapEnv();
+  const p = keyPoint(env, 60);
+  const next = arrowPoint(env, 1);
+  env.click(p.x, p.y);
+  env.drag(next.x, next.y);
+  const task = env.tasks[0];
+  env.release(next.x, next.y);
+  task.fire();
+  assert.equal(env.get('winStart'), 36);
+});
+
+test('swap: without Max Task the dwell is measured on drag events', () => {
+  const env = swapEnv({}, { noTask: true });
+  const p = keyPoint(env, 60);
+  const next = arrowPoint(env, 1);
+  env.click(p.x, p.y);
+  env.drag(next.x, next.y);
+  assert.equal(env.get('winStart'), 36);
+  env.drag(next.x + 1, next.y);
+  assert.equal(env.get('winStart'), 36, 'too early');
+  env.get('drag.hoverAt = 1');                    /* pretend the pointer has been here for a long time */
+  env.drag(next.x + 2, next.y);
+  assert.equal(env.get('winStart'), 48);
+  env.drag(next.x + 1, next.y);
+  assert.equal(env.get('winStart'), 48, 'one octave per dwell');
+  const q = keyPoint(env, 70);
+  env.drag(q.x, q.y);
+  env.release(q.x, q.y);
+  assert.deepEqual(env.msgs(), ['selectkey 60', 'swap 60 70']);
+});
+
+test('swap: a throwing Task constructor falls back to event dwell', () => {
+  const env = swapEnv();
+  env.sb.Task = function Task() { throw new Error('no tasks here'); };
+  const p = keyPoint(env, 60);
+  const next = arrowPoint(env, 1);
+  env.click(p.x, p.y);
+  assert.doesNotThrow(() => env.drag(next.x, next.y));
+  env.get('drag.hoverAt = 1');
+  env.drag(next.x + 1, next.y);
+  assert.equal(env.get('winStart'), 48);
+});
+
+test('swap: painting during a swap drag stays sane at every size and window', () => {
+  for (const [w, h] of [[80, 80], [160, 100], [300, 120], [600, 160], [900, 300], [1400, 200]]) {
+    const env = load({ w, h });
+    env.show(v2View({ armed: 'dup' }));
+    env.sb.onresize(w, h);
+    const L = env.ex.computeLayout(w, h);
+    for (const ws of [0, 36, 61, 80]) {
+      env.get('winStart = ' + ws);
+      const a = env.ex.keyCenter(L, ws, ws + 5);
+      const b = env.ex.keyCenter(L, ws, ws + 30);
+      env.click(a.x, a.y);
+      env.drag(b.x, b.y);
+      assert.doesNotThrow(() => env.paint(), `${w}x${h} ws ${ws}`);
+      assertSanePaint(env, `swap ${w}x${h} ws ${ws}`);
+      env.drag(L.next.x + 3, L.next.y + 3);
+      env.paint();
+      assertSanePaint(env, `swap on arrow ${w}x${h} ws ${ws}`);
+      env.release(b.x, b.y);
+      env.get('winStart = ' + ws);
+    }
+  }
 });

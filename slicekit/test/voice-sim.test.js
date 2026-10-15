@@ -1130,10 +1130,10 @@ test('API: params table, clamping, unknown names, src ignored, setBuffer, null p
   sim.set('trig', 2);
   r = sim.process(200, null);
   assert.ok(r.left[30] > 0.005, 'audio from the buffer set later: ' + r.left[30]);
-  assert.equal(Object.keys(VoiceSim.PARAMS).length, 26);
+  assert.equal(Object.keys(VoiceSim.PARAMS).length, 28);
   const names = ['bufsr', 'pstart', 'pend', 'dir', 'pitch', 'amp', 'att', 'dec', 'sus', 'rel', 'gatemode', 'held',
     'loopon', 'loopsize', 'looppos', 'rptdiv', 'rptswing', 'rptalt', 'cutoff', 'drive', 'tape', 'tapems', 'bpm',
-    'playing', 'trig', 'kill'];
+    'playing', 'trig', 'kill', 'jump', 'redir'];
   assert.deepEqual(Object.keys(VoiceSim.PARAMS), names);
 });
 
@@ -1438,7 +1438,7 @@ test('voice.genexpr: Param declarations match VoiceSim.PARAMS (names, order, def
 test('voice.genexpr: PROTOCOL.md voice parameters are all present', () => {
   const protocol = ['bufsr', 'pstart', 'pend', 'dir', 'pitch', 'amp', 'att', 'dec', 'sus', 'rel', 'gatemode', 'held',
     'loopon', 'loopsize', 'looppos', 'rptdiv', 'rptswing', 'rptalt', 'cutoff', 'drive', 'tape', 'tapems', 'bpm',
-    'playing', 'trig', 'kill'];
+    'playing', 'trig', 'kill', 'jump', 'redir'];
   assert.deepEqual(COMPILED.order.slice().sort(), protocol.slice().sort());
   const docs = path.join(__dirname, '..', 'docs', 'PROTOCOL.md');
   if (fs.existsSync(docs)) {

@@ -758,10 +758,10 @@ test('reverse modifier flips sounding voices with the right pend, and back on re
   const { engine } = posSetup({}, {});
   engine.noteOn(60, 100);
   assert.deepEqual(engine.noteOn(MOD.REVERSE, 100), [
-    { voice: 0, params: [['dir', -1], ['pend', 2000]] }
+    { voice: 0, params: [['dir', -1], ['pend', 2000], ['redir', 1]] }
   ]);
   assert.deepEqual(engine.noteOff(MOD.REVERSE), [
-    { voice: 0, params: [['dir', 1], ['pend', 4000]] }
+    { voice: 0, params: [['dir', 1], ['pend', 4000], ['redir', 2]] }
   ]);
 });
 
@@ -769,10 +769,10 @@ test('reverse modifier with thru: pend is 0 reversed and source end forward', ()
   const { engine } = posSetup({ playMode: 'thru' }, {});
   engine.noteOn(60, 100);
   assert.deepEqual(engine.noteOn(MOD.REVERSE, 100), [
-    { voice: 0, params: [['dir', -1], ['pend', 0]] }
+    { voice: 0, params: [['dir', -1], ['pend', 0], ['redir', 1]] }
   ]);
   assert.deepEqual(engine.noteOff(MOD.REVERSE), [
-    { voice: 0, params: [['dir', 1], ['pend', 10000]] }
+    { voice: 0, params: [['dir', 1], ['pend', 10000], ['redir', 2]] }
   ]);
 });
 
@@ -780,10 +780,10 @@ test('reverse modifier on a reversed pad plays it forward (XOR)', () => {
   const { engine } = posSetup({}, { reverse: true });
   engine.noteOn(60, 100);
   assert.deepEqual(engine.noteOn(MOD.REVERSE, 100), [
-    { voice: 0, params: [['dir', 1], ['pend', 4000]] }
+    { voice: 0, params: [['dir', 1], ['pend', 4000], ['redir', 1]] }
   ]);
   assert.deepEqual(engine.noteOff(MOD.REVERSE), [
-    { voice: 0, params: [['dir', -1], ['pend', 2000]] }
+    { voice: 0, params: [['dir', -1], ['pend', 2000], ['redir', 2]] }
   ]);
   // new note while held: forward
   engine.noteOn(MOD.REVERSE, 100);
@@ -797,7 +797,7 @@ test('notes started while reverse is held are reversed, and flip on release', ()
   const p = pmap(engine.noteOn(60, 100)[0]);
   assert.deepEqual([p.pstart, p.pend, p.dir], [3900, 2000, -1]);
   assert.deepEqual(engine.noteOff(MOD.REVERSE), [
-    { voice: 0, params: [['dir', 1], ['pend', 4000]] }
+    { voice: 0, params: [['dir', 1], ['pend', 4000], ['redir', 1]] }
   ]);
 });
 
@@ -1387,7 +1387,7 @@ test('refreshScan: held main voices switch slice without trig or held', () => {
   const cmds = engine.refreshScan();
   assert.equal(cmds.length, 2);
   assert.deepEqual(cmds.map((c) => c.voice), [0, 1]);
-  const order = ['src', 'bufsr', 'pstart', 'pend', 'dir', 'loopsize', 'looppos', 'pitch', 'amp', 'cutoff', 'drive'];
+  const order = ['src', 'bufsr', 'pstart', 'pend', 'dir', 'loopsize', 'looppos', 'pitch', 'amp', 'cutoff', 'drive', 'jump'];
   for (const c of cmds) {
     assert.deepEqual(names(c), order);
     assert.ok(!names(c).includes('trig') && !names(c).includes('held'));
@@ -1429,8 +1429,8 @@ test('refreshScan: later modifiers, pressure and note off use the new slice of a
   g.scan = 100;                                            // key 60 -> pad B (thru, reversed)
   engine.refreshScan();
   // B is reversed + thru: reverse modifier plays it forward to the end of the source
-  assert.deepEqual(engine.noteOn(MOD.REVERSE, 100), [{ voice: 0, params: [['dir', 1], ['pend', 20000]] }]);
-  assert.deepEqual(engine.noteOff(MOD.REVERSE), [{ voice: 0, params: [['dir', -1], ['pend', 0]] }]);
+  assert.deepEqual(engine.noteOn(MOD.REVERSE, 100), [{ voice: 0, params: [['dir', 1], ['pend', 20000], ['redir', 1]] }]);
+  assert.deepEqual(engine.noteOff(MOD.REVERSE), [{ voice: 0, params: [['dir', -1], ['pend', 0], ['redir', 2]] }]);
   near(pmap(engine.noteOn(MOD.OCTUP, 100)[0]).pitch, 3.5 + 12);
   near(pmap(engine.pressure(127)[0]).amp, dbtoa(-12));
   assert.deepEqual(engine.noteOff(60), [{ voice: 0, params: [['held', 0]] }]);
@@ -1975,6 +1975,226 @@ test('gesture + morph + scan: refreshMorph and refreshScan keep the gesture fact
   near(s.cutoff, 8000 * 0.5);
   near(s.pitch, 3);
   near(s.amp, dbtoa(-12) * 0.5);
+});
+
+// ===========================================================================
+// v2 fixes: jump / redir counters, resuming ended held voices
+// ===========================================================================
+
+test('jump: refreshScan ends with a per-voice jump counter (1, 2, ...), independent of trig', () => {
+  const { engine, g } = scanVoiceSetup();
+  engine.noteOn(60, 100);                                  // v0 trig 1
+  engine.noteOn(61, 100);                                  // v1 trig 1
+  g.scan = 100;
+  let cmds = engine.refreshScan();
+  for (const c of cmds) assert.equal(c.params[c.params.length - 1][0], 'jump', 'jump is the last param');
+  assert.deepEqual(cmds.map((c) => pmap(c).jump), [1, 1]);
+  g.scan = 0;
+  cmds = engine.refreshScan();
+  assert.deepEqual(cmds.map((c) => pmap(c).jump), [2, 2]);
+  g.scan = 100;
+  assert.deepEqual(engine.refreshScan().map((c) => pmap(c).jump), [3, 3]);
+  assert.deepEqual(engine.refreshScan(), []);               // nothing switched: no jump sent
+  // trig is untouched by jumps: restarting a voice still counts trig on its own
+  g.scan = 0;
+  const next = starts(engine.noteOn(60, 100));              // pad A (poly): no choke, free voice v2
+  assert.equal(next.length, 1);
+  assert.equal(pmap(next[0]).trig, 1);
+  assert.ok(!names(next[0]).includes('jump'));
+});
+
+test('jump: a voice that switched twice while another switched once has its own count', () => {
+  const { engine, g } = scanVoiceSetup();
+  engine.noteOn(60, 100);                                  // v0
+  g.scan = 100;
+  engine.refreshScan();                                    // v0 jump 1
+  engine.noteOn(61, 100);                                  // v1, maps to pad A (scan 100)
+  g.scan = 0;
+  const cmds = engine.refreshScan();
+  assert.deepEqual(cmds.map((c) => [c.voice, pmap(c).jump]), [[0, 2], [1, 1]]);
+});
+
+test('redir: the reverse modifier ends dir, pend with a per-voice redir counter', () => {
+  const { model, engine } = mk();
+  const src = model.addSource();
+  model.addPad(60, src, 0);
+  model.addPad(61, src, 1, { reverse: true });
+  engine.noteOn(60, 100);                                  // v0 forward
+  engine.noteOn(61, 100);                                  // v1 reversed pad
+  let cmds = engine.noteOn(MOD.REVERSE, 100);
+  assert.deepEqual(cmds, [
+    { voice: 0, params: [['dir', -1], ['pend', 0], ['redir', 1]] },
+    { voice: 1, params: [['dir', 1], ['pend', 2000], ['redir', 1]] }
+  ]);
+  cmds = engine.noteOff(MOD.REVERSE);
+  assert.deepEqual(cmds, [
+    { voice: 0, params: [['dir', 1], ['pend', 1000], ['redir', 2]] },
+    { voice: 1, params: [['dir', -1], ['pend', 1000], ['redir', 2]] }
+  ]);
+  // a voice started while reverse is held first flips on release with redir 1
+  engine.noteOn(MOD.REVERSE, 100);                         // v0 redir 3, v1 redir 3
+  const born = engine.noteOn(60, 100);                     // v2, started reversed
+  assert.ok(!names(born[0]).includes('redir'));
+  const rel = engine.noteOff(MOD.REVERSE);
+  assert.deepEqual(rel.map((c) => [c.voice, pmap(c).redir]), [[0, 4], [1, 4], [2, 1]]);
+  // redir is independent of trig: a fresh voice still counts its own trig from 1
+  const fresh = engine.noteOn(60, 100)[0];
+  assert.equal(fresh.voice, 3);
+  assert.equal(pmap(fresh).trig, 1);
+});
+
+test('redir: unchanged direction sends nothing; thru and XOR cases still end with redir', () => {
+  const { engine } = posSetup({ playMode: 'thru' }, { reverse: true });
+  engine.noteOn(60, 100);                                  // reversed thru pad: dir -1
+  const cmds = engine.noteOn(MOD.REVERSE, 100);            // plays forward
+  assert.deepEqual(cmds, [{ voice: 0, params: [['dir', 1], ['pend', 10000], ['redir', 1]] }]);
+  assert.deepEqual(engine.noteOn(MOD.OCTUP, 100).map((c) => names(c)), [['pitch']]);   // other mods: no redir
+  assert.deepEqual(engine.noteOn(MOD.TAPE, 100).map((c) => names(c)), [['tape', 'tapems']]);
+});
+
+// An ended held voice: a one-shot that ran out while its key is still down.
+function endedSetup(padOpts = {}, gOpts = {}) {
+  const ctx = gmk({ gainDb: -6, pitch: 2, ...padOpts });
+  Object.assign(ctx.g, { velSens: 50 }, gOpts);
+  ctx.engine.noteOn(60, 90);                               // v0 held, trig 1, rptdiv 0
+  ctx.engine.voiceEnded(0);                                // finished while held
+  return ctx;
+}
+
+test('resume: a repeat modifier press restarts an ended held voice with the full start sequence', () => {
+  const { engine } = endedSetup();
+  assert.deepEqual(engine.activeKeys(), []);               // silent
+  const cmds = engine.noteOn(MOD.RPT_16, 100);
+  assert.equal(cmds.length, 1);
+  assert.equal(cmds[0].voice, 0);
+  assert.deepEqual(names(cmds[0]), START_ORDER);           // held 1 and trig last
+  assert.deepEqual(cmds[0].params.slice(-2), [['held', 1], ['trig', 2]]);
+  const p = pmap(cmds[0]);
+  assert.equal(p.rptdiv, 4);
+  assert.deepEqual([p.pstart, p.pend, p.dir], [0, 1000, 1]);
+  near(p.pitch, 2);
+  near(p.amp, dbtoa(-6) * velCurve(90, 50));               // stored velocity kept
+  // ended is cleared: the voice is sounding again and its key still owns it
+  assert.deepEqual(engine.activeKeys(), [60]);
+  assert.deepEqual(engine.noteOff(60), [{ voice: 0, params: [['held', 0]] }]);
+  assert.deepEqual(engine.noteOff(MOD.RPT_16).map((c) => pmap(c).rptdiv), [0]);   // normal repeat update now
+});
+
+test('resume: nothing is resumed while the effective rate stays 0', () => {
+  const { engine, g, setGest } = endedSetup();
+  setGest(0, { pitchTo: 12 });                             // rate off/off
+  for (const key of [MOD.REVERSE, MOD.OCTUP, MOD.TAPE, MOD.CHAOS, MOD.GEST_0]) {
+    assert.deepEqual(engine.noteOn(key, 100), [], 'key ' + key);
+  }
+  for (const key of [MOD.REVERSE, MOD.OCTUP, MOD.TAPE, MOD.CHAOS, MOD.GEST_0]) {
+    assert.deepEqual(engine.noteOff(key), [], 'key ' + key);
+  }
+  assert.ok(engine.refreshHeld().every((c) => !names(c).includes('trig')));   // repeat off: no restart
+  g.repeatOn = false;
+  assert.deepEqual(engine.refreshHeld().map((c) => names(c)), [['rptdiv', 'rptswing', 'rptalt']]);
+  assert.deepEqual(engine.activeKeys(), []);               // still silent
+});
+
+test('resume: only a press restarts a voice, never a release', () => {
+  const { engine, src } = endedSetup();
+  src.frames = 0;                                          // unplayable for a moment: the press cannot resume it
+  assert.deepEqual(engine.noteOn(MOD.RPT_4, 100), []);
+  src.frames = 44100;
+  assert.deepEqual(starts(engine.noteOff(MOD.RPT_4)), []);
+  assert.deepEqual(engine.activeKeys(), []);               // still silent
+  assert.equal(starts(engine.noteOn(MOD.RPT_4, 100)).length, 1);   // a new press does restart it
+});
+
+test('resume: global repeat turned on is picked up by refreshHeld; other held voices just get params', () => {
+  const { model, engine, g, src } = endedSetup();
+  model.addPad(61, src, 1);
+  engine.noteOn(61, 100);                                  // v1 sounding
+  g.repeatOn = true; g.repeatDiv = '1/16'; g.swing = 20;
+  const cmds = engine.refreshHeld();
+  assert.deepEqual(cmds.map((c) => c.voice), [0, 1]);
+  assert.deepEqual(names(cmds[0]), START_ORDER);
+  const p = pmap(cmds[0]);
+  assert.equal(p.rptdiv, 4);
+  assert.equal(p.rptswing, 0.2);
+  assert.equal(p.trig, 2);
+  assert.deepEqual(cmds[1], { voice: 1, params: [['rptdiv', 4], ['rptswing', 0.2], ['rptalt', 0]] });
+  // the voice is sounding now: a later refresh is parameters only
+  assert.deepEqual(engine.refreshHeld().map((c) => names(c)), [['rptdiv', 'rptswing', 'rptalt'], ['rptdiv', 'rptswing', 'rptalt']]);
+});
+
+test('resume: a gesture press with an effective rate > 0 restarts the voice with the gesture values', () => {
+  const { engine, setGest } = endedSetup({ cutoffHz: 10000 });
+  setGest(0, { rateFrom: '1/8', rateTo: '1/64', cutFrom: 20000, cutTo: 1000, pitchFrom: 3, pitchTo: 3 });
+  const cmds = engine.noteOn(MOD.GEST_0, 100);
+  assert.equal(cmds.length, 1);
+  assert.deepEqual(names(cmds[0]), START_ORDER);
+  const p = pmap(cmds[0]);
+  assert.equal(p.rptdiv, 2);                               // t = 0 of the ramp
+  near(p.pitch, 2 + 3);
+  assert.equal(p.cutoff, 10000);
+  assert.equal(p.trig, 2);
+  assert.equal(engine.needsTick(), true);
+  assert.deepEqual(engine.activeKeys(), [60]);
+});
+
+test('resume: switching to another gesture with a rate restarts a still-ended voice; off/off does not', () => {
+  const { engine, setGest } = endedSetup();
+  setGest(0, {});                                          // rate off/off
+  setGest(1, { rateFrom: '1/16', rateTo: '1/16' });
+  assert.deepEqual(engine.noteOn(MOD.GEST_0, 100), []);
+  const cmds = engine.noteOn(MOD.GEST_1, 100);
+  assert.deepEqual(cmds.map((c) => isStart(c) && pmap(c).rptdiv), [4]);
+  // a gesture release never restarts
+  const again = endedSetup();
+  again.setGest(1, { rateFrom: '1/16', rateTo: '1/16' });
+  assert.equal(starts(again.engine.noteOn(MOD.GEST_1, 100)).length, 1);
+  again.engine.voiceEnded(0);
+  assert.deepEqual(starts(again.engine.noteOff(MOD.GEST_1)), []);
+});
+
+test('resume: a voice whose repeat was already active is not restarted', () => {
+  const { engine, g } = endedSetup({}, {});
+  g.repeatOn = true; g.repeatDiv = '1/8';
+  engine.noteOn(60, 100);                                  // v1 starts with rptdiv 2
+  engine.voiceEnded(1);                                    // (stale) end report for a repeating voice
+  assert.deepEqual(starts(engine.noteOn(MOD.RPT_64, 100)).filter((c) => c.voice === 1), []);
+});
+
+test('resume: keeps key, main / layer roles, current modifiers and morph', () => {
+  const { model, engine, g, src, pad } = endedSetup({}, {});
+  const layer = model.addPad(null, src, 1, { pitch: 5 });
+  pad.layers = [layer.id];
+  pad.morph = { pitch: 10 };
+  g.morph = 100;
+  engine.noteOff(60);                                      // fresh start below
+  engine.voiceEnded(0);
+  engine.noteOn(60, 100);                                  // v0 main + v1 layer
+  engine.voiceEnded(0);
+  engine.voiceEnded(1);
+  engine.noteOn(MOD.OCTUP, 100);
+  engine.noteOn(MOD.REVERSE, 100);
+  const cmds = engine.noteOn(MOD.RPT_8, 100);
+  assert.deepEqual(cmds.map((c) => c.voice), [0, 1]);
+  assert.deepEqual(names(cmds[0]), START_ORDER);
+  assert.deepEqual(names(cmds[1]), START_ORDER);
+  near(pmap(cmds[0]).pitch, 10 + 12);                      // morphed pad + octave
+  near(pmap(cmds[1]).pitch, 5 + 12);                       // the layer's own pad
+  assert.equal(pmap(cmds[0]).dir, -1);                     // reverse modifier applies
+  assert.equal(pmap(cmds[0]).rptdiv, 2);
+  assert.deepEqual(engine.activeKeys(), [60]);
+  // main / layer tracking survives: scan only moves the main voice
+  g.scan = 100;
+  model.addPad(70, src, 2);
+  const sc = engine.refreshScan();
+  assert.deepEqual(sc.map((c) => c.voice), [0]);
+  assert.deepEqual(engine.noteOff(60).map((c) => c.voice), [0, 1]);
+});
+
+test('resume: a voice whose pad can no longer be played is skipped', () => {
+  const { engine, src } = endedSetup();
+  src.frames = 0;                                          // sample unloaded meanwhile
+  assert.deepEqual(engine.noteOn(MOD.RPT_16, 100), []);
+  assert.deepEqual(starts(engine.refreshHeld()), []);
 });
 
 // ---------------------------------------------------------------------------
