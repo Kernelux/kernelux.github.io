@@ -2096,7 +2096,8 @@ test('resume: nothing is resumed while the effective rate stays 0', () => {
 });
 
 test('resume: only a press restarts a voice, never a release', () => {
-  const { engine, src } = endedSetup();
+  const { engine, src, g } = endedSetup();
+  g.repeatOn = true; g.repeatDiv = '1/8';                  // repeat stays active after the release (rate 2)
   src.frames = 0;                                          // unplayable for a moment: the press cannot resume it
   assert.deepEqual(engine.noteOn(MOD.RPT_4, 100), []);
   src.frames = 44100;
