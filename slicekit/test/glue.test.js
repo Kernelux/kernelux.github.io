@@ -94,12 +94,18 @@ function maxQuirk(v) {
   return v;
 }
 
+// Value of the synthetic capture ring at (channel, frame): unique enough to catch a wrong copy order.
+function ringValue(c, i) { return (((i * 7 + c * 3) % 997) + 1) / 1000; }
+
+const CLOCK_BASE = Date.UTC(2026, 0, 2, 3, 4, 5);   // what Date.now() returns at virtual time 0
+
 function createWorld(opts) {
   opts = opts || {};
-  const names = opts.args || ['slicekit.js', 'tsrc', 'tstate', 'tview'];
+  const names = opts.args || ['slicekit.js', 'tsrc', 'tstate', 'tview', 'tcap'];
   const prefix = names[1] || '---src';
   const stateName = names[2] || '---skstate';
   const viewName = names[3] || '---skview';
+  const capName = names[4] || '---cap';
   const world = {
     now: 0,
     log: [],
@@ -108,14 +114,32 @@ function createWorld(opts) {
     buffers: {},
     tasks: new Set(),
     liveInstances: [],
+    liveCalls: [],
+    bufCalls: [],
+    written: {},
     autoload: opts.autoload !== false,
     failPeek: false,
     peekCalls: 0,
-    prefix, stateName, viewName
+    prefix, stateName, viewName, capName
   };
 
   function loadInto(slot, p) {
-    world.buffers[prefix + slot] = synthAudio(p, opts.seconds);
+    world.buffers[prefix + slot] = world.written[p]
+      ? { channels: world.written[p].channels.map((c) => Float32Array.from(c)), sr: world.written[p].sr, frames: world.written[p].frames }
+      : synthAudio(p, opts.seconds);
+  }
+
+  // Capture ring (filled with ringValue), recorder write position and staging buffer.
+  if (opts.ring !== false) {
+    const sr = 44100;
+    const ringFrames = Math.round(sr * (opts.ringSeconds || 8));
+    const ring = [new Float32Array(ringFrames), new Float32Array(ringFrames)];
+    if (!opts.silentRing) {
+      for (let c = 0; c < 2; c++) { for (let i = 0; i < ringFrames; i++) { ring[c][i] = ringValue(c, i); } }
+    }
+    world.buffers[capName] = { channels: ring, sr, frames: ringFrames };
+    world.buffers[capName + 'wp'] = { channels: [Float32Array.of(opts.wp === undefined ? 100000 : opts.wp)], sr, frames: 1 };
+    world.buffers[capName + 'out'] = { channels: [new Float32Array(sr), new Float32Array(sr)], sr, frames: sr };
   }
 
   const outletFn = function (n, ...args) {
@@ -139,8 +163,27 @@ function createWorld(opts) {
       const b = this.b();
       assert.ok(ch >= 1 && ch <= b.channels.length, 'peek channel is 1-based');
       const d = b.channels[ch - 1];
+      if (this.name.startsWith(capName)) { world.bufCalls.push({ op: 'peek', name: this.name, ch, start, count }); }
       if (count === 1) { return d[start]; }
       return Array.from(d.subarray(start, start + count));
+    }
+    poke(ch, start, values) {
+      const b = this.b();
+      assert.ok(Array.isArray(values), 'poke gets an array');
+      assert.ok(ch >= 1 && ch <= b.channels.length, 'poke channel is 1-based');
+      assert.ok(start >= 0 && start + values.length <= b.frames, 'poke inside the buffer');
+      world.bufCalls.push({ op: 'poke', name: this.name, ch, start, count: values.length });
+      b.channels[ch - 1].set(values, start);
+    }
+    send(msg, ...args) {
+      world.bufCalls.push({ op: 'send', name: this.name, msg, args });
+      const b = this.b();
+      if (msg === 'sizeinsamps') {
+        const n = args[0];
+        world.buffers[this.name] = { channels: b.channels.map(() => new Float32Array(n)), sr: b.sr, frames: n };
+      } else if (msg === 'writewave') {
+        world.written[args[0]] = { channels: b.channels.map((c) => Float32Array.from(c)), sr: b.sr, frames: b.frames };
+      }
     }
     freepeer() {}
   }
@@ -177,11 +220,21 @@ function createWorld(opts) {
     freepeer() { world.tasks.delete(this); }
   }
 
+  // opts.live: { '<path>': { id, props: { name: [..] }, counts: { devices: n }, calls: { fn(...args) } } }
   class MockLiveAPI {
     constructor(cb, p) {
       if (opts.liveThrows) { throw new Error('no Live here'); }
       this.cb = cb; this.path = p; this.property = '';
       world.liveInstances.push(this);
+    }
+    node() { return (opts.live || {})[this.path] || null; }
+    get id() { const n = this.node(); return n ? String(n.id === undefined ? 1 : n.id) : '0'; }
+    get(prop) { const n = this.node(); return n && n.props && n.props[prop] !== undefined ? n.props[prop] : []; }
+    getcount(prop) { const n = this.node(); return n && n.counts && n.counts[prop] ? n.counts[prop] : 0; }
+    call(name, ...args) {
+      world.liveCalls.push({ path: this.path, name, args });
+      const n = this.node();
+      return n && n.calls && n.calls[name] ? n.calls[name](...args) : undefined;
     }
     freepeer() {}
   }
@@ -193,10 +246,13 @@ function createWorld(opts) {
     Dict: MockDict,
     Task: MockTask,
     jsarguments: names,
-    messagename: ''
+    messagename: '',
+    __now: () => CLOCK_BASE + world.now
   };
   if (!opts.noLive) { sandbox.LiveAPI = MockLiveAPI; }
+  if (opts.patcher !== undefined) { sandbox.patcher = opts.patcher; }
   const ctx = vm.createContext(sandbox);
+  vm.runInContext('Date.now = function () { return __now(); };', ctx);   // the engine's clock follows the virtual one
   vm.runInContext(BUNDLE, ctx, { filename: 'dist/slicekit.js' });
   world.ctx = ctx;
 
@@ -284,7 +340,9 @@ const PAD_FB = ['reverse', 'pitch', 'fine', 'gain', 'attack', 'decay', 'sustain'
   'cutoff', 'drive', 'lock', 'layerarm', 'duparm', 'spreadparam', 'spreadcount', 'spreadstep'].map((n) => 'pad_' + n);
 const KIT_FB = ['slot', 'layout', 'zonealign', 'sortby', 'root', 'shufflemode', 'shufflescope', 'seed', 'flip', 'bestn', 'chokescope',
   'modzone', 'modstart', 'velsens', 'pressure2level'].map((n) => 'kit_' + n);
-const ALL_FB = SRC_FB.concat(PAD_FB, KIT_FB);
+const V2_FB = ['kit_morphedit', 'kit_capturebars', 'kit_keepclip', 'gest_sel', 'gest_beats', 'gest_ratefrom', 'gest_rateto',
+  'gest_cutfrom', 'gest_cutto', 'gest_pitchfrom', 'gest_pitchto', 'gest_ampfrom', 'gest_ampto', 'gest_curve'];
+const ALL_FB = SRC_FB.concat(PAD_FB, KIT_FB, V2_FB);
 
 // ---------------------------------------------------------------------------
 // Entry points & bundle
@@ -293,7 +351,7 @@ const ALL_FB = SRC_FB.concat(PAD_FB, KIT_FB);
 test('bundle declares the Max entry points', () => {
   const w = createWorld();
   assert.equal(w.get('inlets'), 1);
-  assert.equal(w.get('outlets'), 4);
+  assert.equal(w.get('outlets'), 5);
   assert.equal(w.get('autowatch'), 0);
   ['loadbang', 'bang', 'msg_int', 'msg_float', 'list', 'anything', 'notifydeleted'].forEach((f) => {
     assert.equal(w.get('typeof ' + f), 'function', f);
