@@ -365,7 +365,7 @@ function tabRects(L, n) {
     var a = L.tabs;
     var gap = 2;
     var cw = Math.floor((a.w - (n - 1) * gap) / n);
-    cw = clamp(cw, 8, 120);
+    cw = clamp(cw, 2, 120);
     for (var i = 0; i < n; i++) {
         rects.push({ x: a.x + i * (cw + gap), y: a.y, w: cw, h: a.h });
     }
@@ -935,14 +935,14 @@ function setRGBA(c, a) {
 
 function fillRect(x, y, w, h, c, a) {
     setRGBA(c, a);
-    mgraphics.rectangle(x, y, w, h);
+    mgraphics.rectangle(x, y, Math.max(0, w), Math.max(0, h));
     mgraphics.fill();
 }
 
 function strokeRect(x, y, w, h, c, a, lw) {
     setRGBA(c, a);
     mgraphics.set_line_width(lw || 1);
-    mgraphics.rectangle(x, y, w, h);
+    mgraphics.rectangle(x, y, Math.max(0, w), Math.max(0, h));
     mgraphics.stroke();
 }
 
@@ -969,7 +969,10 @@ function textW(s) {
     return (m && m.length) ? m[0] : s.length * fontSize * 0.55;
 }
 
-/* shorten s with "..." until it is at most maxW pixels wide at font size px */
+/*
+ * Shorten s to at most maxW pixels at font size px: "abc..." when at least
+ * three characters fit before the dots, else a bare prefix, else "".
+ */
 function fitText(s, maxW, px) {
     s = String(s);
     if (px) {
@@ -991,7 +994,20 @@ function fitText(s, maxW, px) {
             hi = mid - 1;
         }
     }
-    return lo > 0 ? s.substring(0, lo) + '...' : '';
+    if (lo >= 3) {
+        return s.substring(0, lo) + '...';
+    }
+    lo = 0;
+    hi = s.length;
+    while (lo < hi) {
+        var mid2 = Math.ceil((lo + hi) / 2);
+        if (textW(s.substring(0, mid2)) <= maxW) {
+            lo = mid2;
+        } else {
+            hi = mid2 - 1;
+        }
+    }
+    return s.substring(0, lo);
 }
 
 /* draw text with its baseline at y; align is 'left' (default), 'right' or 'center' */
@@ -1021,17 +1037,22 @@ function paintTabs(L, v) {
         var live = src.loaded ? 1 : 0.4;
 
         fillRect(r.x, r.y, r.w, r.h, sel ? COL.chipSel : COL.chip, 1);
-        fillRect(r.x + 3, r.y + 4, 5, r.h - 8, col, live);
+        if (r.w < 14) {
+            /* too narrow for text: the colour swatch fills the chip */
+            fillRect(r.x + 1, r.y + 4, Math.max(1, r.w - 2), r.h - 8, col, live);
+        } else {
+            fillRect(r.x + 3, r.y + 4, 5, r.h - 8, col, live);
 
-        var base = r.y + r.h / 2 + 3.2;
-        var left = r.x + 12;
-        var right = r.x + r.w - 4;
-        if (r.w >= 60) {
-            var cnt = String(src.slices);
-            drawText(cnt, right, base, 8, COL.dim, live, 'right');
-            right -= textW(cnt) + 4;
+            var base = r.y + r.h / 2 + 3.2;
+            var left = r.x + 12;
+            var right = r.x + r.w - 4;
+            if (r.w >= 60) {
+                var cnt = String(src.slices);
+                drawText(cnt, right, base, 8, COL.dim, live, 'right');
+                right -= textW(cnt) + 4;
+            }
+            drawText(fitText(src.name, right - left, 9), left, base, 9, COL.text, src.loaded ? 1 : 0.45, 'left');
         }
-        drawText(fitText(src.name, right - left, 9), left, base, 9, COL.text, src.loaded ? 1 : 0.45, 'left');
 
         if (sel) {
             strokeRect(r.x + 0.5, r.y + 0.5, r.w - 1, r.h - 1, col, 1, 1.5);
@@ -1224,9 +1245,10 @@ function paintKey(L, v, k) {
     if (f & FLAG_LAYERS) {
         glyphs.push(drawDotGlyph);
     }
+    var step = clamp(Math.floor((r.h - 8) / Math.max(1, glyphs.length)), 4, 8);
     for (i = 0; i < glyphs.length; i++) {
         if (black) {
-            glyphs[i](cx, r.y + 7 + i * 8, ink);
+            glyphs[i](cx, r.y + 7 + i * step, ink);
         } else {
             glyphs[i](cx + (i - (glyphs.length - 1) / 2) * 7, r.y + L.blackH + 6, ink);
         }
@@ -1243,7 +1265,8 @@ function paintKey(L, v, k) {
     }
 
     /* C labels and the root key marker */
-    if (!black && k % 12 === 0 && !(f & FLAG_MOD)) {
+    var roomForBoth = r.h - L.blackH >= 19;
+    if (!black && k % 12 === 0 && !(f & FLAG_MOD) && (roomForBoth || !glyphs.length)) {
         drawText(noteName(k), cx, r.y + r.h - 4, 8, pi >= 0 ? COL.ink : COL.dim, 0.8, 'center');
     }
     if (k === v.rootKey) {
@@ -1256,9 +1279,10 @@ function paintArrow(r, dir, enabled) {
     var cx = r.x + r.w / 2;
     var cy = r.y + r.h / 2;
     setRGBA(COL.text, enabled ? 0.9 : 0.25);
-    mgraphics.move_to(cx + dir * 3, cy - 5);
-    mgraphics.line_to(cx - dir * 3, cy);
-    mgraphics.line_to(cx + dir * 3, cy + 5);
+    /* dir -1 points left (<), +1 points right (>) */
+    mgraphics.move_to(cx - dir * 3, cy - 5);
+    mgraphics.line_to(cx + dir * 3, cy);
+    mgraphics.line_to(cx - dir * 3, cy + 5);
     mgraphics.close_path();
     mgraphics.fill();
 }

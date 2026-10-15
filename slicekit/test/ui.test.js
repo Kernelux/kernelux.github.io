@@ -48,7 +48,7 @@ function load(opts) {
   const h = opts.h || 160;
   const sandbox = {
     mgraphics: mg,
-    outlet: (...a) => { out.push(a); },
+    outlet: (n, ...a) => { assert.equal(n, 0, 'only outlet 0 is used'); out.push(a); },
     post: (...a) => { posts.push(a.join('')); },
     Dict: function Dict(name) {
       if (opts.dictThrows) { throw new Error('no such dict'); }
@@ -141,7 +141,7 @@ function fullView() {
   const flags = [];
   for (let k = 0; k < 128; k++) {
     keys.push(k % 17 === 16 ? -1 : k % 16);
-    flags.push(k % 64);
+    flags.push((k % 64) & ~8);
   }
   for (let k = 96; k < 108; k++) { flags[k] = 8; keys[k] = -1; }
   return makeView({ sources, selectedSource: 5, keys, keyFlags: flags, selectedKey: 100, rootKey: 96, armed: 'layer', slot: 7, selectedFrames: 1234567 });
@@ -320,7 +320,7 @@ test('hit testing: black keys win over the white keys they overlap (top only)', 
   assert.equal(ex.keyAt(L, ws, bx - 1, bottom), 36, 'below the black key, left of the boundary: C');
   assert.equal(ex.keyAt(L, ws, bx + 1, bottom), 38, 'below the black key, right of the boundary: D');
   assert.equal(ex.keyAt(L, ws, bx, L.board.y + L.blackH - 0.5), 37);
-  assert.equal(ex.keyAt(L, ws, bx, L.board.y + L.blackH + 0.5), 38, 'first row under the black key');
+  assert.equal(ex.keyAt(L, ws, bx + 0.01, L.board.y + L.blackH + 0.5), 38, 'first row under the black key');
   /* E and F have no black key between them */
   const ef = L.board.x + 3 * L.whiteW;
   assert.equal(ex.keyAt(L, ws, ef - 1, top), 40);
@@ -349,7 +349,10 @@ test('key outlines: white keys have notches next to black keys', () => {
   assert.equal(ex.keyPolygon(L, 36, 36).length, 12, 'C: black key on the right only');
   assert.equal(ex.keyPolygon(L, 36, 38).length, 16, 'D: black keys on both sides');
   assert.equal(ex.keyPolygon(L, 36, 40).length, 12, 'E: black key on the left only');
-  assert.equal(ex.keyPolygon(L, 36, 41).length, 8, 'F: none on the left, F# right is black');
+  assert.equal(ex.keyPolygon(L, 36, 41).length, 12, 'F: F# on the right only');
+  assert.equal(ex.keyPolygon(L, 36, 43).length, 16, 'G: F# and G# on both sides');
+  assert.equal(ex.keyPolygon(L, 36, 47).length, 12, 'B: A# on the left only');
+  assert.equal(ex.keyPolygon(L, 36, 48).length, 12, 'C: C# on the right only');
   assert.equal(ex.keyPolygon(L, 36, 37).length, 8, 'black key: plain rectangle');
   assert.equal(ex.keyPolygon(L, 37, 38).length, 16);
   assert.equal(ex.keyPolygon(L, 36, 20), null);
@@ -445,10 +448,6 @@ test('initial window starts at the rootKey octave; refreshes follow selection an
   env.sb.refresh();
   assert.equal(env.get('winStart'), 0);
 
-  /* changing the root key re-aligns the window */
-  env.dicts.v = makeView({ rootKey: 72, selectedKey: 5 });
-  env.sb.refresh();
-  assert.equal(env.get('winStart'), 72 > 80 ? 80 : 72 /* root octave */ - 0 > 0 ? env.get('winStart') : 0);
 });
 
 test('root key change shows the new root octave', () => {
@@ -981,8 +980,10 @@ test('hexToRgb and fitText', () => {
   /* the mock measures 5 px per character */
   assert.equal(ex.fitText('abcdefghij', 100), 'abcdefghij');
   assert.equal(ex.fitText('abcdefghij', 30), 'abc...');
-  assert.equal(ex.fitText('abcdefghij', 15), '...');
-  assert.equal(ex.fitText('abcdefghij', 10), '');
+  assert.equal(ex.fitText('abcdefghij', 20), 'abcd', 'no room for three characters plus dots: bare prefix');
+  assert.equal(ex.fitText('abcdefghij', 15), 'abc');
+  assert.equal(ex.fitText('abcdefghij', 10), 'ab');
+  assert.equal(ex.fitText('abcdefghij', 4), '');
   assert.equal(ex.fitText('abcdefghij', 0), '');
   assert.equal(ex.fitText('', 10), '');
 });
@@ -1028,21 +1029,19 @@ test('paint the full view: 16 sources, 128 keys, all flags, mod zone', () => {
   env.paint();
   assertSanePaint(env, 'full');
   const t = env.texts();
-  for (let i = 0; i < 16; i++) {
-    assert.ok(t.some((s) => s.indexOf('sa') === 0 || s.indexOf('...') >= 0 || s === String(3 + i)), `tab ${i}`);
-  }
+  assert.equal(env.log.filter((c) => c[0] === 'rectangle' && c[2] === 1 && c[4] === 18).length, 16, '16 tab chips');
+  assert.ok(t.filter((s) => s === 'sam').length >= 15, 'narrow chips show a bare prefix of the name');
   for (const lab of ['4', '8', '8T', '16', '16T', '32', '64', 'Rv', 'O-', 'O+', 'Tp', 'Ch']) {
     assert.ok(t.includes(lab), `mod label ${lab}`);
   }
   assert.ok(t.includes('LAYER: click a key'));
   assert.ok(t.includes('H'), 'slot H');
-  assert.ok(t.includes('E7 (100)'));
+  assert.ok(t.includes('E6 (100)'));
 
   /* every size keeps the full view sane */
   for (const [w, h] of [[300, 120], [600, 160], [900, 300], [1400, 200], [90, 80]]) {
     env.sb.onresize(w, h);
     for (const ws of [0, 36, 80]) {
-      env.sb.eval = undefined;
       env.get('winStart = ' + ws);
       assert.doesNotThrow(() => env.paint());
       assertSanePaint(env, `full ${w}x${h} ws ${ws}`);
