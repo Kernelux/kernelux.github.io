@@ -87,37 +87,61 @@ function onsetFunction(mono, sr, opts) {
   var re = new Float64Array(N);
   var im = new Float64Array(N);
   var bins = (N >> 1) + 1;
-  var prev = new Float64Array(bins);
-  var cur = new Float64Array(bins);
-  var tmp;
+  var prev = new Float64Array(bins); // log magnitudes of the previous frame
+  var la = new Float64Array(bins);
+  var lb = new Float64Array(bins);
+  var mask = N - 1;
   var peak = 0;
-  var f, i, k, s, avail, flux, d, mag;
+  var f, i, k, k2, s, avail, flux, d, x, y, ar, ai, br, bi, tmp;
 
-  for (f = 0; f < numFrames; f++) {
+  // Two real frames are transformed with one complex FFT: frame f in the real
+  // part, frame f+1 in the imaginary part, then split by symmetry.
+  for (f = 0; f < numFrames; f += 2) {
+    var haveB = f + 1 < numFrames;
     s = f * hop;
     avail = n - s;
     if (avail > N) avail = N;
-    for (i = 0; i < avail; i++) { re[i] = mono[s + i] * win[i]; im[i] = 0; }
-    for (; i < N; i++) { re[i] = 0; im[i] = 0; }
-    FFT.fft(re, im);
-    flux = 0;
-    if (f === 0) {
-      for (k = 0; k < bins; k++) {
-        mag = Math.sqrt(re[k] * re[k] + im[k] * im[k]);
-        cur[k] = Math.log(1 + 100 * mag);
-      }
+    for (i = 0; i < avail; i++) re[i] = mono[s + i] * win[i];
+    for (; i < N; i++) re[i] = 0;
+    if (haveB) {
+      s = (f + 1) * hop;
+      avail = n - s;
+      if (avail > N) avail = N;
+      for (i = 0; i < avail; i++) im[i] = mono[s + i] * win[i];
+      for (; i < N; i++) im[i] = 0;
     } else {
+      for (i = 0; i < N; i++) im[i] = 0;
+    }
+    FFT.fft(re, im);
+    for (k = 0; k < bins; k++) {
+      k2 = (N - k) & mask;
+      ar = 0.5 * (re[k] + re[k2]);
+      ai = 0.5 * (im[k] - im[k2]);
+      la[k] = Math.log(1 + 100 * Math.sqrt(ar * ar + ai * ai));
+      br = 0.5 * (im[k] + im[k2]);
+      bi = 0.5 * (re[k2] - re[k]);
+      lb[k] = Math.log(1 + 100 * Math.sqrt(br * br + bi * bi));
+    }
+    // flux of frame f (odf[0] stays 0: there is no previous frame)
+    if (f > 0) {
+      flux = 0;
       for (k = 0; k < bins; k++) {
-        mag = Math.sqrt(re[k] * re[k] + im[k] * im[k]);
-        mag = Math.log(1 + 100 * mag);
-        cur[k] = mag;
-        d = mag - prev[k];
+        d = la[k] - prev[k];
         if (d > 0) flux += d;
       }
       odf[f] = flux;
       if (flux > peak) peak = flux;
     }
-    tmp = prev; prev = cur; cur = tmp;
+    if (haveB) {
+      flux = 0;
+      for (k = 0; k < bins; k++) {
+        d = lb[k] - la[k];
+        if (d > 0) flux += d;
+      }
+      odf[f + 1] = flux;
+      if (flux > peak) peak = flux;
+      tmp = prev; prev = lb; lb = tmp;
+    }
   }
 
   if (peak > 0) {
@@ -403,7 +427,7 @@ function estimateBpm(mono, sr, opts) {
   var lagMax = Math.ceil(fps * 60 / minBpm);
   if (m < 2 * lagMax + 2) return null;
 
-  var i, lag, s;
+  var i, lag;
   var mean = 0;
   for (i = 0; i < m; i++) mean += odf[i];
   mean /= m;
@@ -427,7 +451,8 @@ function estimateBpm(mono, sr, opts) {
   // Candidate lags = local maxima of the autocorrelation inside the range.
   // They are ranked by a harmonic-enhanced score r(l) + 0.5 r(2l) + 0.25 r(4l)
   // (multiples only while the overlap is long enough), which prefers the beat
-  // period over a sub-beat period that happens to be in range.
+  // period over a sub-beat period that happens to be in range, and weighted by a
+  // tempo prior.
   var bestLag = -1;
   var bestScore = 0;
   var bestVal = 0;
@@ -445,6 +470,10 @@ function estimateBpm(mono, sr, opts) {
         if (lagM < m / 2) { score += wgt * acf(lagM); wsum += wgt; }
       }
       score /= wsum;
+      // mild log-Gaussian tempo prior (centre 120 BPM, sigma 1 octave): breaks the
+      // tie between a period and its multiples in perfectly regular material
+      lagM = Math.log(60 * fps / lag / 120) / Math.LN2;
+      score *= Math.exp(-0.5 * lagM * lagM);
       if (score > bestScore) {
         bestScore = score;
         bestVal = rl;

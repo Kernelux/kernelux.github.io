@@ -4,20 +4,23 @@
 // Pure ES5, no Max globals. Bit-reversal tables and twiddle factors are cached
 // per transform size, as are the scratch buffers used by magnitudeSpectrum.
 
-var plans = {};      // size -> { rev, cos, sin }
+var plans = {};      // size -> { rev, twr, twi }
 var scratches = {};  // size -> { re, im }
 
 function isPow2(n) {
   return n >= 1 && (n & (n - 1)) === 0;
 }
 
+// Per-size tables: bit-reversal permutation and twiddle factors stored
+// contiguously per stage (for a butterfly half-size h the h factors
+// e^{-j pi k / h}, k < h, live at [h + k]).
 function getPlan(n) {
   var plan = plans[n];
   if (plan) return plan;
   var bits = 0;
   while ((1 << bits) < n) bits++;
   var rev = new Int32Array(n);
-  var i, b, r, x;
+  var i, b, r, x, h, k, a;
   for (i = 0; i < n; i++) {
     r = 0;
     x = i;
@@ -27,15 +30,16 @@ function getPlan(n) {
     }
     rev[i] = r;
   }
-  var half = n >> 1;
-  var cos = new Float64Array(half > 0 ? half : 1);
-  var sin = new Float64Array(half > 0 ? half : 1);
-  for (i = 0; i < half; i++) {
-    var a = -2 * Math.PI * i / n; // forward transform: e^{-j 2 pi i / n}
-    cos[i] = Math.cos(a);
-    sin[i] = Math.sin(a);
+  var twr = new Float64Array(n);
+  var twi = new Float64Array(n);
+  for (h = 1; h < n; h <<= 1) {
+    for (k = 0; k < h; k++) {
+      a = -Math.PI * k / h; // forward transform: e^{-j pi k / h}
+      twr[h + k] = Math.cos(a);
+      twi[h + k] = Math.sin(a);
+    }
   }
-  plan = { rev: rev, cos: cos, sin: sin };
+  plan = { rev: rev, twr: twr, twi: twi };
   plans[n] = plan;
   return plan;
 }
@@ -49,8 +53,8 @@ function fft(re, im) {
   if (n < 2) return;
   var plan = getPlan(n);
   var rev = plan.rev;
-  var cs = plan.cos;
-  var sn = plan.sin;
+  var twr = plan.twr;
+  var twi = plan.twi;
   var i, j, t;
 
   for (i = 0; i < n; i++) {
@@ -61,24 +65,47 @@ function fft(re, im) {
     }
   }
 
-  var size, half, step, start, k, tw, a, b, wr, wi, xr, xi;
-  for (size = 2; size <= n; size <<= 1) {
-    half = size >> 1;
-    step = n / size;
+  if (n === 2) {
+    var r0 = re[0], i0 = im[0];
+    re[0] = r0 + re[1]; im[0] = i0 + im[1];
+    re[1] = r0 - re[1]; im[1] = i0 - im[1];
+    return;
+  }
+
+  // stages of size 2 and 4 fused (their twiddles are 1 and -j: no multiplies)
+  var s, ar, ai, br, bi, cr, ci, dr, di, t0r, t0i, t1r, t1i, t2r, t2i, t3r, t3i;
+  for (s = 0; s < n; s += 4) {
+    ar = re[s]; ai = im[s];
+    br = re[s + 1]; bi = im[s + 1];
+    cr = re[s + 2]; ci = im[s + 2];
+    dr = re[s + 3]; di = im[s + 3];
+    t0r = ar + br; t0i = ai + bi;
+    t1r = ar - br; t1i = ai - bi;
+    t2r = cr + dr; t2i = ci + di;
+    t3r = cr - dr; t3i = ci - di;
+    re[s] = t0r + t2r; im[s] = t0i + t2i;
+    re[s + 2] = t0r - t2r; im[s + 2] = t0i - t2i;
+    re[s + 1] = t1r + t3i; im[s + 1] = t1i - t3r;
+    re[s + 3] = t1r - t3i; im[s + 3] = t1i + t3r;
+  }
+
+  var half, size, start, k, a, b, wr, wi, xr, xi;
+  for (half = 4; half < n; half <<= 1) {
+    size = half << 1;
     for (start = 0; start < n; start += size) {
-      tw = 0;
       for (k = 0; k < half; k++) {
         a = start + k;
         b = a + half;
-        wr = cs[tw];
-        wi = sn[tw];
-        xr = re[b] * wr - im[b] * wi;
-        xi = re[b] * wi + im[b] * wr;
-        re[b] = re[a] - xr;
-        im[b] = im[a] - xi;
-        re[a] += xr;
-        im[a] += xi;
-        tw += step;
+        wr = twr[half + k];
+        wi = twi[half + k];
+        br = re[b]; bi = im[b];
+        xr = br * wr - bi * wi;
+        xi = br * wi + bi * wr;
+        ar = re[a]; ai = im[a];
+        re[b] = ar - xr;
+        im[b] = ai - xi;
+        re[a] = ar + xr;
+        im[a] = ai + xi;
       }
     }
   }

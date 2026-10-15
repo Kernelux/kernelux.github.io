@@ -562,8 +562,12 @@ function create(host) {
 
   // ----- loading ---------------------------------------------------------
 
-  function startPending(slot, mode) {
-    pending[slot] = { mode: mode, stale: bufFrames(slot), seen: -1, ticks: POLL_TICKS };
+  // Sends `<slot> replace <path>` and starts watching the buffer. The frame
+  // count is sampled first: it is what a poll must see change.
+  function requestLoad(slot, path, mode) {
+    var stale = bufFrames(slot);
+    out(1, slot, 'replace', path);
+    pending[slot] = { mode: mode, stale: stale, seen: -1, ticks: POLL_TICKS };
     ensurePoller();
   }
 
@@ -636,7 +640,12 @@ function create(host) {
     delete pending[slot];
     src = model.getSourceBySlot(slot);
     if (!src) { return; }
-    data = readBuffer(slot);
+    try {
+      data = readBuffer(slot);
+    } catch (e) {
+      log('could not read buffer ' + bufferName(slot) + ': ' + errText(e));
+      data = null;
+    }
     if (!data) {
       pending[slot] = p;
       failLoad(slot);
@@ -684,8 +693,7 @@ function create(host) {
       setStatus('16 samples max');
       return;
     }
-    out(1, src.slot, 'replace', p);
-    startPending(src.slot, 'new');
+    requestLoad(src.slot, p, 'new');
     setStatus('Loading ' + src.name + ' ...');
   }
 
@@ -839,6 +847,7 @@ function create(host) {
       keyFlags: flags,
       selectedKey: sel.key,
       rootKey: g.rootKey,
+      modStart: g.modZoneOn ? g.modZoneStart : -1,
       slot: model.currentSlot(),
       armed: armed
     };
@@ -1016,8 +1025,7 @@ function create(host) {
     for (i = 0; i < list.length; i++) {
       src = list[i];
       if (src.path) {
-        out(1, src.slot, 'replace', src.path);
-        startPending(src.slot, 'restore');
+        requestLoad(src.slot, src.path, 'restore');
       }
     }
 

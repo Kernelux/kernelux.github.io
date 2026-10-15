@@ -1,0 +1,670 @@
+// SliceKit voice - gen~ codebox (GenExpr)
+// ======================================================================
+// One poly~ voice: plays a slice from a buffer~ with envelope, micro-loop,
+// beat-synced repeat, low-pass filter, drive, tape stop and click-free
+// (re)starts. Faithful port of core/voice-sim.js (the unit-tested JS
+// reference). See docs/VOICE.md for the state machine and open questions.
+//
+// INPUTS
+//   in1   host beat phase, 0..1 ramp once per beat (plugphasor~). Only used
+//         when Param `playing` = 1 (otherwise a free-running phase is used).
+// OUTPUTS
+//   out1  left   (mono buffers are duplicated to both outputs)
+//   out2  right
+//   out3  active: 1 from the start of a hit until the voice is idle again
+//         (end of slice reached, released, killed). A falling edge here is
+//         the "voiceend" report. While `held` = 1 and `rptdiv` > 0 a voice
+//         whose hit has finished stays active (silent) waiting for the next
+//         repeat.
+// BUFFER
+//   `Buffer src` is rebound with the message `src <buffer~ name>` sent to gen~.
+//
+// PARAMS (plain numbers, set with the message `<name> <value>`)
+//   bufsr     Hz       sample rate of the buffer
+//                      (increment = 2^(pitch/12) * bufsr / samplerate * tape)
+//   pstart    frames   playhead start (float)
+//   pend      frames   stop position; dir 1: pend > pstart, dir -1: pend < pstart
+//   dir       +-1      playback direction (< 0 = reverse)
+//   pitch     st       transposition in semitones
+//   amp       linear   output gain incl. velocity, smoothed with a ~5 ms one-pole
+//   att       ms       attack  (linear 0 -> 1; a 1 ms fade-in is always applied)
+//   dec       ms       decay   (exponential, -80 dB in `dec` ms, toward `sus`)
+//   sus       0..1     sustain level
+//   rel       ms       release (exponential, -80 dB in `rel` ms; minimum 1 ms)
+//   gatemode  0/1      1 = gate: held -> 0 starts the release.
+//                      0 = trigger: held -> 0 never releases; it only ends
+//                      repeat and micro-loop, the hit plays on to `pend`.
+//   held      0/1      key is down (named `held`: `gate` is a gen operator)
+//   loopon    0/1      micro-loop while held = 1
+//   loopsize  frames   loop length (clamped to [1, span])
+//   looppos   0..1     loop start inside the played range:
+//                      start + dir*looppos*(span - loopsize)
+//   rptdiv    1/beat   repeats per beat, 0 = off. Retrigger at grid lines
+//                      while held = 1
+//   rptswing  0..1     every 2nd grid line is delayed to pair position
+//                      0.5 + 0.25*rptswing
+//   rptalt    0/1      alternate direction on every repeat
+//   cutoff    Hz       2-pole low-pass (Simper TPT SVF, Q = 0.7071);
+//                      >= 19000 = bypass
+//   drive     0..1     y = tanh(x*(1+9*drive))/tanh(1+9*drive) when > 0
+//   tape      0/1      1: rate factor falls linearly to 0 in `tapems`;
+//                      0: back to 1 within 10 ms
+//   tapems    ms       tape stop time
+//   bpm       BPM      free-running repeat grid (when playing = 0)
+//   playing   0/1      1: repeat grid from in1 (host phase), 0: free-running
+//   trig      counter  any change (re)starts the hit (1 ms fade-out first if
+//                      it is sounding). The first value must differ from 0.
+//   kill      counter  any change fades the voice out in 2 ms (choke)
+//
+// GenExpr rules followed here (see docs/VOICE.md):
+//   - Param/History/Buffer declarations first; no functions; only `//`
+//     comments; no operator assignments (plain `x = x + 1`).
+//   - GenExpr scopes variables to their {} block, so every temporary is
+//     assigned once at top level before it is used inside an if block.
+//   - Persistent state lives in History variables (h_*). Each is copied into
+//     a local at the top of the sample and written back at the very end, so
+//     the code never depends on whether a History read sees a write made in
+//     the same sample.
+
+Param bufsr(44100, min=1000, max=768000);
+Param pstart(0, min=0, max=1000000000);
+Param pend(0, min=0, max=1000000000);
+Param dir(1, min=-1, max=1);
+Param pitch(0, min=-96, max=96);
+Param amp(1, min=0, max=32);
+Param att(0, min=0, max=60000);
+Param dec(0, min=0, max=60000);
+Param sus(1, min=0, max=1);
+Param rel(30, min=0, max=60000);
+Param gatemode(0, min=0, max=1);
+Param held(0, min=0, max=1);
+Param loopon(0, min=0, max=1);
+Param loopsize(1000, min=0, max=1000000000);
+Param looppos(0, min=0, max=1);
+Param rptdiv(0, min=0, max=256);
+Param rptswing(0, min=0, max=1);
+Param rptalt(0, min=0, max=1);
+Param cutoff(20000, min=1, max=96000);
+Param drive(0, min=0, max=1);
+Param tape(0, min=0, max=1);
+Param tapems(500, min=1, max=60000);
+Param bpm(120, min=1, max=999);
+Param playing(0, min=0, max=1);
+Param trig(0, min=0, max=1000000000);
+Param kill(0, min=0, max=1000000000);
+
+Buffer src;
+
+History h_st(0);
+History h_mode(0);
+History h_pkind(1);
+History h_g(0);
+History h_pos(0);
+History h_sdir(1);
+History h_sstart(0);
+History h_sstop(0);
+History h_alt(0);
+History h_stage(0);
+History h_envv(0);
+History h_ampsm(1);
+History h_tf(1);
+History h_lw(0);
+History h_looping(0);
+History h_lstart(0);
+History h_lend(0);
+History h_llen(1);
+History h_lcprev(0);
+History h_lastk(-1);
+History h_fr(0);
+History h_plprev(0);
+History h_seentrig(0);
+History h_seenkill(0);
+History h_ic1l(0);
+History h_ic2l(0);
+History h_ic1r(0);
+History h_ic2r(0);
+
+// ---------------------------------------------------------------------
+// Per-sample temporaries. All assigned here, at top level, because GenExpr
+// variables are block scoped (a variable first assigned inside an if block
+// does not exist after it).
+// ---------------------------------------------------------------------
+sr = samplerate;
+nsrc = dim(src);
+chr = 0;
+if (channels(src) > 1) {
+  chr = 1;
+}
+
+// constants derived from the sample rate
+fadein_step = 1 / (0.001 * sr);
+rtfade_step = 1 / (0.001 * sr);
+killfade_step = 1 / (0.002 * sr);
+endfade_len = 0.002 * sr;
+tape_back_step = 1 / (0.01 * sr);
+loopexit_step = 1 / (0.001 * sr);
+ampcoef = 1 - exp(-1 / (0.005 * sr));
+
+// ---- load state ------------------------------------------------------
+st = h_st;
+mode = h_mode;
+pkind = h_pkind;
+g = h_g;
+pos = h_pos;
+sdir = h_sdir;
+sstart = h_sstart;
+sstop = h_sstop;
+alt = h_alt;
+stage = h_stage;
+envv = h_envv;
+ampsm = h_ampsm;
+tf = h_tf;
+lw = h_lw;
+looping = h_looping;
+lstart = h_lstart;
+lend = h_lend;
+llen = h_llen;
+lcprev = h_lcprev;
+lastk = h_lastk;
+fr = h_fr;
+plprev = h_plprev;
+seentrig = h_seentrig;
+seenkill = h_seenkill;
+ic1l = h_ic1l;
+ic2l = h_ic2l;
+ic1r = h_ic1r;
+ic2r = h_ic2r;
+
+// other temporaries (declared here for scope)
+trigreq = 0;
+ph = 0;
+pl = 0;
+rd = 0;
+kidx = -1;
+gp = 0;
+pairs = 0;
+odd = 0.5;
+fire = 0;
+rptact = 0;
+dorestart = 0;
+dd = 1;
+span = 0;
+lc = 0;
+remain = 0;
+ended = 0;
+finish = 0;
+incr = 0;
+aincr = 0;
+ge = 1;
+xf = 1;
+stg = 0;
+attn = 0;
+decn = 0;
+reln = 0;
+over = 0;
+vg = 0;
+p1 = 0;
+p2 = 0;
+i0 = 0;
+f1 = 0;
+a0 = 0;
+b0 = 0;
+a1 = 0;
+b1 = 0;
+xl = 0;
+xr = 0;
+fc = 0;
+gf = 0;
+a1f = 0;
+a2f = 0;
+a3f = 0;
+v1 = 0;
+v2 = 0;
+v3 = 0;
+yl = 0;
+yr = 0;
+da = 1;
+dn = 1;
+outl = 0;
+outr = 0;
+outa = 0;
+
+// ---- 1. host events: kill and trig ------------------------------------
+if (kill != seenkill) {
+  seenkill = kill;
+  if (st == 1) {
+    mode = 2;
+  }
+  if (st == 2) {
+    st = 0;
+    mode = 0;
+  }
+}
+if (trig != seentrig) {
+  seentrig = trig;
+  trigreq = 1;
+}
+
+// a finished hit that waits for the next repeat ends when the key is
+// released or repeat is turned off
+if (st == 2) {
+  if (held < 0.5 || rptdiv <= 0) {
+    st = 0;
+    mode = 0;
+  }
+}
+
+// ---- 2. repeat grid ---------------------------------------------------
+// phase in beats: host phase when playing, else free-running since note start
+ph = in1;
+if (playing < 0.5) {
+  ph = fr;
+}
+if (ph < 0) {
+  ph = 0;
+}
+pl = 0;
+if (playing > 0.5) {
+  pl = 1;
+}
+rd = rptdiv;
+kidx = -1;
+if (rd > 0) {
+  // grid lines come in pairs: the even line at pair position 0, the odd one
+  // at 0.5 + 0.25*swing; kidx numbers the lines
+  gp = ph * rd * 0.5;
+  pairs = floor(gp);
+  odd = 0.5 + 0.25 * rptswing;
+  kidx = 2 * pairs;
+  if (gp - pairs >= odd) {
+    kidx = kidx + 1;
+  }
+}
+fire = 0;
+rptact = 0;
+if (rd > 0 && held > 0.5 && st != 0) {
+  rptact = 1;
+}
+if (rptact > 0.5) {
+  // no retrigger on the very first look at the grid, nor when the phase
+  // source was just switched (playing changed)
+  if (lastk >= 0 && kidx != lastk && pl == plprev) {
+    fire = 1;
+  }
+  lastk = kidx;
+} else {
+  lastk = -1;
+}
+plprev = pl;
+
+// ---- 3. restart decisions ---------------------------------------------
+dorestart = 0;
+if (trigreq > 0.5) {
+  pkind = 1;
+  if (st == 1) {
+    mode = 1;
+  } else {
+    dorestart = 1;
+  }
+} else {
+  if (fire > 0.5) {
+    if (st == 2) {
+      pkind = 2;
+      dorestart = 1;
+    }
+    if (st == 1 && mode == 0) {
+      pkind = 2;
+      mode = 1;
+    }
+  }
+}
+// fade-out finished: jump now
+if (st == 1 && mode == 1 && g <= 0) {
+  dorestart = 1;
+}
+// kill fade finished
+if (dorestart < 0.5) {
+  if (st == 1 && mode == 2 && g <= 0) {
+    st = 0;
+    mode = 0;
+  }
+}
+
+// ---- 4. (re)start the hit ---------------------------------------------
+if (dorestart > 0.5) {
+  if (pkind == 1) {
+    // new note: direction toggle and free-running clock start over
+    alt = 0;
+    fr = 0;
+    lastk = -1;
+  } else {
+    // repeat: alternate direction when rptalt is on
+    if (rptalt > 0.5) {
+      alt = 1 - alt;
+    } else {
+      alt = 0;
+    }
+  }
+  if (st != 1) {
+    ic1l = 0;
+    ic2l = 0;
+    ic1r = 0;
+    ic2r = 0;
+  }
+  dd = 1;
+  if (dir < 0) {
+    dd = -1;
+  }
+  sdir = dd;
+  sstart = pstart;
+  sstop = pend;
+  if (alt > 0.5) {
+    sdir = 0 - dd;
+    sstart = pend;
+    sstop = pstart;
+  }
+  span = abs(pend - pstart);
+  lc = 0;
+  if (loopon > 0.5 && held > 0.5) {
+    lc = 1;
+  }
+  looping = 0;
+  llen = min(max(loopsize, 1), span);
+  if (lc > 0.5 && span >= 1) {
+    looping = 1;
+    lstart = sstart + sdir * looppos * (span - llen);
+    lend = lstart + sdir * llen;
+  }
+  lcprev = lc;
+  pos = sstart;
+  if (looping > 0.5) {
+    pos = lstart;
+  }
+  stage = 1;
+  envv = 0;
+  g = 0;
+  mode = 0;
+  ampsm = amp;
+  tf = 1;
+  lw = 0;
+  st = 1;
+}
+
+// ---- 5. render one sample ---------------------------------------------
+if (st == 1) {
+  // micro-loop enter / leave
+  span = abs(sstart - sstop);
+  lc = 0;
+  if (loopon > 0.5 && held > 0.5) {
+    lc = 1;
+  }
+  if (lc > 0.5 && lcprev < 0.5 && looping < 0.5 && span >= 1) {
+    // loop switched on while playing: arm it if its end is still ahead
+    llen = min(max(loopsize, 1), span);
+    lstart = sstart + sdir * looppos * (span - llen);
+    lend = lstart + sdir * llen;
+    if ((lend - pos) * sdir > 0) {
+      looping = 1;
+    }
+  }
+  if (lc < 0.5) {
+    looping = 0;
+  }
+  lcprev = lc;
+
+  // end of the slice reached?
+  remain = (sstop - pos) * sdir;
+  ended = 0;
+  if (looping < 0.5 && remain <= 0) {
+    ended = 1;
+  }
+
+  if (ended > 0.5) {
+    if (mode == 1) {
+      // a restart is pending: nothing left to fade, restart on the next sample
+      g = 0;
+    } else {
+      if (rptdiv > 0 && held > 0.5) {
+        st = 2;
+      } else {
+        st = 0;
+      }
+      g = 0;
+      mode = 0;
+    }
+  } else {
+    // tape stop / recovery
+    if (tape > 0.5) {
+      tf = max(tf - 1 / max(tapems * 0.001 * sr, 1), 0);
+    } else {
+      tf = min(tf + tape_back_step, 1);
+    }
+    // a tape-stopped voice whose key was released would never end
+    if (tf <= 0 && held < 0.5 && mode == 0) {
+      mode = 2;
+    }
+
+    // declick gain: 1 ms fade-in, 1 ms fade-out before a retrigger,
+    // 2 ms fade-out for kill
+    if (mode == 1) {
+      g = max(g - rtfade_step, 0);
+    } else {
+      if (mode == 2) {
+        g = max(g - killfade_step, 0);
+      } else {
+        g = min(g + fadein_step, 1);
+      }
+    }
+
+    // envelope: 1 attack, 2 decay, 3 sustain, 4 release
+    finish = 0;
+    if (gatemode > 0.5 && held < 0.5 && stage != 4) {
+      stage = 4;
+    }
+    stg = stage;
+    if (stg == 1) {
+      attn = att * 0.001 * sr;
+      if (attn <= 1) {
+        envv = 1;
+        stage = 2;
+      } else {
+        envv = envv + 1 / attn;
+        if (envv >= 1) {
+          envv = 1;
+          stage = 2;
+        }
+      }
+    }
+    if (stg == 2) {
+      decn = dec * 0.001 * sr;
+      if (decn <= 1) {
+        envv = sus;
+        stage = 3;
+      } else {
+        envv = sus + (envv - sus) * exp(-9.210340371976184 / decn);
+        if (envv - sus < 0.0001) {
+          envv = sus;
+          stage = 3;
+        }
+      }
+    }
+    if (stg == 3) {
+      envv = sus;
+    }
+    if (stg == 4) {
+      reln = max(rel * 0.001 * sr, 0.001 * sr);
+      envv = envv * exp(-9.210340371976184 / reln);
+      if (envv < 0.0001) {
+        envv = 0;
+        finish = 1;
+      }
+    }
+
+    // playback increment in buffer frames per sample
+    incr = sdir * exp(pitch * 0.05776226504666211) * bufsr / sr * tf;
+    aincr = abs(incr);
+
+    // fade-out lookahead: 2 ms (of output time) before the end is reached
+    ge = 1;
+    if (looping < 0.5 && aincr > 0.000001) {
+      ge = min(1, remain / (aincr * endfade_len));
+    }
+
+    // micro-loop crossfade weight. Inside the last xf frames of the loop the
+    // signal at (pos - sdir*llen) - the material just before the loop start,
+    // which plays on seamlessly after the wrap - is blended in. After the loop
+    // is left the weight fades out in 1 ms.
+    if (looping > 0.5) {
+      xf = max(1, min(0.005 * bufsr, 0.25 * llen));
+      lw = 1 - ((lend - pos) * sdir) / xf;
+      lw = min(max(lw, 0), 1);
+    } else {
+      lw = max(lw - loopexit_step, 0);
+    }
+
+    // read the buffer at pos (linear interpolation, silent outside)
+    p1 = pos;
+    i0 = floor(p1);
+    f1 = p1 - i0;
+    a0 = 0;
+    b0 = 0;
+    a1 = 0;
+    b1 = 0;
+    if (i0 >= 0 && i0 < nsrc) {
+      a0 = peek(src, i0, 0);
+      a1 = peek(src, i0, chr);
+    }
+    if (i0 + 1 >= 0 && i0 + 1 < nsrc) {
+      b0 = peek(src, i0 + 1, 0);
+      b1 = peek(src, i0 + 1, chr);
+    }
+    xl = a0 + (b0 - a0) * f1;
+    xr = a1 + (b1 - a1) * f1;
+
+    if (lw > 0) {
+      p2 = pos - sdir * llen;
+      i0 = floor(p2);
+      f1 = p2 - i0;
+      a0 = 0;
+      b0 = 0;
+      a1 = 0;
+      b1 = 0;
+      if (i0 >= 0 && i0 < nsrc) {
+        a0 = peek(src, i0, 0);
+        a1 = peek(src, i0, chr);
+      }
+      if (i0 + 1 >= 0 && i0 + 1 < nsrc) {
+        b0 = peek(src, i0 + 1, 0);
+        b1 = peek(src, i0 + 1, chr);
+      }
+      xl = xl * (1 - lw) + (a0 + (b0 - a0) * f1) * lw;
+      xr = xr * (1 - lw) + (a1 + (b1 - a1) * f1) * lw;
+    }
+
+    // amplitude: declick * end fade * envelope * tape (amplitude ~ sqrt)
+    vg = g * ge * envv * sqrt(tf);
+    xl = xl * vg;
+    xr = xr * vg;
+
+    // 2-pole TPT low-pass (Simper SVF). It always runs so its state is warm;
+    // cutoff >= 19000 bypasses its output.
+    fc = min(max(cutoff, 10), 0.45 * sr);
+    gf = tan(3.141592653589793 * fc / sr);
+    a1f = 1 / (1 + gf * (gf + 1.4142135623730951));
+    a2f = gf * a1f;
+    a3f = gf * a2f;
+    v3 = xl - ic2l;
+    v1 = a1f * ic1l + a2f * v3;
+    v2 = ic2l + a2f * ic1l + a3f * v3;
+    ic1l = 2 * v1 - ic1l;
+    ic2l = 2 * v2 - ic2l;
+    yl = v2;
+    v3 = xr - ic2r;
+    v1 = a1f * ic1r + a2f * v3;
+    v2 = ic2r + a2f * ic1r + a3f * v3;
+    ic1r = 2 * v1 - ic1r;
+    ic2r = 2 * v2 - ic2r;
+    yr = v2;
+    if (cutoff >= 19000) {
+      yl = xl;
+      yr = xr;
+    }
+
+    // drive
+    if (drive > 0) {
+      da = 1 + 9 * drive;
+      dn = tanh(da);
+      yl = tanh(yl * da) / dn;
+      yr = tanh(yr * da) / dn;
+    }
+
+    // amp, smoothed (~5 ms)
+    ampsm = ampsm + (amp - ampsm) * ampcoef;
+    outl = yl * ampsm;
+    outr = yr * ampsm;
+
+    // advance the playhead, wrap inside the micro-loop
+    pos = pos + incr;
+    if (looping > 0.5) {
+      over = (pos - lend) * sdir;
+      if (over >= 0) {
+        pos = pos - sdir * llen * (floor(over / llen) + 1);
+      }
+    }
+
+    // the envelope reached -80 dB: the voice is done (unless a restart is
+    // already pending, which then takes over on the next sample)
+    if (finish > 0.5) {
+      if (mode == 1) {
+        g = 0;
+      } else {
+        st = 0;
+        mode = 0;
+      }
+    }
+  }
+}
+
+// the free-running repeat clock runs while the voice is active
+if (st != 0) {
+  fr = fr + bpm / (60 * sr);
+}
+
+outa = 0;
+if (st != 0) {
+  outa = 1;
+}
+
+// ---- store state -------------------------------------------------------
+h_st = st;
+h_mode = mode;
+h_pkind = pkind;
+h_g = g;
+h_pos = pos;
+h_sdir = sdir;
+h_sstart = sstart;
+h_sstop = sstop;
+h_alt = alt;
+h_stage = stage;
+h_envv = envv;
+h_ampsm = ampsm;
+h_tf = tf;
+h_lw = lw;
+h_looping = looping;
+h_lstart = lstart;
+h_lend = lend;
+h_llen = llen;
+h_lcprev = lcprev;
+h_lastk = lastk;
+h_fr = fr;
+h_plprev = plprev;
+h_seentrig = seentrig;
+h_seenkill = seenkill;
+h_ic1l = ic1l;
+h_ic2l = ic2l;
+h_ic1r = ic1r;
+h_ic2r = ic2r;
+
+out1 = outl;
+out2 = outr;
+out3 = outa;
