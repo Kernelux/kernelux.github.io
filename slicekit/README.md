@@ -33,6 +33,23 @@ environment it was built in):
   and the clip rewrite of Keep clip (note reads and writes through the Live API).
   None of them has run in Live.
 
+### Checked against the Max / Live documentation
+
+| assumption | status |
+|---|---|
+| gen~ `Buffer` re-pointed with the message `<name> <buffer~>` (voice `src`, recorder `cap` / `wpb`) | documented (forum + reference) |
+| GenExpr `poke(buffer, value, index, channel)` | documented (forum) |
+| JS `Buffer.poke(channel, frame, array)`, `send()` forwards buffer~ messages (`sizeinsamps`, `writewave`) | documented |
+| `buffer~ name <ms> <channels>`; buffer~ defaults to 1 channel; `replace` adopts the file's channels | documented |
+| `thispoly~` outputs the voice number (from 1) on bang | documented |
+| `Task.repeat()` with no argument runs until `cancel()` | documented |
+| `---` gives device-unique names in object boxes (buffers, dicts, the glue's arguments) | documented |
+| `dict @parameter_enable 1` saves its contents with the Live Set | documented (forum reports it can need a save + reopen) |
+| SimplerDevice `slicing_playback_mode` 0/1/2 = Mono/Poly/Thru, `sample` child | documented |
+| Clip `get_notes_extended` returns a JSON string; `apply_note_modifications` takes `{notes: [...]}` with `note_id` | documented |
+| Simpler `class_name` = `OriginalSimpler`; Sample `file_path` / `slices` property names | **not confirmed**: check first in Live |
+| the gen~ codeboxes compile; everything sounds right | **needs Live** |
+
 So expect the first launch to surface a few Max-specific issues (an object
 argument, a gen~ syntax detail, a Live property name). [docs/TESTING.md](docs/TESTING.md) is a
 step-by-step checklist. When something fails, copy the Max console lines that
