@@ -85,7 +85,8 @@ function create(opts) {
   var h_st = 0, h_mode = 0, h_pkind = 1, h_g = 0, h_pos = 0, h_sdir = 1;
   var h_sstart = 0, h_sstop = 0, h_alt = 0, h_stage = 0, h_envv = 0, h_ampsm = 1;
   var h_tf = 1, h_lw = 0, h_looping = 0, h_lstart = 0, h_lend = 0, h_llen = 1;
-  var h_lcprev = 0, h_lastk = -1, h_fr = 0, h_plprev = 0, h_seentrig = 0;
+  var h_lcprev = 0, h_lastk = -1, h_fr = 0, h_plprev = 0, h_lastph = 0, h_rdprev = 0, h_swprev = 0;
+  var h_seentrig = 0;
   var h_seenkill = 0, h_ic1l = 0, h_ic2l = 0, h_ic1r = 0, h_ic2r = 0;
 
   // --- outputs of the last tick ---
@@ -141,7 +142,7 @@ function create(opts) {
     var chr = 0;
     var fadein_step, rtfade_step, killfade_step, endfade_len, tape_back_step, loopexit_step, ampcoef;
     var st, mode, pkind, g, pos, sdir, sstart, sstop, alt, stage, envv, ampsm, tf, lw;
-    var looping, lstart, lend, llen, lcprev, lastk, fr, plprev, seentrig, seenkill;
+    var looping, lstart, lend, llen, lcprev, lastk, fr, plprev, lastph, rdprev, swprev, seentrig, seenkill;
     var ic1l, ic2l, ic1r, ic2r;
     var trigreq = 0, ph = 0, pl = 0, rd = 0, kidx = -1, gp = 0, pairs = 0, odd = 0.5;
     var fire = 0, rptact = 0, dorestart = 0, dd = 1, span = 0, lc = 0, remain = 0;
@@ -149,7 +150,7 @@ function create(opts) {
     var attn = 0, decn = 0, reln = 0, over = 0, vg = 0, p1 = 0, p2 = 0, i0 = 0, f1 = 0;
     var a0 = 0, b0 = 0, a1 = 0, b1 = 0, xl = 0, xr = 0;
     var fc = 0, gf = 0, a1f = 0, a2f = 0, a3f = 0, v1 = 0, v2 = 0, v3 = 0;
-    var yl = 0, yr = 0, da = 1, dn = 1, outl = 0, outr = 0, outa = 0;
+    var yl = 0, yr = 0, da = 1, dn = 1, dw = 0, outl = 0, outr = 0, outa = 0;
 
     if (channels() > 1) {
       chr = 1;
@@ -187,6 +188,9 @@ function create(opts) {
     lastk = h_lastk;
     fr = h_fr;
     plprev = h_plprev;
+    lastph = h_lastph;
+    rdprev = h_rdprev;
+    swprev = h_swprev;
     seentrig = h_seentrig;
     seenkill = h_seenkill;
     ic1l = h_ic1l;
@@ -252,14 +256,26 @@ function create(opts) {
       rptact = 1;
     }
     if (rptact > 0.5) {
-      if (lastk >= 0 && kidx !== lastk && pl === plprev) {
-        fire = 1;
+      if (lastk >= 0 && pl === plprev && rd === rdprev && rptswing === swprev) {
+        if (ph - lastph < -0.5) {
+          fire = 1;
+        } else {
+          if (kidx > lastk) {
+            fire = 1;
+          }
+          if (kidx < lastk && lastk - kidx <= 1) {
+            kidx = lastk;
+          }
+        }
       }
       lastk = kidx;
+      lastph = ph;
     } else {
       lastk = -1;
     }
     plprev = pl;
+    rdprev = rd;
+    swprev = rptswing;
 
     // ---- 3. restart decisions ----
     dorestart = 0;
@@ -540,11 +556,13 @@ function create(opts) {
         }
 
         // drive
+        // the shaped signal fades in over drive 0..0.1 (no level jump above 0)
         if (drive > 0) {
           da = 1 + 9 * drive;
           dn = tanh(da);
-          yl = tanh(yl * da) / dn;
-          yr = tanh(yr * da) / dn;
+          dw = Math.min(1, drive * 10);
+          yl = yl + (tanh(yl * da) / dn - yl) * dw;
+          yr = yr + (tanh(yr * da) / dn - yr) * dw;
         }
 
         // gain stage after filter and drive, so every fade ends in exact silence:
@@ -612,6 +630,9 @@ function create(opts) {
     h_lastk = lastk;
     h_fr = fr;
     h_plprev = plprev;
+    h_lastph = lastph;
+    h_rdprev = rdprev;
+    h_swprev = swprev;
     h_seentrig = seentrig;
     h_seenkill = seenkill;
     h_ic1l = ic1l;

@@ -189,6 +189,9 @@ rebinds the codebox `Buffer src` to the buffer~ named by the value):
 | `trig` | counter | any change (re)starts the voice from `pstart` (≈1 ms fade-out first if sounding) |
 | `kill` | counter | any change = fast fade-out (≈2 ms) then silent (choke) |
 
+`active` (gen~ out 3) stays 1 while a repeating voice (held, `rptdiv` > 0) waits
+silently between hits, so no `voiceend` is sent between repeats.
+
 Engine send order when starting a voice: `src`, `bufsr`, `pstart`, `pend`, `dir`,
 `pitch`, `amp`, `att`, `dec`, `sus`, `rel`, `gatemode`, `loopon`, `loopsize`,
 `looppos`, `rptdiv`, `rptswing`, `rptalt`, `cutoff`, `drive`, `tape`, `tapems`,

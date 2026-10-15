@@ -25,7 +25,8 @@ silently diverging.
    requires of other core modules.
 3. `tools/build.js` bundles `core/*.js` + `max/glue.js` into `dist/slicekit.js`
    with a tiny CommonJS shim (Max does not get `require`). So only use
-   `require('./name')` with literal strings, at the top of files.
+   `require('./name')` with literal strings (a lazy `require` inside a function
+   is fine, the shim resolves it at call time).
 4. No npm runtime dependencies. Dev dependency allowed: `acorn` (ES5 check).
 5. Tests use `node:test` + `node:assert/strict`. Run: `npm test` inside `slicekit/`.
 6. Do **not** run git commands that change state (no commit/checkout/stash/reset).

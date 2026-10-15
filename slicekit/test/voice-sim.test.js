@@ -537,6 +537,63 @@ test('repeat: over several beats the hits sit exactly on the grid', () => {
   }
 });
 
+test('repeat: rptdiv 1 (quarter notes) and 2 retrigger once per line, also at the beat wrap', () => {
+  const spb = 22050;
+  [[1, [22050, 44100, 66150]], [2, [11025, 22050, 33075, 44100, 55125, 66150]]].forEach(([div, expected]) => {
+    const sim = make(rampBuffer(20000), { pstart: 1000, pend: 1500, rptdiv: div, held: 1, playing: 1, trig: 1 });
+    sim.process(spb * 3 + 100, hostPhase(spb, 0));
+    const lines = eventsOf(sim, 'line').map(e => e.n);
+    assert.equal(lines.length, expected.length, 'rptdiv ' + div + ' lines ' + lines.join(','));
+    expected.forEach((e, i) => assert.ok(Math.abs(lines[i] - e) <= 1, 'rptdiv ' + div + ' line ' + i + ' at ' + lines[i]));
+  });
+});
+
+test('repeat: changing rptdiv / rptswing while holding does not fire a spurious retrigger', () => {
+  const spb = 22050;
+  const sim = make(rampBuffer(20000), { pstart: 1000, pend: 1500, rptdiv: 4, held: 1, playing: 1, trig: 1 });
+  sim.process(7000, hostPhase(spb, 0));
+  const before = eventsOf(sim, 'line').length;
+  sim.set('rptdiv', 3);
+  sim.process(3, hostPhase(spb, 0));
+  sim.set('rptswing', 0.5);
+  sim.process(3, hostPhase(spb, 0));
+  assert.equal(eventsOf(sim, 'line').length, before);
+  // and it keeps repeating on the new grid: gp = ph*3/2, next line at ph = 2/3
+  sim.process(spb, hostPhase(spb, 0));
+  assert.ok(eventsOf(sim, 'line').length > before);
+  // turning repeat on while holding starts counting from the next line
+  const sim2 = make(rampBuffer(20000), { pstart: 1000, pend: 15000, rptdiv: 0, held: 1, playing: 1, trig: 1 });
+  sim2.process(7000, hostPhase(spb, 0));
+  sim2.set('rptdiv', 4);
+  sim2.process(10, hostPhase(spb, 0));
+  assert.equal(eventsOf(sim2, 'line').length, 0);
+  sim2.process(5000, hostPhase(spb, 0));
+  assert.equal(eventsOf(sim2, 'line').length, 1);
+});
+
+test('repeat: phase jitter around a grid line fires once; a backward seek resyncs without firing', () => {
+  const spb = 22050;
+  // phase that steps back by a hair right after crossing each quarter line
+  const jitter = function (i, k) {
+    let ph = (k % spb) / spb;
+    const line = Math.round(ph * 4) / 4;
+    if (ph > line && ph < line + 3 / spb && line > 0) { ph = ph - 2 / spb * ((k % 2) + 1); }
+    return Math.max(0, ph);
+  };
+  const sim = make(rampBuffer(20000), { pstart: 1000, pend: 1500, rptdiv: 4, held: 1, playing: 1, trig: 1 });
+  sim.process(spb, jitter);
+  assert.equal(eventsOf(sim, 'line').length, 3, 'one retrigger per line despite jitter');
+  // transport relocation backwards by 0.3 beat (more than one line)
+  const sim2 = make(rampBuffer(20000), { pstart: 1000, pend: 1500, rptdiv: 4, held: 1, playing: 1, trig: 1 });
+  const seek = function (i, k) { return (k < 17000 ? k / spb : (k - 6600) / spb) % 1; };
+  sim2.process(17000, seek);
+  const n0 = eventsOf(sim2, 'line').length;
+  sim2.process(1, seek);
+  assert.equal(eventsOf(sim2, 'line').length, n0, 'seek back: no retrigger');
+  sim2.process(spb, seek);
+  assert.ok(eventsOf(sim2, 'line').length > n0, 'repeating continues after the relocation');
+});
+
 test('repeat while sounding: new hit starts ~1 ms after the grid line (fade-out first)', () => {
   const spb = 22050;
   const sim = make(rampBuffer(20000), {
@@ -585,7 +642,7 @@ test('repeat: rptalt alternates direction on every repeat; a new trig starts for
   assert.equal(r.pos[s[2].n], 1000);
   // new note: alternation restarts forward
   sim.set('trig', 2);
-  sim.process(200, hostPhase(spb, spb % spb));
+  sim.process(200, hostPhase(spb, 0));
   const s2 = starts(sim);
   assert.equal(s2[s2.length - 1].sdir, 1);
   assert.equal(s2[s2.length - 1].kind, 1);
@@ -643,21 +700,21 @@ test('repeat: off when rptdiv = 0 or the key is released; switching the phase so
   let r = sim.process(7000, hostPhase(spb, 0));
   assert.equal(r.active[6999], 1);
   sim.set('held', 0);
-  r = sim.process(spb, hostPhase(spb, 7000));
+  r = sim.process(spb, hostPhase(spb, 0));
   assert.equal(r.active[0], 0);
   assert.equal(starts(sim).length, 2);
   // repeat turned off while waiting
   sim = make(rampBuffer(20000), { pstart: 1000, pend: 2000, rptdiv: 4, held: 1, playing: 1, trig: 1 });
   sim.process(3000, hostPhase(spb, 0));
   sim.set('rptdiv', 0);
-  r = sim.process(100, hostPhase(spb, 3000));
+  r = sim.process(100, hostPhase(spb, 0));
   assert.equal(r.active[0], 0);
   // playing 1 -> 0 mid-note: the phase source changes but no retrigger is fired by the switch itself
   sim = make(rampBuffer(20000), { pstart: 1000, pend: 15000, rptdiv: 4, held: 1, playing: 1, trig: 1 });
   sim.process(6000, hostPhase(spb, 0));
   const before = eventsOf(sim, 'line').length;
   sim.set('playing', 0);
-  sim.process(20, hostPhase(spb, 6000));
+  sim.process(20, hostPhase(spb, 0));
   assert.equal(eventsOf(sim, 'line').length, before);
 });
 
@@ -668,7 +725,7 @@ test('repeat: releasing the key while a hit is still sounding stops further repe
   assert.equal(starts(sim).length, 2);
   const startN = starts(sim)[1].n;
   sim.set('held', 0);
-  const r = sim.process(20000, hostPhase(spb, 7000));
+  const r = sim.process(20000, hostPhase(spb, 0));
   assert.equal(starts(sim).length, 2, 'no more repeats');
   const end = firstIndex(r.active, 0, v => v === 0);
   assert.equal(end + 7000, startN + 14000, 'the running hit plays to pend');
@@ -679,7 +736,7 @@ test('repeat: kill ends a waiting voice at once; unheld trigger voices still end
   const sim = make(rampBuffer(20000), { pstart: 1000, pend: 2000, rptdiv: 4, held: 1, playing: 1, trig: 1 });
   sim.process(3000, hostPhase(spb, 0));
   sim.set('kill', 1);
-  const r = sim.process(10, hostPhase(spb, 3000));
+  const r = sim.process(10, hostPhase(spb, 0));
   assert.equal(r.active[0], 0);
   assert.equal(r.left[0], 0);
 });
@@ -764,7 +821,7 @@ test('drive: bounded tanh saturation, level-independent normalisation, off at 0'
 test('tape stop: rate falls linearly to 0 over tapems, voice stays active while held, recovers in ~10 ms', () => {
   const N = 100000;
   const sim = make(rampBuffer(N), { pstart: 1000, pend: 90000, held: 1, trig: 1, tapems: 100 });
-  const r0 = sim.process(1000);
+  sim.process(1000);
   sim.set('tape', 1);
   const T = 0.100 * SR; // 4410
   const r1 = sim.process(T + 3000);
@@ -786,7 +843,6 @@ test('tape stop: rate falls linearly to 0 over tapems, voice stays active while 
   assert.ok(r2.pos[459] - r2.pos[458] > 0.999, 'full speed again within ~10 ms');
   assert.ok(r2.pos[200] - r2.pos[199] < 0.6 && r2.pos[200] - r2.pos[199] > 0.4, 'linear recovery');
   assert.ok(r2.left[500] > 0.01, 'sound is back');
-  void r0;
 });
 
 test('tape stop: a stopped trigger-mode voice whose key is released does not hang', () => {
@@ -1315,7 +1371,6 @@ test('parity: random scenarios (seeded fuzz of every parameter and event)', () =
     }
   }
   // the random scenarios must really visit every state-machine path
-  if (process.env.VOICE_COV) { console.log(JSON.stringify(coverage)); }
   ['trig', 'start:1', 'start:2', 'line', 'wait', 'wrap', 'kill', 'end:pend', 'end:release', 'end:kill', 'end:wait'].forEach(key => {
     assert.ok((coverage[key] || 0) >= (key === 'end:wait' ? 3 : 10), 'fuzz coverage of "' + key + '": ' + (coverage[key] || 0));
   });
