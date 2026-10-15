@@ -686,7 +686,7 @@ function buildDevice() {
   }
 
   // ---- presentation-only decorations, parked in a lane right of the patch --------------------
-  const laneX = BX + NUM_BUFFERS * BP + 60;
+  const laneX = GRID_X0 + COLS * COL_W + 48; // right of the control grid, top of the canvas (buffers are at the bottom)
   p.comment('PRESENTATION-ONLY: panels, section titles, labels (no function)', [laneX, 14, 420, 20]);
   let lane = 0;
   const park = () => {
