@@ -709,7 +709,7 @@ test('filter: 2-pole low-pass attenuates highs, passes lows, -3 dB at the cutoff
   const dry = make(sineBuffer(N, 3000, 0.5), { pstart: 0, pend: 50000, cutoff: 20000, trig: 1 }).process(3000);
   const byp = make(sineBuffer(N, 3000, 0.5), { pstart: 0, pend: 50000, cutoff: 19000, trig: 1 }).process(3000);
   const fil = make(sineBuffer(N, 3000, 0.5), { pstart: 0, pend: 50000, cutoff: 18999, trig: 1 }).process(3000);
-  assert.deepEqual(Array.from(byp.left), Array.from(dry.left));
+  assert.equal(maxAbsDiff(byp.left, dry.left), 0, 'bypass is bit-exact');
   assert.ok(maxAbsDiff(fil.left, dry.left) > 1e-3);
   // channels filter independently (stereo)
   const a = sineBuffer(N, 10000, 0.5).channels[0];
@@ -1189,7 +1189,8 @@ function parity(buffer, script, total, phaseFn, sampleRate) {
   const gen = createGenVoice(COMPILED, { sampleRate: sampleRate || SR, buffer: buffer });
   const a = applyScript(sim, script, total, phaseFn);
   const b = applyScript(gen, script, total, phaseFn);
-  assert.deepEqual(Array.from(a.active), Array.from(b.active), 'active outputs identical');
+  const di = firstIndex(a.active, 0, (v, i) => v !== b.active[i]);
+  assert.ok(di < 0, 'active outputs identical (first difference at sample ' + di + ')');
   const dl = maxAbsDiff(a.left, b.left), dr = maxAbsDiff(a.right, b.right);
   assert.ok(dl < 1e-6 && dr < 1e-6, 'audio parity: ' + dl + ' / ' + dr);
   a.events = sim.events;
