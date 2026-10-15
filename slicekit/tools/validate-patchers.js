@@ -14,9 +14,13 @@
  *   inlet < numinlets.
  * Device patcher (has "devicewidth"): the control table of docs/PROTOCOL.md is parsed and every
  *   varname must exist exactly once with the right maxclass / mode / text / range / enum / flags
- *   (parameter_invisible 0 = A, 2 = H), sit inside the device area (height <= 169), be wired to
- *   the glue ("sends") and to a [route] -> [prepend set] chain ("feedback"); parameter_longname
- *   must be unique; presentation boxes must not overlap.
+ *   (parameter_invisible 0 = A, 2 = H, "-" = not a Live parameter, parameter_enable 0), sit inside
+ *   the device area (height <= 169), be wired to the glue ("sends") and to a [route] -> [prepend set]
+ *   chain ("feedback"; "raw" feedback goes route -> control directly, e.g. the Simpler umenu);
+ *   buttons go through [route bang 1]; folder / file choosers ("-> opendialog X") sit in the send
+ *   path; parameter_longname must be unique; presentation boxes must not overlap.
+ *   v2 topology: glue with 5 outlets and the ---cap argument, the three capture buffers, and the
+ *   recorder gen~ (dsp.gen patcher, in 1/in 2/out 1) fed by poly~ outlets 0/1 and glue outlet 4.
  * Voice patcher (contains a gen~): poly~ voice wiring and a non-empty codebox.
  */
 
@@ -32,7 +36,7 @@ const DEVICE_HEIGHT = 169;
 
 /**
  * Parse the "UI controls" table of PROTOCOL.md.
- * @returns {{varname,maxclass,mode,paren,text,range,sends,feedback,vis}[]}
+ * @returns {{varname,maxclass,mode,paren,text,range,sends,feedback,feedbackRaw,vis}[]}
  */
 function loadControlTable(protocolPath) {
   const md = fs.readFileSync(protocolPath || path.join(ROOT, 'docs', 'PROTOCOL.md'), 'utf8');
@@ -50,6 +54,10 @@ function loadControlTable(protocolPath) {
     const obj = /^([A-Za-z0-9_.~]+)\s*(?:\(([^)]*)\))?\s*(?:["“]([^"”]*)["”])?\s*$/.exec(cells[1]);
     if (!obj) throw new Error('PROTOCOL.md: cannot parse object cell "' + cells[1] + '" of ' + cells[0]);
     const paren = obj[2] || '';
+    // feedback cell: `—` | `name` | `name (raw: ...)` (raw = route outlet goes straight into the control)
+    const fbCell = cells[4] === '—' ? '' : cells[4];
+    const fb = /^([A-Za-z0-9_]+)\s*(?:\(\s*(raw)\b[^)]*\))?$/.exec(fbCell);
+    if (fbCell && !fb) throw new Error('PROTOCOL.md: cannot parse feedback cell "' + fbCell + '" of ' + cells[0]);
     rows.push({
       varname: cells[0],
       maxclass: obj[1],
@@ -58,7 +66,8 @@ function loadControlTable(protocolPath) {
       text: obj[3] || '',
       range: cells[2],
       sends: cells[3],
-      feedback: cells[4] === '—' ? '' : cells[4],
+      feedback: fb ? fb[1] : '',
+      feedbackRaw: Boolean(fb && fb[2]),
       vis: cells[5],
     });
   }
@@ -66,26 +75,27 @@ function loadControlTable(protocolPath) {
   return rows;
 }
 
-/** Parse BEAT_DIVS / REPEAT_DIVS from ARCHITECTURE.md; null entries when not parseable. */
+const ENUM_CONSTANTS = ['BEAT_DIVS', 'REPEAT_DIVS', 'CAPTURE_BARS', 'GEST_RATES', 'GEST_BEATS_LABELS'];
+
+/** Parse the string-array constants (ENUM_CONSTANTS) from ARCHITECTURE.md; null when not parseable. */
 function loadConstants(archPath) {
   let md = '';
   try {
     md = fs.readFileSync(archPath || path.join(ROOT, 'docs', 'ARCHITECTURE.md'), 'utf8');
   } catch (e) {
-    return { BEAT_DIVS: null, REPEAT_DIVS: null };
+    return Object.fromEntries(ENUM_CONSTANTS.map((n) => [n, null]));
   }
   const arr = (name) => {
     const m = new RegExp('\\b' + name + '\\s*=\\s*\\[([^\\]]*)\\]').exec(md);
     if (!m) return null;
     return Array.from(m[1].matchAll(/'([^']*)'/g), (x) => x[1]);
   };
-  return { BEAT_DIVS: arr('BEAT_DIVS'), REPEAT_DIVS: arr('REPEAT_DIVS') };
+  return Object.fromEntries(ENUM_CONSTANTS.map((n) => [n, arr(n)]));
 }
 
 function expectedEnum(range, consts) {
   const t = range.trim();
-  if (t === 'BEAT_DIVS') return consts.BEAT_DIVS;
-  if (t === 'REPEAT_DIVS') return consts.REPEAT_DIVS;
+  if (ENUM_CONSTANTS.includes(t)) return consts[t];
   if (t === 'A–H') return ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H'];
   const copy = /^Copy→([A-Z])\s*…\s*Copy→([A-Z])$/.exec(t);
   if (copy) {
@@ -302,10 +312,14 @@ function checkDevice(root, errors, opts) {
   const glues = ix.byText(/^v8\s+slicekit\.js\b/);
   if (glues.length !== 1) { err('expected exactly one [v8 slicekit.js ...] glue, found ' + glues.length); return; }
   const glue = glues[0];
-  if (glue.numinlets !== 1 || glue.numoutlets !== 4) err('glue must have 1 inlet / 4 outlets');
-  for (const a of ['---src', '---skstate', '---skview']) {
-    if (!tokens(glue.text).includes(a)) err('glue is missing argument ' + a);
-  }
+  if (glue.numinlets !== 1 || glue.numoutlets !== 5) err('glue must have 1 inlet / 5 outlets');
+  // arguments in order: buffer prefix, state dict, view dict, capture ring buffer (jsarguments[1..4])
+  const glueArgs = tokens(glue.text).slice(2);
+  ['---src', '---skstate', '---skview', '---cap'].forEach((a, i) => {
+    if (!glueArgs.includes(a)) err('glue is missing argument ' + a);
+    else if (glueArgs[i] !== a) err('glue argument ' + (i + 1) + ' must be ' + a + ' (found ' + glueArgs[i] + ')');
+  });
+  checkTopology(ix, glue, err);
 
   let table;
   try {
@@ -338,7 +352,11 @@ function checkDevice(root, errors, opts) {
       const want = row.vis === 'A' ? 0 : 2;
       if (inv !== want) err(tag + ': parameter_invisible ' + inv + ' != ' + want + ' (' + row.vis + ')');
     } else if (b.parameter_enable) {
+      // vis `—`: not a Live parameter (live.drop, umenu, jsui)
       err(tag + ': must not be a Live parameter (parameter_enable should be 0)');
+    }
+    if (row.maxclass === 'umenu' && (b.numinlets !== 1 || b.numoutlets !== 3)) {
+      err(tag + ': umenu must have 1 inlet / 3 outlets (index, text, dumpout)');
     }
 
     // live.text mode / text
@@ -360,7 +378,7 @@ function checkDevice(root, errors, opts) {
     if (row.maxclass === 'live.tab' || row.maxclass === 'live.menu') {
       if (v.parameter_type !== 2) err(tag + ': parameter_type must be 2 (enum)');
       const want = expectedEnum(row.range, consts);
-      if (want === null && (row.range === 'BEAT_DIVS' || row.range === 'REPEAT_DIVS')) {
+      if (want === null && ENUM_CONSTANTS.includes(row.range.trim())) {
         err(tag + ': cannot parse ' + row.range + ' from ARCHITECTURE.md');
       } else if (want && JSON.stringify(v.parameter_enum) !== JSON.stringify(want)) {
         err(tag + ': parameter_enum ' + JSON.stringify(v.parameter_enum) + ' != ' + JSON.stringify(want));
@@ -380,6 +398,18 @@ function checkDevice(root, errors, opts) {
       if (!/\(exp\)/.test(row.range) && v.parameter_exponent > 1) err(tag + ': unexpected parameter_exponent');
     }
 
+    // buttons fire once per click: outlet 0 -> [route bang 1], whose outlets 0 and 1 go to the same boxes
+    if (row.maxclass === 'live.text' && row.mode === 'button' && row.sends !== '—') {
+      const first = ix.targets(b, 0);
+      if (first.length !== 1 || first[0].box.text !== 'route bang 1') {
+        err(tag + ': button outlet 0 must feed exactly one [route bang 1]');
+      } else {
+        const a = ix.targets(first[0].box, 0).map((t) => t.box.id).sort().join();
+        const c = ix.targets(first[0].box, 1).map((t) => t.box.id).sort().join();
+        if (!a || a !== c) err(tag + ': [route bang 1] outlets 0 and 1 must feed the same boxes');
+      }
+    }
+
     // wiring: control -> ... -> glue, passing a box that carries the "sends" text
     const key = row.sends.replace(/<[^>]*>/g, '').replace(/\.\.\./g, '').trim();
     if (key && key !== 'audio' && key !== '—') {
@@ -390,8 +420,17 @@ function checkDevice(root, errors, opts) {
       const outs = ix.out(b.id).filter((l) => l.out <= 1);
       if (outs.length < 2) err(tag + ': audio outlets 0/1 are not both connected');
     }
+    // file / folder chooser: range cell `→ opendialog [type]` -> the chooser sits in the send path
+    const dlg = /^→\s*opendialog(?:\s+(\S+))?\s*$/.exec(row.range.trim());
+    if (dlg) {
+      const want = dlg[1] ? 'opendialog ' + dlg[1] : 'opendialog';
+      const ok = findPaths(ix, b, glue).some((trail) => trail.some((t) => t.text === want
+        || (!dlg[1] && /^opendialog\s/.test(t.text || ''))));
+      if (!ok) err(tag + ': no path control -> ... -> [' + want + '] -> ... -> glue');
+    }
 
     // feedback: glue out2 -> [route ..name..] -> [prepend set] -> control
+    //           raw: glue out2 -> [route ..name..] -> control (inlet 0), never via [prepend set]
     if (row.feedback) {
       const owners = routes.filter((r) => tokens(r.text).slice(1).includes(row.feedback));
       if (owners.length !== 1) { err(tag + ': feedback "' + row.feedback + '" must be in exactly one [route], found ' + owners.length); continue; }
@@ -400,11 +439,67 @@ function checkDevice(root, errors, opts) {
         err(tag + ': route for ' + row.feedback + ' is not fed by glue outlet 2');
       }
       const idx = tokens(r.text).slice(1).indexOf(row.feedback);
-      const viaSet = ix.targets(r, idx).filter((t) => t.box.text === 'prepend set');
-      if (viaSet.length !== 1 || !ix.hasLine(viaSet[0].box, 0, b, 0)) {
-        err(tag + ': route outlet ' + idx + ' (' + row.feedback + ') -> [prepend set] -> control not wired');
+      if (row.feedbackRaw) {
+        const tg = ix.targets(r, idx);
+        if (tg.length !== 1 || tg[0].box !== b || tg[0].inlet !== 0) {
+          err(tag + ': raw feedback route outlet ' + idx + ' (' + row.feedback + ') must go straight to the control inlet 0');
+        }
+        if (ix.inc(b.id).some((l) => ix.byId.get(l.from).text === 'prepend set')) {
+          err(tag + ': raw feedback control must not be fed by [prepend set]');
+        }
+      } else {
+        const viaSet = ix.targets(r, idx).filter((t) => t.box.text === 'prepend set');
+        if (viaSet.length !== 1 || !ix.hasLine(viaSet[0].box, 0, b, 0)) {
+          err(tag + ': route outlet ' + idx + ' (' + row.feedback + ') -> [prepend set] -> control not wired');
+        }
       }
     }
+  }
+}
+
+/**
+ * v2 topology: capture buffers + recorder gen~ (see PROTOCOL.md "v2 additions / Topology additions").
+ *   [buffer~ ---cap 40000 2] [buffer~ ---capwp 10 1] [buffer~ ---capout 1000 2]
+ *   poly~ outlet 0/1 -> [gen~ recorder] inlet 0/1, glue outlet 4 -> [gen~ recorder] inlet 0
+ */
+function checkTopology(ix, glue, err) {
+  for (const t of ['buffer~ ---cap 40000 2', 'buffer~ ---capwp 10 1', 'buffer~ ---capout 1000 2']) {
+    const n = ix.byText(t).length;
+    if (n !== 1) err('expected exactly one [' + t + '], found ' + n);
+  }
+  const polys = ix.byText(/^poly~\s+slicekit\.voice\b/);
+  if (polys.length !== 1) { err('expected exactly one [poly~ slicekit.voice ...], found ' + polys.length); return; }
+  const poly = polys[0];
+  if (!ix.hasLine(glue, 0, poly, 0)) err('missing wire glue outlet 0 -> poly~');
+
+  const recs = ix.boxes.filter((b) => b.text === 'gen~' && b.patcher);
+  if (recs.length !== 1) { err('expected exactly one recorder [gen~] with an embedded patcher, found ' + recs.length); return; }
+  const rec = recs[0];
+  if (rec.numinlets !== 2 || rec.numoutlets < 1) err('recorder gen~ must have 2 inlets (L, R) and an outlet (write position)');
+  if (!rec.patcher || rec.patcher.classnamespace !== 'dsp.gen') {
+    err('recorder gen~ has no embedded dsp.gen patcher');
+  } else {
+    const gi = indexPatcher(rec.patcher);
+    const cbs = gi.boxes.filter((b) => b.maxclass === 'codebox');
+    if (cbs.length !== 1) err('recorder gen~ patcher needs exactly one codebox');
+    else if (typeof cbs[0].code !== 'string' || !cbs[0].code.trim()) err('recorder codebox code is empty');
+    for (const t of ['in 1', 'in 2', 'out 1']) {
+      if (gi.byText(t).length !== 1) err('recorder gen~ patcher needs exactly one [' + t + ']');
+    }
+    if (cbs.length === 1) {
+      for (const [i, t] of ['in 1', 'in 2'].entries()) {
+        const f = gi.byText(t);
+        if (f.length === 1 && !gi.hasLine(f[0], 0, cbs[0], i)) err('recorder: missing wire [' + t + '] -> codebox inlet ' + i);
+      }
+    }
+  }
+  if (!ix.hasLine(poly, 0, rec, 0)) err('missing wire poly~ outlet 0 (L) -> recorder gen~ inlet 0');
+  if (!ix.hasLine(poly, 1, rec, 1)) err('missing wire poly~ outlet 1 (R) -> recorder gen~ inlet 1');
+  if (!ix.hasLine(glue, 4, rec, 0)) err('missing wire glue outlet 4 -> recorder gen~ inlet 0');
+  // the recorder taps the voices before the output gain (live.gain~)
+  for (const l of ix.out(poly.id).filter((x) => x.out <= 1)) {
+    const d = ix.byId.get(l.to);
+    if (d !== rec && d.maxclass !== 'live.gain~') err('poly~ outlet ' + l.out + ' feeds unexpected box ' + nameOf(d));
   }
 }
 

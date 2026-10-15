@@ -398,7 +398,7 @@ const KIT_CONTROLS = [
   button('sk_best', 'Kit Find Best', 'Find best', 'kit findbest'),
   tab('sk_chokescope', 'Choke Scope', 'Choke', ['Sample', 'All'], 'kit chokescope', 'kit_chokescope'),
   toggle('sk_modzone', 'Mod Zone', 'Mods', 'kit modzone', 'kit_modzone'),
-  numbox('sk_modstart', 'Mod Zone Start', 'Mod Start', 0, 116, 'kit modstart', 'kit_modstart', { unit: 'note' }),
+  numbox('sk_modstart', 'Mod Zone Start', 'Mod Start', 0, 112, 'kit modstart', 'kit_modstart', { unit: 'note' }),
   dial('sk_velsens', 'Velocity Sens', 'Vel', 0, 100, 'kit velsens', 'kit_velsens', { unit: 'pct' }),
   toggle('sk_pressure', 'Pressure To Level', 'Press', 'kit pressure2level', 'kit_pressure2level'),
 ];

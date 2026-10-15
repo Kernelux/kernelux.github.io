@@ -1741,7 +1741,7 @@ function createModel(state, deps) {
     var pad = getPad(padId);
     if (!pad) return null;
     var t = toNum(m);
-    t = isFinite(t) ? clamp(t, 0, 1) : 0;
+    t = isNaN(t) ? 0 : clamp(t, 0, 1);
     var out = {};
     var f, i, name, a, b;
     for (f in pad) {

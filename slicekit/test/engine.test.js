@@ -12,11 +12,13 @@ const Engine = require('../core/engine');
 // Stub model
 // ---------------------------------------------------------------------------
 
-// Mod zone starts at MOD_START; offsets follow MOD_ACTIONS.
+// Mod zone (16 keys) starts at MOD_START; offsets follow MOD_ACTIONS.
 const MOD_START = 96;
+const MOD_SIZE = 16;
 const MOD = {
   RPT_4: 96, RPT_8: 97, RPT_8T: 98, RPT_16: 99, RPT_16T: 100, RPT_32: 101, RPT_64: 102,
-  REVERSE: 103, OCTDOWN: 104, OCTUP: 105, TAPE: 106, CHAOS: 107
+  REVERSE: 103, OCTDOWN: 104, OCTUP: 105, TAPE: 106, CHAOS: 107,
+  GEST_0: 108, GEST_1: 109, GEST_2: 110, GEST_3: 111
 };
 
 const START_ORDER = [
@@ -24,6 +26,16 @@ const START_ORDER = [
   'gatemode', 'loopon', 'loopsize', 'looppos', 'rptdiv', 'rptswing', 'rptalt',
   'cutoff', 'drive', 'tape', 'tapems', 'held', 'trig'
 ];
+
+// Default gestures (docs/ARCHITECTURE.md, v2 additions)
+function defaultGestures() {
+  return [
+    { name: 'Build', beats: 4, rateFrom: '1/8', rateTo: '1/64', cutFrom: 20000, cutTo: 1200, pitchFrom: 0, pitchTo: 0, ampFrom: 1, ampTo: 1, curve: 0.3 },
+    { name: 'Rise', beats: 4, rateFrom: '1/16', rateTo: '1/16', cutFrom: 20000, cutTo: 20000, pitchFrom: 0, pitchTo: 12, ampFrom: 1, ampTo: 1, curve: 0 },
+    { name: 'Drop', beats: 2, rateFrom: 'off', rateTo: 'off', cutFrom: 20000, cutTo: 600, pitchFrom: 0, pitchTo: -24, ampFrom: 1, ampTo: 0.6, curve: 0.5 },
+    { name: 'Fade', beats: 4, rateFrom: '1/32', rateTo: '1/32', cutFrom: 20000, cutTo: 20000, pitchFrom: 0, pitchTo: 0, ampFrom: 1, ampTo: 0, curve: 0 }
+  ];
+}
 
 function stubModel() {
   let nextId = 1;
@@ -33,20 +45,39 @@ function stubModel() {
   const keys = {};
   const g = {
     chokeScope: 'source', chaos: 0, repeatOn: false, repeatDiv: '1/16', swing: 0,
-    repeatAlt: false, velSens: 50, pressureToLevel: false
+    repeatAlt: false, velSens: 50, pressureToLevel: false,
+    morph: 0, scan: 0, gestures: defaultGestures()
   };
   const model = {
     modZoneOn: true,
+    effectivePadCalls: [],
     getPadOnKey(k) { const id = keys[k]; return id === undefined ? null : (pads[id] || null); },
     getPad(id) { return pads[id] || null; },
     getSlice(id) { return slices[id] || null; },
     getSource(id) { return sources[id] || null; },
-    isModKey(k) { return model.modZoneOn && k >= MOD_START && k < MOD_START + 12; },
+    isModKey(k) { return model.modZoneOn && k >= MOD_START && k < MOD_START + MOD_SIZE; },
     modOffset(k) { return model.isModKey(k) ? k - MOD_START : -1; },
     occupiedKeys() {
       return Object.keys(keys).map(Number).filter((k) => !model.isModKey(k)).sort((a, b) => a - b);
     },
     globals() { return g; },
+    // Mirrors the real model: numbers linear, cutoffHz geometric, booleans switch at m >= 0.5,
+    // params without a B value stay A. Unknown pad => null.
+    effectivePad(padId, m) {
+      model.effectivePadCalls.push([padId, m]);
+      const pad = pads[padId];
+      if (!pad) return null;
+      const out = { ...pad };
+      const B = pad.morph || {};
+      for (const name of Object.keys(B)) {
+        const a = pad[name];
+        const b = B[name];
+        if (typeof a === 'boolean') out[name] = m >= 0.5 ? b : a;
+        else if (name === 'cutoffHz') out[name] = a * Math.pow(b / a, m);
+        else out[name] = a + (b - a) * m;
+      }
+      return out;
+    },
 
     // ---- test builders (not part of the engine contract) ----
     addSource(o = {}) {
@@ -833,13 +864,13 @@ test('modifier keys never allocate voices, even when a pad sits on them', () => 
   const { model, engine } = mk();
   const src = model.addSource();
   model.addPad(60, src, 0);
-  for (let k = MOD_START; k < MOD_START + 12; k++) model.addPad(k, src, 1);   // stray pads
-  for (let k = MOD_START; k < MOD_START + 12; k++) {
+  for (let k = MOD_START; k < MOD_START + MOD_SIZE; k++) model.addPad(k, src, 1);   // stray pads
+  for (let k = MOD_START; k < MOD_START + MOD_SIZE; k++) {
     assert.deepEqual(starts(engine.noteOn(k, 100)), [], 'key ' + k);
   }
   assert.deepEqual(engine.activeKeys(), []);
   assert.equal(engine.noteOn(60, 100)[0].voice, 0);          // voice 0 still free
-  for (let k = MOD_START; k < MOD_START + 12; k++) engine.noteOff(k);
+  for (let k = MOD_START; k < MOD_START + MOD_SIZE; k++) engine.noteOff(k);
 });
 
 test('with the mod zone off those keys play normal pads', () => {
@@ -1053,8 +1084,9 @@ test('Engine.create requires a model; constants are exported', () => {
   assert.throws(() => Engine.create({}), /model/);
   assert.deepEqual(Engine.REPEAT_PER_BEAT, [1, 2, 3, 4, 6, 8, 12, 16]);
   assert.equal(Engine.REPEAT_DIVS.length, 8);
-  assert.equal(Engine.MOD_ACTIONS.length, 12);
+  assert.equal(Engine.MOD_ACTIONS.length, 16);
   assert.equal(Engine.MOD_ACTIONS[7], 'reverse');
+  assert.deepEqual(Engine.MOD_ACTIONS.slice(12), ['gest:0', 'gest:1', 'gest:2', 'gest:3']);
 });
 
 test('core/engine.js sticks to ES5 and does not require the model', () => {

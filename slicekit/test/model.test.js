@@ -3123,6 +3123,1200 @@ test('pads referenced as layers stay reachable for the engine after their key is
   checkInvariants(m);
 });
 
+// ================================================================ v2: 16-key mod zone, morph, gestures, new globals
+
+function near(a, b, eps) {
+  assert.ok(Math.abs(a - b) <= (eps === undefined ? 1e-9 : eps), a + ' is not close to ' + b);
+}
+
+const NUMERIC_MORPH = CONST.MORPH_PARAMS.filter((n) => n !== 'reverse' && n !== 'loopOn');
+
+// pad with a full A side and a full B side (see the morph tests)
+function morphPad() {
+  const m = bigKit();
+  const p = m.getPadOnKey(36);
+  const A = { pitch: 0, fine: -50, gainDb: -6, attackMs: 10, decayMs: 200, sustain: 0.5, releaseMs: 100, startOffsetMs: 100,
+    loopSizeMs: 20, loopPos: 0.2, cutoffHz: 20000, drive: 0, reverse: false, loopOn: true };
+  const B = { pitch: 12, fine: 50, gainDb: 6, attackMs: 30, decayMs: 600, sustain: 1, releaseMs: 300, startOffsetMs: 300,
+    loopSizeMs: 60, loopPos: 1, cutoffHz: 1250, drive: 1, reverse: true, loopOn: false };
+  Object.keys(A).forEach((n) => assert.equal(m.setPadParam(p.id, n, A[n]), true, 'A.' + n));
+  Object.keys(B).forEach((n) => assert.equal(m.setPadMorphParam(p.id, n, B[n]), true, 'B.' + n));
+  return { m, p, A, B };
+}
+
+// ---------------------------------------------------------------- 16-key mod zone
+
+test('v2 constants: MOD_ZONE_SIZE, gesture / capture / morph tables', () => {
+  assert.equal(CONST.MOD_ZONE_SIZE, 16);
+  assert.deepEqual(CONST.GEST_BEATS, [0.25, 0.5, 1, 2, 4, 8, 16]);
+  assert.deepEqual(CONST.GEST_BEATS_LABELS, ['1/16 bar', '1/8 bar', '1 beat', '2 beats', '1 bar', '2 bars', '4 bars']);
+  assert.equal(CONST.GEST_BEATS_LABELS.length, CONST.GEST_BEATS.length);
+  assert.deepEqual(CONST.GEST_RATES, ['off', '1/4', '1/8', '1/8T', '1/16', '1/16T', '1/32', '1/32T', '1/64']);
+  assert.deepEqual(CONST.GEST_RATES, ['off'].concat(CONST.REPEAT_DIVS));
+  assert.deepEqual(CONST.CAPTURE_BARS, ['1/2 Bar', '1 Bar', '2 Bars', '4 Bars', '8 Bars']);
+  assert.deepEqual(CONST.CAPTURE_BEATS, [2, 4, 8, 16, 32]);
+  assert.equal(CONST.CAPTURE_BEATS.length, CONST.CAPTURE_BARS.length);
+  assert.deepEqual(CONST.MORPH_PARAMS, ['pitch', 'fine', 'gainDb', 'attackMs', 'decayMs', 'sustain', 'releaseMs',
+    'startOffsetMs', 'loopSizeMs', 'loopPos', 'cutoffHz', 'drive', 'reverse', 'loopOn']);
+  // every morph param is a real, user-editable pad param
+  const m = mk();
+  addSrc(m, 'a', 1);
+  const p = m.getPadOnKey(36);
+  CONST.MORPH_PARAMS.forEach((n) => assert.ok(n in p, n + ' is a Pad field'));
+  assert.equal(CONST.MORPH_PARAMS.length, 14);
+  assert.equal(new Set(CONST.MORPH_PARAMS).size, 14);
+  // the mod zone actions fill the zone exactly, gestures last
+  assert.equal(CONST.MOD_ACTIONS.length, CONST.MOD_ZONE_SIZE);
+  assert.deepEqual(CONST.MOD_ACTIONS.slice(12), ['gest:0', 'gest:1', 'gest:2', 'gest:3']);
+});
+
+test('16-key mod zone: isModKey / modOffset for the start positions 0, 40, 96 and 112', () => {
+  [0, 40, 96, 112].forEach((start) => {
+    const m = mk();
+    m.setGlobal('modZoneStart', start);
+    m.setGlobal('modZoneOn', true);
+    assert.equal(m.globals().modZoneStart, start);
+    for (let k = 0; k < 128; k++) {
+      const inside = k >= start && k < start + 16;
+      assert.equal(m.isModKey(k), inside, 'isModKey(' + k + ') start ' + start);
+      assert.equal(m.modOffset(k), inside ? k - start : -1, 'modOffset(' + k + ') start ' + start);
+    }
+    // every offset has an action
+    for (let o = 0; o < 16; o++) assert.ok(typeof CONST.MOD_ACTIONS[o] === 'string');
+    m.setGlobal('modZoneOn', false);
+    for (let k = 0; k < 128; k++) {
+      assert.equal(m.isModKey(k), false);
+      assert.equal(m.modOffset(k), -1);
+    }
+  });
+});
+
+test('modZoneStart clamps to 0..112 (v1 allowed 116)', () => {
+  const m = mk();
+  [[113, 112], [116, 112], [127, 112], [200, 112], [112.4, 112], [111.6, 112], [-5, 0], [0.4, 0], ['100', 100]].forEach(([input, want]) => {
+    assert.equal(m.setGlobal('modZoneStart', input), true);
+    assert.equal(m.globals().modZoneStart, want, 'modZoneStart ' + input);
+  });
+  assert.equal(m.setGlobal('modZoneStart', 'abc'), false);
+  assert.equal(m.globals().modZoneStart, 100);
+});
+
+test('layout skips all 16 mod-zone keys (and only those)', () => {
+  const m = mk();
+  addSrc(m, 'a', 20);
+  m.setGlobal('rootKey', 90);
+  m.setGlobal('modZoneStart', 100);
+  m.setGlobal('modZoneOn', true); // 100..115
+  assert.deepEqual(tags(m, 90, 99), Array.from({ length: 10 }, (_, i) => 'a' + i));
+  for (let k = 100; k <= 115; k++) assert.equal(m.getPadOnKey(k), null, 'key ' + k + ' is in the zone');
+  assert.deepEqual(tags(m, 116, 125), Array.from({ length: 10 }, (_, i) => 'a' + (10 + i)));
+  assert.equal(m.isModKey(99), false);
+  assert.equal(m.isModKey(116), false);
+  assert.deepEqual(m.occupiedKeys(), [].concat(
+    Array.from({ length: 10 }, (_, i) => 90 + i), Array.from({ length: 10 }, (_, i) => 116 + i)));
+  // interleave and sorted skip the same keys
+  addSrc(m, 'b', 2, (i) => feat(100 * (i + 1)));
+  m.setGlobal('layout', 'interleave');
+  for (let k = 100; k <= 115; k++) assert.equal(m.getPadOnKey(k), null);
+  assert.equal(m.occupiedKeys().length, 22, 'capacity: 90..99 and 116..127');
+  m.setGlobal('layout', 'sorted');
+  for (let k = 100; k <= 115; k++) assert.equal(m.getPadOnKey(k), null);
+  assert.equal(m.occupiedKeys().length, 22);
+  checkInvariants(m);
+});
+
+test('a zone at the top of the keyboard (112..127) drops what no longer fits', () => {
+  const m = mk();
+  addSrc(m, 'a', 20);
+  m.setGlobal('rootKey', 100);
+  m.setGlobal('modZoneStart', 112);
+  m.setGlobal('modZoneOn', true);
+  assert.deepEqual(m.applyLayout(0), { placed: 12, dropped: 8 });
+  assert.equal(tag(m, 111), 'a11');
+  for (let k = 112; k < 128; k++) assert.equal(m.getPadOnKey(k), null);
+  checkInvariants(m);
+});
+
+// ---------------------------------------------------------------- morph: B values
+
+test('Pad.morph starts as an own empty object on every pad (also copies)', () => {
+  const m = bigKit();
+  const a = m.getPadOnKey(36);
+  const b = m.getPadOnKey(37);
+  assert.deepEqual(a.morph, {});
+  assert.deepEqual(b.morph, {});
+  assert.notEqual(a.morph, b.morph);
+  const d = m.duplicatePad(36, 70);
+  assert.deepEqual(d.morph, {});
+  assert.notEqual(d.morph, a.morph);
+  padIds(m).forEach((id) => assert.deepEqual(m.getPad(id).morph, {}));
+});
+
+test('setPadMorphParam clamps like setPadParam, stores only B and leaves A alone', () => {
+  const m = bigKit();
+  const p = m.getPadOnKey(36);
+  const before = JSON.parse(JSON.stringify(p));
+  NUMERIC_MORPH.forEach((name) => {
+    const [lo, hi] = Model.PAD_RANGES[name];
+    assert.equal(m.setPadMorphParam(p.id, name, lo - 1000), true, name);
+    assert.equal(p.morph[name], lo, name + ' low clamp');
+    assert.equal(m.setPadMorphParam(p.id, name, hi + 1000), true, name);
+    assert.equal(p.morph[name], hi, name + ' high clamp');
+    const mid = (lo + hi) / 2 + 0.125;
+    m.setPadMorphParam(p.id, name, mid);
+    assert.equal(p.morph[name], mid, name + ' floats are kept');
+    assert.equal(m.setPadMorphParam(p.id, name, NaN), false, name + ' NaN');
+    assert.equal(m.setPadMorphParam(p.id, name, 'abc'), false, name + ' junk');
+    assert.equal(m.setPadMorphParam(p.id, name, undefined), false, name + ' undefined');
+    assert.equal(p.morph[name], mid, name + ' unchanged by refused values');
+    // the same clamp as setPadParam
+    const q = m.getPadOnKey(37);
+    m.setPadParam(q.id, name, hi + 1000);
+    m.setPadMorphParam(q.id, name, hi + 1000);
+    assert.equal(q.morph[name], q[name]);
+    m.setPadParam(q.id, name, lo - 1000);
+    m.setPadMorphParam(q.id, name, lo - 1000);
+    assert.equal(q.morph[name], q[name]);
+  });
+  m.setPadMorphParam(p.id, 'reverse', true);
+  assert.equal(p.morph.reverse, true);
+  m.setPadMorphParam(p.id, 'reverse', 0);
+  assert.equal(p.morph.reverse, false);
+  m.setPadMorphParam(p.id, 'loopOn', 'true');
+  assert.equal(p.morph.loopOn, true);
+  m.setPadMorphParam(p.id, 'loopOn', 'false');
+  assert.equal(p.morph.loopOn, false);
+  assert.equal(m.setPadMorphParam(p.id, 'loopOn', 'maybe'), false);
+  assert.equal(p.morph.loopOn, false);
+  m.setPadMorphParam(p.id, 'pitch', '7.5');
+  assert.equal(p.morph.pitch, 7.5);
+  assert.deepEqual(Object.keys(p.morph).sort(), CONST.MORPH_PARAMS.slice().sort());
+  // A side untouched
+  CONST.MORPH_PARAMS.forEach((n) => assert.equal(p[n], before[n], 'A.' + n));
+  checkInvariants(m);
+});
+
+test('setPadMorphParam rejects non-morph names and unknown pads', () => {
+  const m = bigKit();
+  const p = m.getPadOnKey(36);
+  ['id', 'base', 'layers', 'sliceId', 'sourceId', 'origSliceId', 'simIndex', 'morph', 'bogus', 'constructor', '__proto__', 'toString', '', 5, null, undefined].forEach((n) => {
+    assert.equal(m.setPadMorphParam(p.id, n, 1), false, 'name ' + String(n));
+  });
+  assert.deepEqual(p.morph, {});
+  assert.equal(m.setPadMorphParam(999999, 'pitch', 1), false);
+  assert.equal(m.setPadMorphParam(undefined, 'pitch', 1), false);
+  assert.equal(m.setPadMorphParam(null, 'pitch', 1), false);
+  assert.equal(m.canUndo(), false, 'refused edits leave no undo step');
+});
+
+test('setPadMorphParam: unchanged B creates no undo step and no notification; B equal to A is still stored', () => {
+  const m = bigKit();
+  const p = m.getPadOnKey(36);
+  assert.equal(m.setPadMorphParam(p.id, 'pitch', p.pitch), true);
+  assert.deepEqual(p.morph, { pitch: 0 }, 'an explicit B that equals A is an entry');
+  const kinds = record(m);
+  assert.equal(m.setPadMorphParam(p.id, 'pitch', 0), true);
+  assert.deepEqual(kinds, []);
+  m.undo();
+  assert.deepEqual(p.morph, {});
+  assert.equal(m.canUndo(), false, 'exactly one step was created');
+});
+
+test('setPadMorphParam notifies pads and coalesces per pad+param (own key, apart from setPadParam)', () => {
+  const m = bigKit();
+  const p = m.getPadOnKey(36);
+  const kinds = record(m);
+  [1, 2, 3, 4].forEach((v) => m.setPadMorphParam(p.id, 'pitch', v));
+  assert.deepEqual(kinds, ['pads', 'pads', 'pads', 'pads']);
+  assert.deepEqual(p.morph, { pitch: 4 });
+  // a drag is one step
+  m.undo();
+  assert.deepEqual(p.morph, {});
+  assert.equal(m.canUndo(), false);
+  m.redo();
+  assert.deepEqual(p.morph, { pitch: 4 });
+  // other param, the A param of the same name and the B param again are separate steps
+  m.setPadMorphParam(p.id, 'drive', 0.5);
+  m.setPadParam(p.id, 'pitch', 2);
+  m.setPadMorphParam(p.id, 'pitch', 5);
+  m.setPadMorphParam(p.id, 'pitch', 6); // coalesces with the previous one
+  assert.deepEqual(p.morph, { pitch: 6, drive: 0.5 });
+  m.undo();
+  assert.deepEqual(p.morph, { pitch: 4, drive: 0.5 });
+  assert.equal(p.pitch, 2);
+  m.undo();
+  assert.equal(p.pitch, 0);
+  assert.deepEqual(p.morph, { pitch: 4, drive: 0.5 });
+  m.undo();
+  assert.deepEqual(p.morph, { pitch: 4 });
+  m.undo();
+  assert.deepEqual(p.morph, {});
+  assert.equal(m.canUndo(), false);
+  // redo walks forward again
+  m.redo(); m.redo(); m.redo(); m.redo();
+  assert.deepEqual(p.morph, { pitch: 6, drive: 0.5 });
+  assert.equal(p.pitch, 2);
+  // different pads do not coalesce
+  const q = m.getPadOnKey(37);
+  m.setPadMorphParam(p.id, 'fine', 1);
+  m.setPadMorphParam(q.id, 'fine', 2);
+  m.undo();
+  assert.deepEqual(q.morph, {});
+  assert.equal(p.morph.fine, 1);
+  checkInvariants(m);
+});
+
+test('setPadMorphParam keeps the pad object identity through undo/redo', () => {
+  const m = bigKit();
+  const p = m.getPadOnKey(36);
+  m.setPadMorphParam(p.id, 'cutoffHz', 900);
+  m.undo();
+  assert.equal(m.getPad(p.id), p);
+  assert.deepEqual(p.morph, {});
+  m.redo();
+  assert.equal(m.getPad(p.id), p);
+  assert.deepEqual(p.morph, { cutoffHz: 900 });
+});
+
+test('copyPadToMorph copies every morph param of A into B; idempotent; undoable', () => {
+  const m = bigKit();
+  const p = m.getPadOnKey(36);
+  m.setPadParam(p.id, 'pitch', 5);
+  m.setPadParam(p.id, 'reverse', true);
+  m.setPadParam(p.id, 'cutoffHz', 777);
+  m.toggleLayer(36, 38);
+  const kinds = record(m);
+  assert.equal(m.copyPadToMorph(p.id), true);
+  assert.deepEqual(kinds, ['pads']);
+  assert.deepEqual(Object.keys(p.morph).sort(), CONST.MORPH_PARAMS.slice().sort());
+  CONST.MORPH_PARAMS.forEach((n) => assert.equal(p.morph[n], p[n], n));
+  // pre-existing B values are overwritten by A
+  m.setPadMorphParam(p.id, 'pitch', -3);
+  m.copyPadToMorph(p.id);
+  assert.equal(p.morph.pitch, 5);
+  // a second copy changes nothing: no notification, no extra step
+  kinds.length = 0;
+  assert.equal(m.copyPadToMorph(p.id), true);
+  assert.deepEqual(kinds, []);
+  m.undo(); // undoes the copy that overwrote pitch -3
+  assert.equal(p.morph.pitch, -3);
+  m.undo(); // the setPadMorphParam
+  assert.equal(p.morph.pitch, 5);
+  m.undo(); // the first copyPadToMorph
+  assert.deepEqual(p.morph, {});
+  // refused
+  assert.equal(m.copyPadToMorph(424242), false);
+  assert.equal(m.copyPadToMorph(undefined), false);
+  checkInvariants(m);
+});
+
+test('clearPadMorph removes every B value of the pad; no-op on an empty morph', () => {
+  const m = bigKit();
+  const p = m.getPadOnKey(36);
+  const q = m.getPadOnKey(37);
+  m.copyPadToMorph(p.id);
+  m.copyPadToMorph(q.id);
+  const kinds = record(m);
+  assert.equal(m.clearPadMorph(p.id), true);
+  assert.deepEqual(kinds, ['pads']);
+  assert.deepEqual(p.morph, {});
+  assert.equal(Object.keys(q.morph).length, 14, 'other pads untouched');
+  kinds.length = 0;
+  assert.equal(m.clearPadMorph(p.id), true);
+  assert.deepEqual(kinds, [], 'empty morph: nothing to do');
+  m.undo();
+  assert.equal(Object.keys(p.morph).length, 14);
+  assert.equal(m.clearPadMorph(424242), false);
+  assert.equal(m.clearPadMorph(null), false);
+  checkInvariants(m);
+});
+
+test('copyAllToMorph / clearAllMorph act on every pad (incl. non-base copies) in one undo step', () => {
+  const m = bigKit();
+  const base = m.getPadOnKey(36);
+  m.setPadParam(base.id, 'pitch', 4);
+  const copy = m.duplicatePad(36, 80);
+  m.setPadParam(copy.id, 'pitch', 9);
+  m.setPadMorphParam(m.getPadOnKey(37).id, 'drive', 0.5);
+  const ids = padIds(m);
+  const snapshot = stripped(m);
+  const kinds = record(m);
+  assert.equal(m.copyAllToMorph(), ids.length);
+  assert.deepEqual(kinds, ['pads']);
+  ids.forEach((id) => {
+    const p = m.getPad(id);
+    assert.equal(Object.keys(p.morph).length, 14);
+    CONST.MORPH_PARAMS.forEach((n) => assert.equal(p.morph[n], p[n], n));
+  });
+  assert.equal(m.getPad(copy.id).morph.pitch, 9);
+  // the second call has nothing to do
+  kinds.length = 0;
+  assert.equal(m.copyAllToMorph(), 0);
+  assert.deepEqual(kinds, []);
+  // one step back, including the mixed state that was there before
+  m.undo();
+  assert.deepEqual(stripped(m), snapshot);
+  m.redo();
+  // clear all
+  kinds.length = 0;
+  assert.equal(m.clearAllMorph(), ids.length);
+  assert.deepEqual(kinds, ['pads']);
+  ids.forEach((id) => assert.deepEqual(m.getPad(id).morph, {}));
+  kinds.length = 0;
+  assert.equal(m.clearAllMorph(), 0);
+  assert.deepEqual(kinds, []);
+  m.undo();
+  assert.equal(Object.keys(m.getPad(ids[0]).morph).length, 14);
+  m.undo();
+  assert.deepEqual(stripped(m), snapshot);
+  assert.equal(m.canUndo(), true, 'earlier steps (setPadParam ...) are still there');
+  checkInvariants(m);
+});
+
+test('copyAllToMorph / clearAllMorph on a model without pads do nothing', () => {
+  const m = mk();
+  assert.equal(m.copyAllToMorph(), 0);
+  assert.equal(m.clearAllMorph(), 0);
+  assert.equal(m.canUndo(), false);
+});
+
+test('applyMorphParamToSource copies this pad\'s B value to all pads of the same source (incl. copies), one undo step', () => {
+  const m = bigKit(); // a: 8 slices (keys 36..43), b: 4 slices (44..47)
+  const p = m.getPadOnKey(36);
+  const copy = m.duplicatePad(36, 90);
+  const other = m.getPadOnKey(44);
+  m.setPadMorphParam(p.id, 'pitch', 12);
+  m.setPadMorphParam(m.getPadOnKey(37).id, 'pitch', -5); // overwritten
+  m.setPadMorphParam(other.id, 'pitch', 3);              // other source: untouched
+  m.setPadMorphParam(p.id, 'drive', 0.5);                // another param: not copied
+  const kinds = record(m);
+  const sameSource = padIds(m).filter((id) => m.getPad(id).sourceId === p.sourceId && id !== p.id);
+  assert.equal(m.applyMorphParamToSource(p.id, 'pitch'), sameSource.length);
+  assert.deepEqual(kinds, ['pads']);
+  sameSource.forEach((id) => {
+    assert.equal(m.getPad(id).morph.pitch, 12, 'pad ' + id);
+    assert.equal(m.getPad(id).morph.drive, undefined);
+    assert.equal(m.getPad(id).pitch, 0, 'A untouched');
+  });
+  assert.equal(m.getPad(copy.id).morph.pitch, 12);
+  assert.equal(other.morph.pitch, 3);
+  // nothing left to change
+  kinds.length = 0;
+  assert.equal(m.applyMorphParamToSource(p.id, 'pitch'), 0);
+  assert.deepEqual(kinds, []);
+  m.undo();
+  assert.equal(m.getPadOnKey(37).morph.pitch, -5);
+  assert.equal(copy.morph.pitch, undefined);
+  assert.equal(p.morph.pitch, 12);
+  m.redo();
+  // booleans work too
+  m.setPadMorphParam(p.id, 'reverse', true);
+  assert.equal(m.applyMorphParamToSource(p.id, 'reverse'), sameSource.length);
+  assert.equal(m.getPadOnKey(40).morph.reverse, true);
+  checkInvariants(m);
+});
+
+test('applyMorphParamToSource without a B value, with a bad name or an unknown pad does nothing', () => {
+  const m = bigKit();
+  const p = m.getPadOnKey(36);
+  m.setPadMorphParam(m.getPadOnKey(37).id, 'pitch', 5);
+  m.undo();
+  m.setPadMorphParam(m.getPadOnKey(37).id, 'pitch', 5);
+  const before = JSON.stringify(m.state.pads);
+  assert.equal(m.applyMorphParamToSource(p.id, 'pitch'), 0, 'this pad has no B value for pitch');
+  assert.equal(m.applyMorphParamToSource(p.id, 'bogus'), 0);
+  assert.equal(m.applyMorphParamToSource(p.id, 'layers'), 0);
+  assert.equal(m.applyMorphParamToSource(424242, 'pitch'), 0);
+  assert.equal(m.applyMorphParamToSource(undefined, 'pitch'), 0);
+  assert.equal(JSON.stringify(m.state.pads), before);
+  m.undo(); // the single setPadMorphParam: nothing else was recorded
+  assert.equal(m.canUndo(), false);
+});
+
+// ---------------------------------------------------------------- morph: effectivePad
+
+test('effectivePad without B values is a plain deep copy of the pad; unknown pad gives null', () => {
+  const m = bigKit();
+  const p = m.getPadOnKey(36);
+  m.setPadParam(p.id, 'pitch', 3);
+  m.toggleLayer(36, 37);
+  [0, 0.3, 0.5, 1].forEach((t) => {
+    const e = m.effectivePad(p.id, t);
+    assert.deepEqual(e, JSON.parse(JSON.stringify(p)), 'm=' + t);
+    assert.notEqual(e, p);
+    assert.notEqual(e.layers, p.layers);
+    assert.notEqual(e.morph, p.morph);
+    assert.deepEqual(Object.keys(e).sort(), Object.keys(p).sort(), 'every Pad field is present');
+  });
+  const e = m.effectivePad(p.id, 0.5);
+  e.layers.push(99);
+  e.morph.pitch = 1;
+  e.pitch = 40;
+  assert.equal(p.layers.length, 1);
+  assert.deepEqual(p.morph, {});
+  assert.equal(p.pitch, 3);
+  assert.equal(m.effectivePad(999999, 0), null);
+  assert.equal(m.effectivePad(undefined, 0), null);
+  assert.equal(m.effectivePad(null, 0), null);
+  assert.equal(m.effectivePad('x', 0), null);
+});
+
+test('effectivePad at m = 0, 0.5 and 1: numbers linear, cutoffHz geometric, booleans switch at 0.5', () => {
+  const { m, p, A, B } = morphPad();
+  // m = 0 is exactly A, m = 1 exactly B
+  const e0 = m.effectivePad(p.id, 0);
+  const e1 = m.effectivePad(p.id, 1);
+  CONST.MORPH_PARAMS.forEach((n) => {
+    assert.equal(e0[n], A[n], 'm=0 ' + n);
+    assert.equal(e1[n], B[n], 'm=1 ' + n);
+  });
+  // m = 0.5
+  const h = m.effectivePad(p.id, 0.5);
+  near(h.pitch, 6);
+  near(h.fine, 0);
+  near(h.gainDb, 0);
+  near(h.attackMs, 20);
+  near(h.decayMs, 400);
+  near(h.sustain, 0.75);
+  near(h.releaseMs, 200);
+  near(h.startOffsetMs, 200);
+  near(h.loopSizeMs, 40);
+  near(h.loopPos, 0.6);
+  near(h.cutoffHz, 5000);            // 20000 * (1250/20000)^0.5, not the linear 10625
+  near(h.drive, 0.5);
+  assert.equal(h.reverse, true, 'booleans: m >= 0.5 is B');
+  assert.equal(h.loopOn, false);
+  // other m
+  const q = m.effectivePad(p.id, 0.25);
+  near(q.pitch, 3);
+  near(q.cutoffHz, 10000);
+  assert.equal(q.reverse, false);
+  assert.equal(q.loopOn, true);
+  const b = m.effectivePad(p.id, 0.499);
+  assert.equal(b.reverse, false);
+  assert.equal(b.loopOn, true);
+  assert.equal(m.effectivePad(p.id, 0.5).reverse, true);
+  // monotonic cutoff, geometric ratio is constant per step
+  const c1 = m.effectivePad(p.id, 0.2).cutoffHz;
+  const c2 = m.effectivePad(p.id, 0.4).cutoffHz;
+  const c3 = m.effectivePad(p.id, 0.6).cutoffHz;
+  near(c1 / 20000, c2 / c1, 1e-9);
+  near(c2 / c1, c3 / c2, 1e-9);
+  // non-morph fields are carried over untouched
+  ['id', 'sourceId', 'sliceId', 'base', 'layers', 'origSliceId', 'simIndex'].forEach((n) => {
+    assert.deepEqual(h[n], p[n], n);
+  });
+  // A stays in the model
+  CONST.MORPH_PARAMS.forEach((n) => assert.equal(p[n], A[n]));
+});
+
+test('effectivePad: a param without a B value stays A at every m; endpoints carry no float error', () => {
+  const m = bigKit();
+  const p = m.getPadOnKey(36);
+  m.setPadParam(p.id, 'fine', 0.1);
+  m.setPadParam(p.id, 'cutoffHz', 3000);
+  m.setPadParam(p.id, 'reverse', true);
+  m.setPadMorphParam(p.id, 'fine', 0.3);
+  [0, 0.4, 0.5, 1].forEach((t) => {
+    const e = m.effectivePad(p.id, t);
+    assert.equal(e.cutoffHz, 3000, 'no B cutoff: A at m=' + t);
+    assert.equal(e.reverse, true, 'no B reverse: A at m=' + t);
+    assert.equal(e.pitch, 0);
+  });
+  assert.equal(m.effectivePad(p.id, 0).fine, 0.1);
+  assert.equal(m.effectivePad(p.id, 1).fine, 0.3, 'exactly B, not 0.30000000000000004');
+  near(m.effectivePad(p.id, 0.5).fine, 0.2);
+  // B for a boolean that matches A: no change; B false against A true: switches
+  m.setPadMorphParam(p.id, 'reverse', false);
+  assert.equal(m.effectivePad(p.id, 0.49).reverse, true);
+  assert.equal(m.effectivePad(p.id, 0.5).reverse, false);
+  assert.equal(m.effectivePad(p.id, 1).reverse, false);
+  // geometric endpoints
+  m.setPadMorphParam(p.id, 'cutoffHz', 20);
+  assert.equal(m.effectivePad(p.id, 1).cutoffHz, 20);
+  assert.equal(m.effectivePad(p.id, 0).cutoffHz, 3000);
+  near(m.effectivePad(p.id, 0.5).cutoffHz, Math.sqrt(3000 * 20), 1e-6);
+});
+
+test('effectivePad clamps / coerces m and has no side effects', () => {
+  const { m, p, B } = morphPad();
+  const e1 = m.effectivePad(p.id, 1);
+  assert.deepEqual(m.effectivePad(p.id, 7), e1);
+  assert.deepEqual(m.effectivePad(p.id, Infinity), e1);
+  const e0 = m.effectivePad(p.id, 0);
+  [-1, -Infinity, NaN, undefined, null, 'abc', {}].forEach((t) => assert.deepEqual(m.effectivePad(p.id, t), e0, String(t)));
+  assert.deepEqual(m.effectivePad(p.id, '0.5'), m.effectivePad(p.id, 0.5));
+  // reading never notifies, never touches history or state
+  const kinds = record(m);
+  const json = JSON.stringify(m.state);
+  const undoable = m.canUndo();
+  for (let t = 0; t <= 1; t += 0.1) m.effectivePad(p.id, t);
+  assert.deepEqual(kinds, []);
+  assert.equal(JSON.stringify(m.state), json);
+  assert.equal(m.canUndo(), undoable);
+  assert.equal(p.morph.pitch, B.pitch);
+});
+
+test('effectivePad follows the global morph amount as the engine uses it (morph / 100)', () => {
+  const { m, p } = morphPad();
+  m.setGlobal('morph', 50);
+  const e = m.effectivePad(p.id, m.globals().morph / 100);
+  near(e.pitch, 6);
+  near(e.cutoffHz, 5000);
+  m.setGlobal('morph', 100);
+  assert.equal(m.effectivePad(p.id, m.globals().morph / 100).pitch, 12);
+  m.setGlobal('morph', 0);
+  assert.equal(m.effectivePad(p.id, m.globals().morph / 100).pitch, 0);
+});
+
+// ---------------------------------------------------------------- morph: copies and undo
+
+test('copies of pads keep a deep copy of morph: duplicate, spread, flip shuffle, similar swap', () => {
+  const m = bigKit();
+  const src = m.getPadOnKey(36);
+  m.setPadMorphParam(src.id, 'pitch', 5);
+  m.setPadMorphParam(src.id, 'reverse', true);
+  m.setPadMorphParam(src.id, 'cutoffHz', 900);
+  const want = { pitch: 5, reverse: true, cutoffHz: 900 };
+
+  // duplicate
+  const d = m.duplicatePad(36, 70);
+  assert.deepEqual(d.morph, want);
+  assert.notEqual(d.morph, src.morph);
+  d.morph.pitch = -3; // mutate the copy directly: the source must not change
+  assert.equal(src.morph.pitch, 5);
+  m.undo();
+
+  // spread (levels 1.. are copies of the pad on the key)
+  const keys = m.spread(36, 'decay', 4, 100);
+  assert.equal(keys.length, 3);
+  const seen = new Set([src.morph]);
+  keys.forEach((k) => {
+    const c = m.getPadOnKey(k);
+    assert.equal(c.base, false);
+    assert.deepEqual(c.morph, want);
+    assert.ok(!seen.has(c.morph), 'own morph object');
+    seen.add(c.morph);
+    assert.equal(c.decayMs, 300 + 100 * (k - 36), 'A side is spread, B is copied as is');
+  });
+  m.undo();
+
+  // flip shuffle: the moved pad becomes a reversed copy; B is copied untouched
+  m.shuffle({ seed: 3, flipPct: 100 });
+  const flipped = m.getSlotKeys(0).filter((id) => id !== null).map((id) => m.getPad(id)).filter((p) => p.sliceId === src.sliceId);
+  assert.equal(flipped.length, 1);
+  assert.equal(flipped[0].base, false);
+  assert.equal(flipped[0].reverse, true, 'A.reverse toggled');
+  assert.deepEqual(flipped[0].morph, want, 'B copied, B.reverse not toggled');
+  assert.notEqual(flipped[0].morph, src.morph);
+  m.undo();
+
+  // similar swap of a base pad puts a variation (a copy) on the key
+  const sw = m.swapSimilar(36, 1);
+  assert.notEqual(sw.id, src.id);
+  assert.equal(sw.base, false);
+  assert.deepEqual(sw.morph, want);
+  assert.notEqual(sw.morph, src.morph);
+  assert.deepEqual(src.morph, want, 'the base pad keeps its B values');
+  checkInvariants(m);
+});
+
+test('undo snapshots include morph: exact undo/redo of operations that create or drop copies', () => {
+  const m = bigKit();
+  const p = m.getPadOnKey(36);
+  m.copyAllToMorph();
+  m.setPadMorphParam(p.id, 'pitch', 11);
+  const s0 = stripped(m);
+  m.shuffle({ seed: 9, flipPct: 100 });
+  const s1 = stripped(m);
+  assert.notDeepEqual(s1, s0);
+  m.clearAllMorph();
+  const s2 = stripped(m);
+  m.undo();
+  assert.deepEqual(stripped(m), s1);
+  m.undo();
+  assert.deepEqual(stripped(m), s0);
+  assert.equal(m.getPad(p.id).morph.pitch, 11);
+  m.redo();
+  assert.deepEqual(stripped(m), s1);
+  m.redo();
+  assert.deepEqual(stripped(m), s2);
+  checkInvariants(m);
+});
+
+test('reslice keeps B values with the pad (pads are re-pointed, not recreated)', () => {
+  const m = mk();
+  const s = addSrc(m, 'a', 4);
+  const p = m.getPadOnKey(36);
+  m.setPadMorphParam(p.id, 'pitch', 7);
+  m.setSlices(s.id, ranges(6));
+  assert.equal(m.getPad(p.id), p);
+  assert.deepEqual(p.morph, { pitch: 7 });
+  m.getSlicesOfSource(s.id).forEach((sl) => assert.deepEqual(basePadOf(m, sl.id).morph === p.morph, basePadOf(m, sl.id) === p));
+  checkInvariants(m);
+});
+
+// ---------------------------------------------------------------- gestures
+
+test('gesture defaults are the documented four, independent per model', () => {
+  const m = mk();
+  const g = m.globals().gestures;
+  assert.equal(g.length, 4);
+  assert.deepEqual(g, defaultGestures());
+  assert.equal(g[0].name, 'Build');
+  assert.equal(g[3].name, 'Fade');
+  assert.equal(g[2].rateFrom, 'off');
+  // getGesture returns the LIVE object
+  for (let i = 0; i < 4; i++) {
+    assert.equal(m.getGesture(i), g[i]);
+    assert.deepEqual(m.getGesture(i), defaultGestures()[i]);
+  }
+  assert.equal(m.getGesture('2'), g[2]);
+  [-1, 4, 99, NaN, 'x', null, undefined, {}].forEach((i) => assert.equal(m.getGesture(i), null, String(i)));
+  // live: an edit shows up in a held reference
+  const held = m.getGesture(1);
+  m.setGestureParam(1, 'pitchTo', 5);
+  assert.equal(held.pitchTo, 5);
+  // no sharing between models or with the module defaults
+  const other = mk();
+  assert.equal(other.getGesture(1).pitchTo, 12);
+  assert.notEqual(other.getGesture(1), held);
+  assert.notEqual(other.globals().gestures, g);
+  assert.deepEqual(Model.create().globals().gestures, defaultGestures());
+});
+
+test('setGestureParam: name', () => {
+  const m = mk();
+  assert.equal(m.setGestureParam(0, 'name', 'Riser'), true);
+  assert.equal(m.getGesture(0).name, 'Riser');
+  m.setGestureParam(0, 'name', '  Padded  ');
+  assert.equal(m.getGesture(0).name, 'Padded', 'trimmed');
+  m.setGestureParam(0, 'name', 808);
+  assert.equal(m.getGesture(0).name, '808', 'numbers become text');
+  m.setGestureParam(0, 'name', 'x'.repeat(100));
+  assert.equal(m.getGesture(0).name, 'x'.repeat(32), 'capped at 32 characters');
+  ['', '   ', null, undefined, true, {}, [], NaN].forEach((v) => {
+    assert.equal(m.setGestureParam(0, 'name', v), false, String(v));
+  });
+  assert.equal(m.getGesture(0).name, 'x'.repeat(32));
+  assert.equal(m.getGesture(1).name, 'Rise', 'other gestures untouched');
+});
+
+test('setGestureParam: beats accepts a GEST_BEATS value, an index or a label', () => {
+  const m = mk();
+  const beats = (v) => {
+    const r = m.setGestureParam(0, 'beats', v);
+    return r ? m.getGesture(0).beats : r;
+  };
+  // values (a number in GEST_BEATS is a value first: 1 means 1 beat, 2 means 2 beats)
+  CONST.GEST_BEATS.forEach((v) => assert.equal(beats(v), v, 'value ' + v));
+  assert.equal(beats(1), 1);
+  assert.equal(beats(2), 2);
+  // indices: integers 0..6 that are not themselves GEST_BEATS values
+  assert.equal(beats(0), 0.25);
+  assert.equal(beats(3), 2);
+  assert.equal(beats(5), 8);
+  assert.equal(beats(6), 16);
+  assert.equal(beats(4), 4, '4 is value and index at once');
+  // labels, numeric strings
+  CONST.GEST_BEATS_LABELS.forEach((label, i) => assert.equal(beats(label), CONST.GEST_BEATS[i], label));
+  assert.equal(beats('8'), 8);
+  // refused values leave the old one
+  m.setGestureParam(0, 'beats', 16);
+  [3.5, 7, 32, -1, 0.3, 'abc', '', NaN, Infinity, null, undefined, true, {}].forEach((v) => {
+    assert.equal(m.setGestureParam(0, 'beats', v), false, String(v));
+    assert.equal(m.getGesture(0).beats, 16);
+  });
+});
+
+test('setGestureParam: rateFrom / rateTo accept GEST_RATES strings or indices', () => {
+  const m = mk();
+  ['rateFrom', 'rateTo'].forEach((name) => {
+    CONST.GEST_RATES.forEach((r, i) => {
+      assert.equal(m.setGestureParam(3, name, r), true);
+      assert.equal(m.getGesture(3)[name], r);
+      m.setGestureParam(3, name, 'off');
+      assert.equal(m.setGestureParam(3, name, i), true);
+      assert.equal(m.getGesture(3)[name], r, name + ' index ' + i);
+    });
+    m.setGestureParam(3, name, '1/16T');
+    [-1, 9, 1.5, '1/3', 'OFF', '', null, undefined, NaN, true, {}].forEach((v) => {
+      assert.equal(m.setGestureParam(3, name, v), false, name + ' ' + String(v));
+      assert.equal(m.getGesture(3)[name], '1/16T');
+    });
+  });
+});
+
+test('setGestureParam: cut / pitch / amp / curve are clamped to their ranges', () => {
+  const m = mk();
+  [['cutFrom', 20, 20000], ['cutTo', 20, 20000], ['pitchFrom', -48, 48], ['pitchTo', -48, 48],
+    ['ampFrom', 0, 1], ['ampTo', 0, 1], ['curve', 0, 1]].forEach(([name, lo, hi]) => {
+    assert.equal(m.setGestureParam(2, name, lo - 1000), true, name);
+    assert.equal(m.getGesture(2)[name], lo, name + ' low');
+    assert.equal(m.setGestureParam(2, name, hi + 1000), true, name);
+    assert.equal(m.getGesture(2)[name], hi, name + ' high');
+    const mid = lo + (hi - lo) * 0.3125;
+    m.setGestureParam(2, name, mid);
+    assert.equal(m.getGesture(2)[name], mid, name + ' floats are kept');
+    m.setGestureParam(2, name, String(mid));
+    assert.equal(m.getGesture(2)[name], mid, name + ' numeric strings');
+    [NaN, Infinity, 'abc', '', null, undefined, true, {}].forEach((v) => {
+      assert.equal(m.setGestureParam(2, name, v), false, name + ' ' + String(v));
+      assert.equal(m.getGesture(2)[name], mid);
+    });
+  });
+});
+
+test('setGestureParam: bad index or name is refused; index also accepts numeric strings', () => {
+  const m = mk();
+  const before = JSON.stringify(m.globals().gestures);
+  [-1, 4, 100, NaN, 'x', null, undefined, {}].forEach((i) => assert.equal(m.setGestureParam(i, 'curve', 0.5), false, String(i)));
+  ['bogus', 'Name', 'beat', 'index', 'constructor', '__proto__', 'toString', '', 3, null, undefined].forEach((n) => {
+    assert.equal(m.setGestureParam(0, n, 1), false, String(n));
+  });
+  assert.equal(JSON.stringify(m.globals().gestures), before);
+  assert.equal(m.setGestureParam('2', 'curve', 0.9), true);
+  assert.equal(m.getGesture(2).curve, 0.9);
+  assert.equal(m.setGestureParam(0, 'curve', 0.1), true);
+  assert.equal(m.getGesture(0).curve, 0.1);
+  assert.equal(m.getGesture(1).curve, 0, 'other gestures untouched');
+});
+
+test('gesture edits notify globals, are not undo steps, and do not disturb the history', () => {
+  const m = bigKit();
+  const kinds = record(m);
+  assert.equal(m.canUndo(), false);
+  m.setGestureParam(0, 'curve', 0.9);
+  assert.deepEqual(kinds, ['globals']);
+  kinds.length = 0;
+  m.setGestureParam(0, 'curve', 0.9); // unchanged
+  m.setGestureParam(0, 'curve', 'x'); // refused
+  m.setGestureParam(9, 'curve', 0.5); // refused
+  assert.deepEqual(kinds, []);
+  assert.equal(m.canUndo(), false, 'gesture edits are not undoable');
+  const p = m.getPadOnKey(36);
+  m.setPadParam(p.id, 'pitch', 3);
+  m.setGestureParam(1, 'beats', 8);
+  m.setGlobal('morph', 40);
+  assert.equal(m.undo(), true);
+  assert.equal(p.pitch, 0, 'the pad edit is undone');
+  assert.equal(m.getGesture(1).beats, 8, 'the gesture edit is not');
+  assert.equal(m.getGesture(0).curve, 0.9);
+  assert.equal(m.globals().morph, 40, 'neither are globals');
+  assert.equal(m.canUndo(), false);
+});
+
+// ---------------------------------------------------------------- new globals
+
+test('v2 globals: defaults, validation and clamping through setGlobal', () => {
+  const m = mk();
+  const g = m.globals();
+  assert.deepEqual([g.morph, g.morphEdit, g.scan, g.keepClip, g.captureBars, g.captureFolder, g.gestureSel],
+    [0, false, 0, false, '2 Bars', '', 0]);
+  // morph / scan: numbers 0..100
+  ['morph', 'scan'].forEach((name) => {
+    assert.equal(m.setGlobal(name, 40.5), true);
+    assert.equal(g[name], 40.5, name + ' floats are kept');
+    m.setGlobal(name, -10);
+    assert.equal(g[name], 0, name);
+    m.setGlobal(name, 250);
+    assert.equal(g[name], 100, name);
+    m.setGlobal(name, '33');
+    assert.equal(g[name], 33, name + ' numeric string');
+    [NaN, Infinity, 'abc', null, undefined, {}].forEach((v) => {
+      assert.equal(m.setGlobal(name, v), false, name + ' ' + String(v));
+      assert.equal(g[name], 33);
+    });
+  });
+  // booleans
+  ['morphEdit', 'keepClip'].forEach((name) => {
+    m.setGlobal(name, 1);
+    assert.equal(g[name], true, name);
+    m.setGlobal(name, 0);
+    assert.equal(g[name], false, name);
+    m.setGlobal(name, true);
+    assert.equal(g[name], true, name);
+    m.setGlobal(name, 'false');
+    assert.equal(g[name], false, name);
+    assert.equal(m.setGlobal(name, 'maybe'), false, name);
+    assert.equal(g[name], false);
+  });
+  // captureBars: string or index
+  CONST.CAPTURE_BARS.forEach((label, i) => {
+    assert.equal(m.setGlobal('captureBars', label), true);
+    assert.equal(g.captureBars, label);
+    m.setGlobal('captureBars', '2 Bars');
+    assert.equal(m.setGlobal('captureBars', i), true);
+    assert.equal(g.captureBars, label, 'index ' + i);
+  });
+  m.setGlobal('captureBars', '1 Bar');
+  [-1, 5, 1.5, 'bogus', '1 bar', null, undefined, NaN].forEach((v) => {
+    assert.equal(m.setGlobal('captureBars', v), false, String(v));
+    assert.equal(g.captureBars, '1 Bar');
+  });
+  // captureFolder: any string (also empty), nothing else
+  assert.equal(m.setGlobal('captureFolder', '/Users/me/My Samples'), true);
+  assert.equal(g.captureFolder, '/Users/me/My Samples');
+  assert.equal(m.setGlobal('captureFolder', ''), true);
+  assert.equal(g.captureFolder, '');
+  m.setGlobal('captureFolder', 'C:\\caps');
+  [5, null, undefined, true, {}, []].forEach((v) => {
+    assert.equal(m.setGlobal('captureFolder', v), false, String(v));
+    assert.equal(g.captureFolder, 'C:\\caps');
+  });
+  // gestureSel: int 0..3
+  m.setGlobal('gestureSel', 2);
+  assert.equal(g.gestureSel, 2);
+  m.setGlobal('gestureSel', 9);
+  assert.equal(g.gestureSel, 3);
+  m.setGlobal('gestureSel', -4);
+  assert.equal(g.gestureSel, 0);
+  m.setGlobal('gestureSel', 1.6);
+  assert.equal(g.gestureSel, 2);
+  m.setGlobal('gestureSel', '1');
+  assert.equal(g.gestureSel, 1);
+  assert.equal(m.setGlobal('gestureSel', 'abc'), false);
+  assert.equal(g.gestureSel, 1);
+  // gestures themselves are only edited through setGestureParam
+  const gestures = g.gestures;
+  assert.equal(m.setGlobal('gestures', []), false);
+  assert.equal(m.setGlobal('gestures', null), false);
+  assert.equal(m.globals().gestures, gestures);
+  assert.deepEqual(gestures[0], Object.assign(defaultGestures()[0]));
+  assert.equal(m.globals(), g, 'globals() is the live object');
+});
+
+test('v2 globals are not layout-affecting: slots untouched, one globals notification, no undo step', () => {
+  const m = bigKit();
+  m.setCurrentSlot(4);
+  m.swapKeys(36, 37); // slot 4 manual
+  m.setCurrentSlot(0);
+  const slots = JSON.stringify(m.state.slots);
+  [['morph', 60], ['morphEdit', true], ['scan', 30], ['keepClip', true], ['captureBars', '8 Bars'],
+    ['captureFolder', '/tmp'], ['gestureSel', 3]].forEach(([name, value]) => {
+    const kinds = record(m);
+    assert.equal(m.setGlobal(name, value), true);
+    assert.deepEqual(kinds, ['globals'], name);
+    assert.equal(JSON.stringify(m.state.slots), slots, name + ' leaves every slot alone');
+    const again = record(m);
+    m.setGlobal(name, value);
+    assert.deepEqual(again, [], name + ' unchanged: no notification');
+  });
+  m.undo(); // the swapKeys above is the only step: none of the globals added one
+  assert.equal(m.canUndo(), false);
+  assert.equal(m.globals().morph, 60, 'and undo leaves globals alone');
+  checkInvariants(m);
+});
+
+// ---------------------------------------------------------------- fromJSON: v1 states and leniency
+
+// a hand-written v1 state: no Pad.morph, no v2 globals, no gestures, a 12-key mod zone at 116
+function v1State() {
+  const nulls = () => Array.from({ length: 128 }, () => null);
+  const falses = () => Array.from({ length: 128 }, () => false);
+  const slots = Array.from({ length: 8 }, () => ({ keys: nulls(), locks: falses(), auto: true }));
+  slots[0].keys[36] = 5;
+  slots[0].keys[37] = 6;
+  slots[0].keys[38] = 7;
+  slots[2].auto = false;
+  slots[2].keys[40] = 6;
+  const pad = (id, sliceId, extra) => Object.assign({
+    id, sourceId: 1, sliceId, base: true,
+    reverse: false, pitch: 0, fine: 0, gainDb: 0,
+    attackMs: 0, decayMs: 300, sustain: 1, releaseMs: 30,
+    startOffsetMs: 0, loopOn: false, loopSizeMs: 30, loopPos: 0,
+    cutoffHz: 20000, drive: 0,
+    layers: [], origSliceId: null, simIndex: 0
+  }, extra || {});
+  return {
+    version: 1,
+    nextId: 8,
+    sources: [{
+      id: 1, slot: 0, name: 'old', path: '/old/loop.wav', frames: 3000, sr: 44100, channels: 2, color: 0,
+      playMode: 'poly', trigMode: 'gate',
+      slicing: { mode: 'region', sensitivity: 50, beatDiv: '1/16', regions: 3, bpm: 0, minSliceMs: 30, snap: true },
+      slices: [{ id: 2, start: 0, end: 1000, features: null }, { id: 3, start: 1000, end: 2000, features: null }, { id: 4, start: 2000, end: 3000, features: null }]
+    }],
+    pads: { 5: pad(5, 2), 6: pad(6, 3, { pitch: 5, reverse: true }), 7: pad(7, 4, { cutoffHz: 900, layers: [5] }) },
+    slots,
+    currentSlot: 2,
+    globals: {
+      rootKey: 36, layout: 'zones', zoneAlign: false, sortBy: 'brightness', chokeScope: 'source',
+      chaos: 10, repeatOn: true, repeatDiv: '1/8', swing: 20, repeatAlt: false,
+      shuffleMode: 'chaos', shuffleScope: 'all', seed: 7, flipPct: 0,
+      modZoneOn: true, modZoneStart: 116, velSens: 50, pressureToLevel: false,
+      bestN: 16, spreadParam: 'pitch', spreadCount: 16, spreadStep: 1
+    }
+  };
+}
+
+test('fromJSON loads a v1-shaped state (no morph, no v2 globals, 12-key zone at 116) with v2 defaults', () => {
+  const raw = v1State();
+  const frozen = JSON.stringify(raw);
+  const m = Model.fromJSON(raw, { features: fakeFeatures() });
+  assert.equal(JSON.stringify(raw), frozen, 'the input is not modified');
+  // v1 data survives
+  assert.equal(m.globals().chaos, 10);
+  assert.equal(m.globals().repeatOn, true);
+  assert.equal(m.globals().repeatDiv, '1/8');
+  assert.equal(m.globals().seed, 7);
+  assert.equal(m.currentSlot(), 2);
+  assert.equal(m.getPad(6).pitch, 5);
+  assert.equal(m.getPad(6).reverse, true);
+  assert.equal(m.getPad(7).cutoffHz, 900);
+  assert.deepEqual(m.getPad(7).layers, [5]);
+  assert.equal(m.state.slots[0].keys[37], 6);
+  assert.equal(m.state.slots[2].auto, false);
+  assert.equal(m.getSource(1).playMode, 'poly');
+  // the old zone start no longer fits a 16-key zone: clamped
+  assert.equal(m.globals().modZoneStart, 112);
+  assert.equal(m.globals().modZoneOn, true);
+  assert.equal(m.isModKey(112), true);
+  assert.equal(m.isModKey(127), true);
+  assert.equal(m.modOffset(127), 15);
+  assert.equal(m.isModKey(111), false);
+  // v2 defaults filled in
+  const g = m.globals();
+  assert.deepEqual([g.morph, g.morphEdit, g.scan, g.keepClip, g.captureBars, g.captureFolder, g.gestureSel],
+    [0, false, 0, false, '2 Bars', '', 0]);
+  assert.deepEqual(g.gestures, defaultGestures());
+  [5, 6, 7].forEach((id) => {
+    assert.deepEqual(m.getPad(id).morph, {});
+    assert.deepEqual(m.effectivePad(id, 1), JSON.parse(JSON.stringify(m.getPad(id))));
+  });
+  assert.notEqual(m.getPad(5).morph, m.getPad(6).morph);
+  assert.deepEqual(Object.keys(g).sort(), Object.keys(Model.create().globals()).sort());
+  checkInvariants(m);
+  // and it is fully functional with the v2 API
+  assert.equal(m.setPadMorphParam(5, 'pitch', 7), true);
+  assert.equal(m.setGestureParam(0, 'beats', 8), true);
+  assert.equal(m.setGlobal('morph', 50), true);
+  assert.equal(m.effectivePad(5, 0.5).pitch, 3.5);
+  m.undo();
+  assert.deepEqual(m.getPad(5).morph, {});
+  // it round-trips as a v2 state from now on
+  const j = m.toJSON();
+  assert.deepEqual(Model.fromJSON(j).toJSON(), j);
+});
+
+test('fromJSON of a v1 state: the unmodified layout is still the same with a 16-key zone elsewhere', () => {
+  const raw = v1State();
+  raw.globals.modZoneStart = 96;
+  const m = Model.fromJSON(raw);
+  assert.equal(m.globals().modZoneStart, 96);
+  assert.equal(m.isModKey(108), true, 'keys 108..111 joined the zone');
+  assert.equal(m.isModKey(112), false);
+  assert.deepEqual(m.occupiedKeys(0), [36, 37, 38]);
+});
+
+test('fromJSON repairs junk in the v2 fields (lenient types, clamps, defaults)', () => {
+  const raw = v1State();
+  raw.pads[5].morph = { pitch: 1000, fine: '12', reverse: 1, loopOn: 'false', bogus: 5, layers: [1], cutoffHz: 'x', drive: -5, id: 99, sustain: null };
+  raw.pads[6].morph = [1, 2, 3];
+  raw.pads[7].morph = 'nope';
+  Object.assign(raw.globals, {
+    morph: '250', morphEdit: 'true', scan: -4, keepClip: 'maybe', captureBars: 3, captureFolder: 12, gestureSel: 9,
+    gestures: [
+      { name: '  Hello  ', beats: 3, rateFrom: 2, rateTo: 'bogus', cutFrom: 5, cutTo: '800', pitchFrom: 999, pitchTo: 'x', ampFrom: -1, ampTo: 5, curve: '0.4', extra: 1 },
+      null,
+      { name: '', beats: '2 bars', rateFrom: 'off' },
+      { name: 'z'.repeat(80), beats: 0.2 },
+      { name: 'fifth gesture is dropped' }
+    ]
+  });
+  const m = Model.fromJSON(raw);
+  const g = m.globals();
+  assert.deepEqual(m.getPad(5).morph, { pitch: 48, fine: 12, reverse: true, loopOn: false, drive: 0 });
+  assert.deepEqual(m.getPad(6).morph, {});
+  assert.deepEqual(m.getPad(7).morph, {});
+  assert.equal(g.morph, 100);
+  assert.equal(g.morphEdit, true);
+  assert.equal(g.scan, 0);
+  assert.equal(g.keepClip, false, 'an unreadable boolean falls back to the default');
+  assert.equal(g.captureBars, '4 Bars', 'an index is accepted');
+  assert.equal(g.captureFolder, '', 'non-strings fall back to the default');
+  assert.equal(g.gestureSel, 3);
+  assert.equal(g.gestures.length, 4);
+  assert.deepEqual(g.gestures[0], {
+    name: 'Hello', beats: 2, rateFrom: '1/8', rateTo: '1/64',
+    cutFrom: 20, cutTo: 800, pitchFrom: 48, pitchTo: 0, ampFrom: 0, ampTo: 1, curve: 0.4
+  });
+  assert.deepEqual(g.gestures[1], defaultGestures()[1], 'null entry: defaults');
+  assert.equal(g.gestures[2].name, 'Drop', 'empty name: default');
+  assert.equal(g.gestures[2].beats, 8, "label '2 bars' read");
+  assert.equal(g.gestures[2].rateFrom, 'off');
+  assert.equal(g.gestures[3].name, 'z'.repeat(32));
+  assert.equal(g.gestures[3].beats, 0.25, 'snapped to the nearest GEST_BEATS entry');
+  assert.equal(g.gestures[0].extra, undefined);
+  checkInvariants(m);
+
+  // beats in saved data are values, never indices (1 and 2 are legal values)
+  const raw2 = v1State();
+  raw2.globals.gestures = [{ beats: 1 }, { beats: 2 }, { beats: 16 }, { beats: 100 }];
+  const g2 = Model.fromJSON(raw2).globals().gestures;
+  assert.deepEqual(g2.map((x) => x.beats), [1, 2, 16, 16]);
+
+  // gestures that are not an array: all defaults
+  [{}, 'x', 5, null, { 0: { name: 'a' } }].forEach((junk) => {
+    const r = v1State();
+    r.globals.gestures = junk;
+    assert.deepEqual(Model.fromJSON(r).globals().gestures, defaultGestures());
+  });
+  // fewer than four: the rest default
+  const r3 = v1State();
+  r3.globals.gestures = [{ name: 'Only' }];
+  const g3 = Model.fromJSON(r3).globals().gestures;
+  assert.equal(g3[0].name, 'Only');
+  assert.equal(g3[0].beats, 4);
+  assert.deepEqual(g3.slice(1), defaultGestures().slice(1));
+});
+
+test('fromJSON does not alias the input (gestures, morph) and drops morph of dropped pads', () => {
+  const m = complexModel();
+  const j = m.toJSON();
+  const m2 = Model.fromJSON(j);
+  j.globals.gestures[0].name = 'changed';
+  j.globals.gestures.length = 0;
+  Object.keys(j.pads).forEach((k) => { j.pads[k].morph.pitch = -1; });
+  assert.equal(m2.getGesture(0).name, 'Build');
+  assert.equal(m2.globals().gestures.length, 4);
+  assert.ok(Object.keys(m2.state.pads).every((k) => m2.state.pads[k].morph.pitch !== -1));
+  // a pad pointing at a missing slice disappears with its morph
+  const j2 = m.toJSON();
+  const ids = padIds(m);
+  j2.pads[ids[0]].sliceId = 424242;
+  const m3 = Model.fromJSON(j2);
+  assert.equal(m3.getPad(ids[0]), null);
+  assert.ok(m3.getPad(ids[1]));
+});
+
+// ---------------------------------------------------------------- round trip with v2 fields
+
+test('toJSON / fromJSON round-trip deeply with morph, gestures and the v2 globals', () => {
+  const m = complexModel();
+  const j = m.toJSON();
+  const ids = padIds(m);
+  // the fixture really contains v2 state
+  assert.deepEqual(j.pads[ids[0]].morph, { pitch: 7, cutoffHz: 2500 });
+  assert.deepEqual(j.pads[ids[1]].morph, { reverse: true, drive: 0.25 });
+  assert.equal(Object.keys(j.pads[ids[2]].morph).length, 14);
+  assert.equal(j.globals.gestures.length, 4);
+  assert.equal(j.globals.gestures[1].name, 'Lift');
+  assert.equal(j.globals.gestures[1].beats, 8);
+  assert.equal(j.globals.gestures[2].rateFrom, '1/16T');
+  assert.equal(j.globals.gestures[3].curve, 0.75);
+  assert.deepEqual(
+    [j.globals.morph, j.globals.morphEdit, j.globals.scan, j.globals.keepClip, j.globals.captureBars, j.globals.captureFolder, j.globals.gestureSel],
+    [35, true, 12.5, true, '4 Bars', '/tmp/caps', 2]);
+  assert.equal(j.globals.modZoneOn, true);
+  // deep equality, also through a JSON string, also twice
+  const m2 = Model.fromJSON(j, { features: fakeFeatures() });
+  assert.deepEqual(m2.toJSON(), j);
+  assert.deepEqual(Model.fromJSON(JSON.stringify(j)).toJSON(), j);
+  assert.deepEqual(Model.fromJSON(m2.toJSON()).toJSON(), j);
+  assert.deepEqual(m2.getPad(ids[0]).morph, { pitch: 7, cutoffHz: 2500 });
+  assert.deepEqual(m2.getGesture(1), m.getGesture(1));
+  near(m2.effectivePad(ids[0], 0.5).pitch, m.effectivePad(ids[0], 0.5).pitch, 0);
+  // a plain JSON.stringify of the model uses toJSON
+  assert.deepEqual(JSON.parse(JSON.stringify(m)), j);
+  // v2 edits on the copy leave the original alone
+  m2.setGestureParam(1, 'name', 'Other');
+  m2.setPadMorphParam(ids[0], 'pitch', -2);
+  assert.equal(m.getGesture(1).name, 'Lift');
+  assert.equal(m.getPad(ids[0]).morph.pitch, 7);
+  checkInvariants(m);
+  checkInvariants(m2);
+});
+
+test('the serialised state is the v2 shape: morph on every pad, four gestures, 16-key zone', () => {
+  const m = bigKit();
+  m.setGlobal('modZoneOn', true);
+  const j = m.toJSON();
+  assert.equal(j.version, 1);
+  Object.keys(j.pads).forEach((k) => assert.deepEqual(j.pads[k].morph, {}));
+  assert.equal(j.globals.gestures.length, 4);
+  assert.deepEqual(Object.keys(j.globals.gestures[0]),
+    ['name', 'beats', 'rateFrom', 'rateTo', 'cutFrom', 'cutTo', 'pitchFrom', 'pitchTo', 'ampFrom', 'ampTo', 'curve']);
+  ['morph', 'morphEdit', 'scan', 'keepClip', 'captureBars', 'captureFolder', 'gestureSel'].forEach((n) => {
+    assert.ok(Object.prototype.hasOwnProperty.call(j.globals, n), n);
+  });
+});
+
+// ---------------------------------------------------------------- fuzz: morph, gestures and undo
+
+test('random morph / gesture / copy operations keep every invariant and every undoable op is exactly undoable', () => {
+  const checked = {};
+  for (const seed of [21, 22, 23, 24]) {
+    const m = mk();
+    const rng = prng.mulberry32(seed * 7919 + 3);
+    const R = (n) => prng.randInt(rng, n);
+    addSrc(m, 'a', 6, (i) => feat(1000 + i * 300, -30 + i * 3, 50 + i * 20));
+    addSrc(m, 'b', 5, (i) => feat(500 + i * 700, -25 + i * 2, 80 + i * 10));
+    const anyPad = () => {
+      const ids = padIds(m);
+      return ids.length ? ids[R(ids.length)] : 0;
+    };
+    const keyPick = () => {
+      const occ = m.occupiedKeys();
+      return occ.length && R(4) ? occ[R(occ.length)] : 30 + R(40);
+    };
+    const morphName = () => CONST.MORPH_PARAMS[R(CONST.MORPH_PARAMS.length)];
+    const gestNames = ['name', 'beats', 'rateFrom', 'rateTo', 'cutFrom', 'cutTo', 'pitchFrom', 'pitchTo', 'ampFrom', 'ampTo', 'curve'];
+    const ops = [
+      ['setPadMorphParam', () => m.setPadMorphParam(anyPad(), morphName(), (rng() - 0.3) * 300), false],
+      ['setPadParam', () => m.setPadParam(anyPad(), morphName(), (rng() - 0.3) * 300), false],
+      ['copyPadToMorph', () => m.copyPadToMorph(anyPad()), true],
+      ['clearPadMorph', () => m.clearPadMorph(anyPad()), true],
+      ['copyAllToMorph', () => m.copyAllToMorph(), true],
+      ['clearAllMorph', () => m.clearAllMorph(), true],
+      ['applyMorphParamToSource', () => m.applyMorphParamToSource(anyPad(), morphName()), true],
+      ['duplicatePad', () => m.duplicatePad(keyPick(), keyPick()), true],
+      ['spread', () => m.spread(keyPick(), ['pitch', 'decay', 'start', 'cutoff'][R(4)], 2 + R(5), (rng() - 0.5) * 8), true],
+      ['shuffle', () => m.shuffle({ mode: R(2) ? 'smart' : 'chaos', seed: R(1000), flipPct: R(3) * 50 }), true],
+      ['swapSimilar', () => m.swapSimilar(keyPick(), R(2) ? 1 : -1), true],
+      ['setGestureParam', () => m.setGestureParam(R(5) - 1, gestNames[R(gestNames.length)], [R(10) - 2, 'off', '1/8', 'Zed', 0.5, 1000][R(6)]), false],
+      ['setGlobal', () => {
+        const names = ['morph', 'scan', 'morphEdit', 'keepClip', 'gestureSel', 'captureBars', 'modZoneStart', 'modZoneOn'];
+        m.setGlobal(names[R(names.length)], [R(130) - 10, 'abc', true, 3, '8 Bars'][R(5)]);
+      }, false],
+      ['undo', () => m.undo(), false],
+      ['redo', () => m.redo(), false]
+    ];
+    for (let i = 0; i < 300; i++) {
+      const [name, fn, checkable] = ops[R(ops.length)];
+      const before = stripped(m);
+      fn();
+      checkInvariants(m);
+      // effectivePad agrees with the stored A and B at the endpoints, for any pad
+      const id = anyPad();
+      if (id) {
+        const pad = m.getPad(id);
+        assert.deepEqual(m.effectivePad(id, 0), JSON.parse(JSON.stringify(pad)));
+        const e1 = m.effectivePad(id, 1);
+        CONST.MORPH_PARAMS.forEach((n) => assert.equal(e1[n], Object.prototype.hasOwnProperty.call(pad.morph, n) ? pad.morph[n] : pad[n]));
+      }
+      if (checkable) {
+        const after = stripped(m);
+        if (JSON.stringify(after) !== JSON.stringify(before)) {
+          checked[name] = (checked[name] || 0) + 1;
+          assert.equal(m.canUndo(), true, name + ' changed state without an undo step (iteration ' + i + ')');
+          assert.equal(m.undo(), true);
+          assert.deepEqual(stripped(m), before, name + ' undo is exact (seed ' + seed + ', iteration ' + i + ')');
+          checkInvariants(m);
+          assert.equal(m.redo(), true);
+          assert.deepEqual(stripped(m), after, name + ' redo is exact (seed ' + seed + ', iteration ' + i + ')');
+          checkInvariants(m);
+        }
+      }
+    }
+    const j = m.toJSON();
+    assert.deepEqual(Model.fromJSON(j, { features: fakeFeatures() }).toJSON(), j);
+  }
+  ['copyPadToMorph', 'clearPadMorph', 'copyAllToMorph', 'clearAllMorph', 'applyMorphParamToSource', 'duplicatePad', 'spread', 'shuffle'].forEach((name) => {
+    assert.ok(checked[name] >= 3, name + ' was only undo-checked ' + (checked[name] || 0) + ' times: ' + JSON.stringify(checked));
+  });
+});
+
 // ---------------------------------------------------------------- ES5 conformance
 
 test('model.js is ES5-clean (acorn ecmaVersion 5 + banned API scan)', () => {

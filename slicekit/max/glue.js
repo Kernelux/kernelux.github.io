@@ -659,14 +659,36 @@ function create(host) {
     return model.getSlicesOfSource(srcId).length;
   }
 
+  // Manual slices from Simpler slice points (frames). Falls back to the normal
+  // slicer when there is no usable point. Returns the slice count or -1.
+  function importSlices(srcId, points) {
+    var src = model.getSource(srcId);
+    var pts = [0];
+    var i, p, ranges;
+    if (!src || !monoCache[srcId]) { return -1; }
+    for (i = 0; i < points.length; i++) {
+      p = Math.round(num(points[i], 0));
+      if (p > 0 && p < src.frames) { pts.push(p); }
+    }
+    if (pts.length < 2) { return resliceSource(srcId); }
+    pts.sort(function (a, b) { return a - b; });
+    ranges = Slicing.pointsToRanges(pts, src.frames, 1);
+    model.setSourceSettings(srcId, { mode: 'manual' });
+    model.setSlices(srcId, ranges);
+    recomputeFeatures(srcId);
+    return model.getSlicesOfSource(srcId).length;
+  }
+
   // ----- loading ---------------------------------------------------------
 
   // Sends `<slot> replace <path>` and starts watching the buffer. The frame
   // count is sampled first: it is what a poll must see change.
-  function requestLoad(slot, path, mode) {
+  // extra (optional): { importPoints: [frames] } -> manual slices instead of auto-slicing.
+  function requestLoad(slot, path, mode, extra) {
     var stale = bufFrames(slot);
     out(1, slot, 'replace', path);
     pending[slot] = { mode: mode, stale: stale, seen: -1, ticks: POLL_TICKS };
+    if (extra && extra.importPoints) { pending[slot].importPoints = extra.importPoints; }
     ensurePoller();
   }
 
@@ -696,7 +718,7 @@ function create(host) {
       if (!p) { continue; }
       n = bufFrames(toInt(slot, 0));
       if (n > 0 && n !== p.stale && n === p.seen) {
-        finishLoad(toInt(slot, 0));
+        finishLoadTracked(toInt(slot, 0));
         continue;
       }
       p.seen = (n > 0 && n !== p.stale) ? n : -1;
@@ -705,6 +727,17 @@ function create(host) {
     }
     if (!Object.keys(pending).length) { stopPoller(); }
     afterEdit();
+  }
+
+  // A freshly loaded sample can change the layout of the current slot (interleave,
+  // sorted): treat it as a map change for Keep clip. Restores never do.
+  function finishLoadTracked(slot) {
+    var p = pending[slot];
+    if (p && p.mode === 'new') {
+      mapTracked(function () { finishLoad(slot); });
+    } else {
+      finishLoad(slot);
+    }
   }
 
   function failLoad(slot) {
@@ -758,7 +791,7 @@ function create(host) {
     isNew = (p.mode === 'new') || src.slices.length === 0 || src.frames !== data.frames;
     if (isNew) {
       model.setSourceInfo(src.id, { frames: data.frames, sr: data.sr, channels: data.channels });
-      count = resliceSource(src.id);
+      count = p.importPoints ? importSlices(src.id, p.importPoints) : resliceSource(src.id);
       if (count < 0) { count = 0; }
       src = model.getSource(src.id);
       idx = sourceIndexById(src.id);
@@ -785,18 +818,36 @@ function create(host) {
     viewDeb.trigger();
   }
 
-  function addSourceFromPath(path) {
+  // extra (optional): { importPoints: [frames], playMode: 'mono'|'poly'|'thru' } (Simpler import).
+  function addSourceFromPath(path, extra) {
     var p = String(path);
     var src = model.addSource({ name: basename(p), path: p });
     if (!src) {
       setStatus('16 samples max');
-      return;
+      return null;
     }
-    requestLoad(src.slot, p, 'new');
+    if (extra && extra.playMode) { model.setSourceSettings(src.id, { playMode: extra.playMode }); }
+    requestLoad(src.slot, p, 'new', extra);
     setStatus('Loading ' + src.name + ' ...');
+    return src;
   }
 
   // ----- feedback --------------------------------------------------------
+
+  // A pad parameter as the controls should show it: in morph edit the B value when set.
+  function padValue(pad, field, g) {
+    if (g.morphEdit && pad.morph && has(pad.morph, field)) { return pad.morph[field]; }
+    return pad[field];
+  }
+
+  function hasMorph(pad) {
+    var k;
+    if (!pad || !pad.morph) { return false; }
+    for (k in pad.morph) {
+      if (has(pad.morph, k)) { return true; }
+    }
+    return false;
+  }
 
   function buildFeedback() {
     var list = [];
@@ -804,7 +855,7 @@ function create(host) {
     var pad = curPad();
     var g = model.globals();
     var sl = src ? src.slicing : null;
-    var k;
+    var k, ge;
 
     function add(name, v) {
       if (typeof v === 'boolean') { v = v ? 1 : 0; }
@@ -823,20 +874,21 @@ function create(host) {
     add('src_snap', sl ? !!sl.snap : true);
 
     if (pad) {
-      add('pad_reverse', !!pad.reverse);
-      add('pad_pitch', pad.pitch);
-      add('pad_fine', pad.fine);
-      add('pad_gain', pad.gainDb);
-      add('pad_attack', pad.attackMs);
-      add('pad_decay', pad.decayMs);
-      add('pad_sustain', pad.sustain * 100);
-      add('pad_release', pad.releaseMs);
-      add('pad_start', pad.startOffsetMs);
-      add('pad_loop', !!pad.loopOn);
-      add('pad_loopsize', pad.loopSizeMs);
-      add('pad_looppos', pad.loopPos * 100);
-      add('pad_cutoff', pad.cutoffHz);
-      add('pad_drive', pad.drive * 100);
+      // Morph edit shows the B values (A where no B is set).
+      add('pad_reverse', !!padValue(pad, 'reverse', g));
+      add('pad_pitch', padValue(pad, 'pitch', g));
+      add('pad_fine', padValue(pad, 'fine', g));
+      add('pad_gain', padValue(pad, 'gainDb', g));
+      add('pad_attack', padValue(pad, 'attackMs', g));
+      add('pad_decay', padValue(pad, 'decayMs', g));
+      add('pad_sustain', padValue(pad, 'sustain', g) * 100);
+      add('pad_release', padValue(pad, 'releaseMs', g));
+      add('pad_start', padValue(pad, 'startOffsetMs', g));
+      add('pad_loop', !!padValue(pad, 'loopOn', g));
+      add('pad_loopsize', padValue(pad, 'loopSizeMs', g));
+      add('pad_looppos', padValue(pad, 'loopPos', g) * 100);
+      add('pad_cutoff', padValue(pad, 'cutoffHz', g));
+      add('pad_drive', padValue(pad, 'drive', g) * 100);
     } else {
       for (k in PAD_UI_DEFAULTS) {
         if (has(PAD_UI_DEFAULTS, k)) { add(k, PAD_UI_DEFAULTS[k]); }
@@ -864,6 +916,22 @@ function create(host) {
     add('kit_modstart', g.modZoneStart);
     add('kit_velsens', g.velSens);
     add('kit_pressure2level', !!g.pressureToLevel);
+    add('kit_morphedit', !!g.morphEdit);
+    add('kit_capturebars', indexOfValue(CONST.CAPTURE_BARS, g.captureBars, 2));
+    add('kit_keepclip', !!g.keepClip);
+
+    ge = model.getGesture(g.gestureSel);
+    add('gest_sel', g.gestureSel);
+    add('gest_beats', ge ? nearestIndex(CONST.GEST_BEATS, ge.beats) : 0);
+    add('gest_ratefrom', ge ? indexOfValue(CONST.GEST_RATES, ge.rateFrom, 0) : 0);
+    add('gest_rateto', ge ? indexOfValue(CONST.GEST_RATES, ge.rateTo, 0) : 0);
+    add('gest_cutfrom', ge ? ge.cutFrom : 20000);
+    add('gest_cutto', ge ? ge.cutTo : 20000);
+    add('gest_pitchfrom', ge ? ge.pitchFrom : 0);
+    add('gest_pitchto', ge ? ge.pitchTo : 0);
+    add('gest_ampfrom', ge ? ge.ampFrom * 100 : 100);
+    add('gest_ampto', ge ? ge.ampTo * 100 : 100);
+    add('gest_curve', ge ? ge.curve * 100 : 0);
     return list;
   }
 
@@ -896,7 +964,7 @@ function create(host) {
   // ----- view dict -------------------------------------------------------
 
   function buildView() {
-    var list, sources, cur, s, i, k, wave, slices, keys, flags, slotKeys, active, pad, ps, f, padId, g;
+    var list, sources, cur, s, i, k, wave, slices, keys, flags, slotKeys, active, pad, ps, f, padId, g, names, ge;
     reconcileSelection();
     list = srcList();
     sources = [];
@@ -934,9 +1002,15 @@ function create(host) {
       if (model.isModKey(k)) { f |= 8; }
       if (active[k]) { f |= 16; }
       if (pad && pad.base === false) { f |= 32; }
+      if (hasMorph(pad)) { f |= 64; }
       flags.push(f);
     }
     g = model.globals();
+    names = [];
+    for (i = 0; i < 4; i++) {
+      ge = model.getGesture(i);
+      names.push(ge ? String(ge.name) : 'G' + (i + 1));
+    }
     return {
       status: status,
       palette: Model.PALETTE,
@@ -952,7 +1026,12 @@ function create(host) {
       rootKey: g.rootKey,
       modStart: g.modZoneOn ? g.modZoneStart : -1,
       slot: model.currentSlot(),
-      armed: armed
+      armed: armed,
+      morph: g.morph,
+      morphEdit: g.morphEdit ? 1 : 0,
+      scan: g.scan,
+      gesture: activeGesture(),
+      gestureNames: names
     };
   }
 
@@ -1006,7 +1085,8 @@ function create(host) {
     engine = Engine.create({
       model: model,
       numVoices: NUM_VOICES,
-      bufferName: bufferName
+      bufferName: bufferName,
+      now: nowFn
     });
     if (transportSeen) { sendCommands(engine.setTransport(transport)); }
   }
@@ -1039,6 +1119,14 @@ function create(host) {
         model.setGlobal('repeatAlt', toBool(v));
         held = true;
         break;
+      case 'morph':
+        model.setGlobal('morph', clamp(num(v, 0), 0, 100));
+        sendCommands(engine.refreshMorph());
+        break;
+      case 'scan':
+        model.setGlobal('scan', clamp(num(v, 0), 0, 100));
+        sendCommands(engine.refreshScan());
+        break;
       default:
         return false;
     }
@@ -1047,11 +1135,84 @@ function create(host) {
   }
 
   function applyCachedAutoParams() {
-    var names = ['slot', 'chaos', 'repeat', 'rate', 'swing', 'alt'];
     var i;
-    for (i = 0; i < names.length; i++) {
-      if (has(autoParams, names[i])) { applyKitParam(names[i], autoParams[names[i]]); }
+    for (i = 0; i < AUTO_PARAMS.length; i++) {
+      if (has(autoParams, AUTO_PARAMS[i])) { applyKitParam(AUTO_PARAMS[i], autoParams[AUTO_PARAMS[i]]); }
     }
+  }
+
+  // ----- gesture ticker --------------------------------------------------
+  //
+  // While a gesture modifier key is held the engine needs tick() calls to advance
+  // its ramps. A repeating Task (TICK_MS) runs exactly as long as needsTick() is
+  // true: it is started after a note on and stopped right after the note off (the
+  // engine reverts the voices itself on release); a tick that finds needsTick()
+  // false also stops it, as a safety net.
+
+  function trackGesture(key, on) {
+    var i, off, action, index;
+    for (i = 0; i < gestHeld.length; i++) {
+      if (gestHeld[i].key === key) {
+        if (!on) { gestHeld.splice(i, 1); }
+        return;
+      }
+    }
+    if (!on || !model.isModKey(key)) { return; }
+    off = model.modOffset(key);
+    action = (off >= 0) ? CONST.MOD_ACTIONS[off] : null;
+    if (action && action.indexOf('gest:') === 0) {
+      index = toInt(action.substring(5), -1);
+      if (index >= 0) { gestHeld.push({ key: key, index: index }); }
+    }
+  }
+
+  // Index of the gesture being applied (the most recently pressed held one), or -1.
+  function activeGesture() {
+    if (!gestHeld.length || !engine.needsTick()) { return -1; }
+    return gestHeld[gestHeld.length - 1].index;
+  }
+
+  function stopTicker() {
+    if (tickTask && tickRunning) { tickTask.cancel(); }
+    tickRunning = false;
+  }
+
+  function tickOnce() {
+    sendCommands(engine.tick());
+    if (!engine.needsTick()) {
+      stopTicker();
+      gestHeld = [];
+    }
+    viewDeb.trigger();
+  }
+
+  function updateTicker() {
+    if (!engine.needsTick()) {
+      stopTicker();
+      gestHeld = [];
+      return;
+    }
+    if (tickRunning) { return; }
+    if (!tickTask) {
+      tickTask = newTask(tickOnce, 'gesture tick');
+      if (!tickTask) { return; }
+    }
+    tickTask.interval = TICK_MS;
+    tickRunning = true;
+    tickTask.repeat(); // es5-ok (Max Task.repeat, no count = until cancelled)
+  }
+
+  // note on/off and audition all go through here
+  function playKey(key, vel) {
+    if (vel > 0) {
+      trackGesture(key, true);
+      sendCommands(engine.noteOn(key, vel));
+    } else {
+      trackGesture(key, false);
+      sendCommands(engine.noteOff(key));
+    }
+    updateTicker();
+    viewDeb.trigger();
   }
 
   // ----- LiveAPI ---------------------------------------------------------
@@ -1090,6 +1251,380 @@ function create(host) {
     }
   }
 
+  // ----- LiveAPI helpers -------------------------------------------------
+
+  function noop() { }
+
+  // Opens a LiveAPI object on `path` without observing anything. Temporaries are
+  // released by freeTemps() once the operation that needed them is done.
+  function openApi(path) {
+    var api = new host.LiveAPI(noop, path);
+    liveTemps.push(api);
+    return api;
+  }
+
+  function freeTemps() {
+    var i;
+    for (i = 0; i < liveTemps.length; i++) {
+      try {
+        if (typeof liveTemps[i].freepeer === 'function') { liveTemps[i].freepeer(); }
+      } catch (e) { /* ignore */ }
+    }
+    liveTemps = [];
+  }
+
+  // A LiveAPI object that points at nothing has id 0.
+  function isValidApi(api) {
+    var id = api ? String(api.id) : '0';
+    return id !== '0' && id !== '' && id !== 'undefined' && id !== 'null';
+  }
+
+  function lstr(v) {
+    return (v === undefined || v === null) ? '' : String(v);
+  }
+
+  // ----- keep clip -------------------------------------------------------
+  //
+  // mapTracked(fn) runs an operation and, when it moved pads to other keys of the
+  // (same) current slot, remembers the key mapping old key -> new key. With Keep
+  // clip on, the notes of the current clip are rewritten with that mapping so the
+  // same pads still play. Only the outermost call acts (loads and edits nest).
+
+  function mapTracked(fn) {
+    var slot, before, after, mapping;
+    if (mapDepth > 0 || !model) { fn(); return; }
+    slot = model.currentSlot();
+    before = model.getSlotKeys().slice();
+    mapDepth++;
+    try {
+      fn();
+    } finally {
+      mapDepth--;
+    }
+    if (model.currentSlot() !== slot) { return; }   // slot switching is not a map change
+    after = model.getSlotKeys();
+    mapping = Remap.keyMapping(before, after);
+    if (!Remap.changedCount(mapping)) { return; }
+    lastMapping = { map: mapping, applied: '' };
+    if (model.globals().keepClip) { remapClip(false); }
+  }
+
+  // The MIDI clip to rewrite: the detail clip when it is a MIDI clip on this
+  // device's track, else the clip playing on that track. null when there is none.
+  function findTargetClip() {
+    var track = openApi('this_device canonical_parent');
+    var clip, owner, idx;
+    if (!isValidApi(track)) { return null; }
+    clip = openApi('live_set view detail_clip');
+    if (isValidApi(clip) && toBool(first(clip.get('is_midi_clip')))) {
+      owner = openApi('live_set view detail_clip canonical_parent canonical_parent');
+      if (isValidApi(owner) && String(owner.id) === String(track.id)) { return clip; }
+    }
+    idx = toInt(first(track.get('playing_slot_index')), -1);
+    if (idx >= 0) {
+      clip = openApi('this_device canonical_parent clip_slots ' + idx + ' clip');
+      if (isValidApi(clip) && toBool(first(clip.get('is_midi_clip')))) { return clip; }
+    }
+    return null;
+  }
+
+  function readNotes(clip, len) {
+    var raw = clip.call('get_notes_extended', 0, 128, 0, len);
+    var text = (typeof raw === 'string') ? raw : ((raw && typeof raw.length === 'number') ? toArray(raw).join(' ') : String(raw));
+    return JSON.parse(text);
+  }
+
+  // True when every note of `changed` now has its new pitch in the clip.
+  function notesApplied(clip, changed, len) {
+    var now = readNotes(clip, len);
+    var byId = {};
+    var i;
+    var list = (now && now.notes) ? now.notes : [];
+    for (i = 0; i < list.length; i++) { byId[list[i].note_id] = list[i].pitch; }
+    for (i = 0; i < changed.notes.length; i++) {
+      if (byId[changed.notes[i].note_id] !== changed.notes[i].pitch) { return false; }
+    }
+    return true;
+  }
+
+  // apply_note_modifications takes a dictionary. The notes are passed as a JS
+  // object; if the clip does not show the new pitches afterwards (or the call
+  // throws) the same modification is sent again as a JSON string. Applying it twice
+  // is harmless: the modification sets absolute pitches by note_id.
+  function applyNoteModifications(clip, changed, len) {
+    var ok = false;
+    try {
+      clip.call('apply_note_modifications', changed);
+      ok = notesApplied(clip, changed, len);
+    } catch (e) {
+      ok = false;
+    }
+    if (!ok) { clip.call('apply_note_modifications', JSON.stringify(changed)); }
+  }
+
+  // -> { error } | { skipped } | { count, key }
+  function rewriteClip(mapping) {
+    var clip = findTargetClip();
+    var key, len, changed;
+    if (!clip) { return { error: 'no MIDI clip on this track' }; }
+    key = String(clip.id);
+    if (lastMapping && lastMapping.map === mapping && lastMapping.applied === key) { return { skipped: true }; }
+    len = num(first(clip.get('length')), 0);
+    if (!(len > 0)) { return { error: 'the clip is empty' }; }
+    changed = Remap.remapNotes(readNotes(clip, len), mapping, function (k) { return model.isModKey(k); });
+    if (changed.notes.length) { applyNoteModifications(clip, changed, len); }
+    return { count: changed.notes.length, key: key };
+  }
+
+  // Applies lastMapping to the current clip. manual = true for `kit remapclip`.
+  function remapClip(manual) {
+    var res = null;
+    if (!lastMapping || !Remap.changedCount(lastMapping.map)) {
+      if (manual) { setStatus('No map change to apply yet'); }
+      return;
+    }
+    if (!host.LiveAPI) {
+      setStatus('Keep clip needs the Live API');
+      return;
+    }
+    try {
+      res = rewriteClip(lastMapping.map);
+    } catch (e) {
+      log('could not remap the clip: ' + errText(e));
+      setStatus('Clip remap failed (see the Max console)');
+      return;
+    } finally {
+      freeTemps();
+    }
+    if (res.error) {
+      setStatus('Keep clip: ' + res.error);
+    } else if (res.skipped) {
+      setStatus('Clip already remapped');
+    } else {
+      lastMapping.applied = res.key;
+      setStatus('Clip remapped: ' + res.count + (res.count === 1 ? ' note' : ' notes'));
+    }
+  }
+
+  // ----- capture ---------------------------------------------------------
+
+  // captureFolder setting, else the device's folder, else the first sample's folder.
+  function captureFolderPath() {
+    var f = model.globals().captureFolder;
+    var list, i, p;
+    if (f) { return String(f); }
+    p = (typeof host.patcherPath === 'function') ? host.patcherPath() : '';
+    if (p) {
+      f = dirname(p);
+      if (f) { return f; }
+    }
+    list = srcList();
+    for (i = 0; i < list.length; i++) {
+      if (list[i].path) {
+        f = dirname(list[i].path);
+        if (f) { return f; }
+      }
+    }
+    return '';
+  }
+
+  function peekArray(buf, ch, pos, n) {
+    var r = buf.peek(ch, pos, n);
+    if (typeof r === 'number') { return [r]; }
+    return r ? toArray(r) : [];
+  }
+
+  function flushCaptureQueue() {
+    var q = captureQueue;
+    var i;
+    captureQueue = [];
+    for (i = 0; i < q.length; i++) { addSourceFromPath(q[i]); }
+    afterEdit();
+  }
+
+  function queueCaptureLoad(path) {
+    captureQueue.push(path);
+    if (!captureTask) { captureTask = newTask(flushCaptureQueue, 'capture load'); }
+    if (!captureTask) { flushCaptureQueue(); return; }
+    captureTask.schedule(CAPTURE_LOAD_MS);
+  }
+
+  // Copies the last N frames of the ring (wrapping at the write position) into the
+  // staging buffer, writes it as a .wav and loads it like a dropped sample.
+  function doCapture() {
+    var g = model.globals();
+    var barsIdx = indexOfValue(CONST.CAPTURE_BARS, g.captureBars, 2);
+    var ring = null;
+    var wpb = null;
+    var stage = null;
+    var folder, ringFrames, lengthMs, sr, wp, bpm, n, ringCh, stageCh, segs, c, k, pos, cnt, dst, r, i, v, peak;
+    var base, name, path;
+
+    if (!host.Buffer) { setStatus('Capture is not available'); return; }
+    folder = captureFolderPath();
+    if (!folder) { setStatus('Choose a capture folder'); return; }
+
+    try {
+      ring = new host.Buffer(capName);
+      wpb = new host.Buffer(capWpName);
+      stage = new host.Buffer(capOutName);
+
+      ringFrames = ring.framecount();
+      if (!(ringFrames > 1)) { setStatus('Nothing captured yet (no recorder buffer)'); return; }
+      lengthMs = ring.length();
+      sr = (typeof lengthMs === 'number' && lengthMs > 0) ? ringFrames / (lengthMs / 1000) : 0;
+      sr = sr > 1000 ? Math.round(sr) : 44100;
+      wp = wpb.peek(1, 0, 1);
+      if (typeof wp !== 'number') { wp = first(wp); }
+      wp = Math.round(num(wp, 0));
+      wp = ((wp % ringFrames) + ringFrames) % ringFrames;
+      bpm = transport.bpm > 0 ? transport.bpm : 120;
+      n = Math.min(Math.round(CONST.CAPTURE_BEATS[barsIdx] * 60 / bpm * sr), ringFrames - 1);
+      if (n < 1) { setStatus('Nothing captured yet'); return; }
+
+      stageCh = Math.max(0, toInt(stage.channelcount(), 0));
+      if (!stageCh) { setStatus('Capture staging buffer not found'); return; }
+      stage.send('sizeinsamps', n);
+      if (stage.framecount() !== n) { log('staging buffer has ' + stage.framecount() + ' frames, expected ' + n); }
+      ringCh = Math.max(1, toInt(ring.channelcount(), 1));
+
+      // [wp - n, wp) of the ring, oldest first; wraps once when wp < n.
+      if (wp - n >= 0) {
+        segs = [[wp - n, n]];
+      } else {
+        segs = [[ringFrames + wp - n, n - wp]];
+        if (wp > 0) { segs.push([0, wp]); }
+      }
+      peak = 0;
+      for (c = 1; c <= stageCh; c++) {
+        dst = 0;
+        for (k = 0; k < segs.length; k++) {
+          for (pos = 0; pos < segs[k][1]; pos += PEEK_CHUNK) {
+            cnt = Math.min(PEEK_CHUNK, segs[k][1] - pos);
+            r = peekArray(ring, Math.min(c, ringCh), segs[k][0] + pos, cnt);
+            for (i = 0; i < r.length; i++) {
+              v = r[i] < 0 ? -r[i] : r[i];
+              if (v > peak) { peak = v; }
+            }
+            stage.poke(c, dst, r);
+            dst += cnt;
+          }
+        }
+      }
+      if (!(peak > 0)) { setStatus('Nothing captured yet: play something first'); return; }
+
+      base = 'SliceKit Capture ' + timestamp(nowFn());
+      if (base === lastCaptureName) {
+        lastCaptureRepeat++;
+        name = base + '-' + (lastCaptureRepeat + 1) + '.wav';
+      } else {
+        lastCaptureName = base;
+        lastCaptureRepeat = 0;
+        name = base + '.wav';
+      }
+      path = stripSlash(folder) + '/' + name;
+      stage.send('writewave', path);
+      queueCaptureLoad(path);
+      setStatus('Captured ' + CONST.CAPTURE_BARS[barsIdx] + ' → ' + name);
+    } finally {
+      if (ring && typeof ring.freepeer === 'function') { ring.freepeer(); }
+      if (wpb && typeof wpb.freepeer === 'function') { wpb.freepeer(); }
+      if (stage && typeof stage.freepeer === 'function') { stage.freepeer(); }
+    }
+  }
+
+  // ----- Simpler import --------------------------------------------------
+
+  // Walks live_set tracks (and one level of rack chains) for OriginalSimpler devices
+  // and fills the sk_simplers menu through outlet 2 (raw `clear` / `append <item>`).
+  function scanSimplers() {
+    var found = [];
+    var api, nTracks, t, tp, tname, nDev, d, dp, nCh, c, cp, cname, nChDev, j, jp, i;
+
+    function at(path) { api.path = path; return api; }
+    function isSimpler(path) { return lstr(first(at(path).get('class_name'))) === SIMPLER_CLASS; }
+
+    if (!host.LiveAPI) { setStatus('Live API not available'); return; }
+    try {
+      api = openApi('live_set');
+      nTracks = toInt(at('live_set').getcount('tracks'), 0);
+      for (t = 0; t < nTracks; t++) {
+        tp = 'live_set tracks ' + t;
+        tname = lstr(first(at(tp).get('name')));
+        nDev = toInt(api.getcount('devices'), 0);
+        for (d = 0; d < nDev; d++) {
+          dp = tp + ' devices ' + d;
+          if (isSimpler(dp)) {
+            found.push({ path: dp, label: tname + ' / ' + lstr(first(api.get('name'))) });
+          } else if (toBool(first(api.get('can_have_chains')))) {
+            nCh = toInt(api.getcount('chains'), 0);
+            for (c = 0; c < nCh; c++) {
+              cp = dp + ' chains ' + c;
+              cname = lstr(first(at(cp).get('name')));
+              nChDev = toInt(api.getcount('devices'), 0);
+              for (j = 0; j < nChDev; j++) {
+                jp = cp + ' devices ' + j;
+                if (isSimpler(jp)) {
+                  found.push({ path: jp, label: tname + ' / ' + cname + ' / ' + lstr(first(api.get('name'))) });
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      log('Simpler scan failed: ' + errText(e));
+      setStatus('Simpler scan failed (see the Max console)');
+      return;
+    } finally {
+      freeTemps();
+    }
+    simplers = found;
+    out(2, 'src_simplers', 'clear');
+    for (i = 0; i < found.length; i++) { out(2, 'src_simplers', 'append', found[i].label); }
+    setStatus(found.length ? 'Found ' + found.length + ' Simpler' + (found.length === 1 ? '' : 's')
+      : 'No Simplers found in the Live Set');
+  }
+
+  // Adds the Simpler's sample as a source. Its slice points become manual slices
+  // once the buffer has loaded (see importSlices); its slicing playback mode sets
+  // the source's play mode.
+  function importSimpler(index) {
+    var entry = (index >= 0 && index < simplers.length) ? simplers[index] : null;
+    var file = '';
+    var pts = [];
+    var mode = 1;
+    var sample, dev, raw, i, v, src;
+
+    if (!entry) { setStatus('Press "Find Simplers", then pick one'); return; }
+    if (!host.LiveAPI) { setStatus('Live API not available'); return; }
+    try {
+      sample = openApi(entry.path + ' sample');
+      if (isValidApi(sample)) {
+        file = lstr(first(sample.get('file_path')));
+        raw = sample.get('slices');
+        raw = (raw !== null && raw !== undefined && typeof raw === 'object' && typeof raw.length === 'number') ? raw : [raw];
+        for (i = 0; i < raw.length; i++) {
+          v = num(raw[i], -1);
+          if (v > 0) { pts.push(Math.round(v)); }
+        }
+      }
+      dev = openApi(entry.path);
+      mode = toInt(first(dev.get('slicing_playback_mode')), 1);
+    } catch (e) {
+      log('could not read the Simpler: ' + errText(e));
+      setStatus('Could not read the Simpler (rescan?)');
+      return;
+    } finally {
+      freeTemps();
+    }
+    if (!file) { setStatus('That Simpler has no sample'); return; }
+    src = addSourceFromPath(file, { importPoints: pts, playMode: PLAY_MODES[clampInt(mode, 0, 2)] });
+    if (src) {
+      setStatus('Importing ' + src.name + (pts.length ? ' (' + pts.length + ' slice points) ...' : ' ...'));
+    }
+  }
+
   // ----- message handlers ------------------------------------------------
 
   function doInit() {
@@ -1101,6 +1636,9 @@ function create(host) {
 
     if (engine && engine.activeKeys().length) { sendCommands(engine.panic()); }
     stopPoller();
+    stopTicker();
+    gestHeld = [];
+    lastMapping = null;
     pending = {};
     monoCache = {};
     overviewCache = {};
@@ -1108,6 +1646,8 @@ function create(host) {
     featCache = {};
     lastFb = {};
     armed = '';
+    lastEdited = '';
+    lastEditedMorph = '';
     sel.source = -1;
     sel.key = -1;
     sel.slice = -1;
@@ -1149,6 +1689,9 @@ function create(host) {
     reconcileSelection();
 
     startLive();
+    // Tell the recorder (gen~) which buffers to use.
+    out(4, 'cap', capName);
+    out(4, 'wpb', capWpName);
     out(3, 'viewdict', viewName);
     forceFb = false;
     syncFeedback(true);
@@ -1172,8 +1715,7 @@ function create(host) {
     var key = toInt(a[0], -1);
     var vel = toInt(a[1], 0);
     if (key < 0 || key > 127) { return; }
-    sendCommands(vel > 0 ? engine.noteOn(key, vel) : engine.noteOff(key));
-    viewDeb.trigger();
+    playKey(key, vel);
   }
 
   function onPolyPressure(a) {
@@ -1198,6 +1740,10 @@ function create(host) {
     var v = a[1];
     var src = curSource();
     var mode, set;
+
+    // These two do not need a selected sample.
+    if (p === 'simplerscan') { scanSimplers(); return; }
+    if (p === 'fromsimpler') { importSimpler(toInt(v, -1)); return; }
 
     if (!src) { forceFb = true; setStatus('Select a sample first'); return; }
 
@@ -1266,7 +1812,7 @@ function create(host) {
   function onPad(a) {
     var p = String(a[0]);
     var v = a[1];
-    var pad, spec, dir, keys, n;
+    var pad, spec, dir, keys, n, value;
 
     // Settings that do not need a selected pad.
     switch (p) {
@@ -1312,6 +1858,13 @@ function create(host) {
         return;
       case 'applysource':
         if (!pad) { return; }
+        if (model.globals().morphEdit) {
+          if (!lastEditedMorph) { setStatus('Edit a B parameter first'); return; }
+          model.applyMorphParamToSource(pad.id, lastEditedMorph);
+          sendCommands(engine.refreshMorph());
+          setStatus('Applied B ' + lastEditedMorph + ' to the whole sample');
+          return;
+        }
         if (!lastEdited) { setStatus('Edit a pad parameter first'); return; }
         model.applyParamToSource(pad.id, lastEdited);
         setStatus('Applied ' + lastEdited + ' to the whole sample');
@@ -1319,26 +1872,42 @@ function create(host) {
       case 'clear':
         model.clearKey(sel.key);
         return;
+      case 'morphcopy':
+        if (!pad) { forceFb = true; return; }
+        model.copyPadToMorph(pad.id);
+        sendCommands(engine.refreshMorph());
+        forceFb = true;
+        return;
+      case 'morphclear':
+        if (!pad) { forceFb = true; return; }
+        model.clearPadMorph(pad.id);
+        sendCommands(engine.refreshMorph());
+        forceFb = true;
+        return;
     }
 
     spec = has(PAD_PARAMS, p) ? PAD_PARAMS[p] : null;
     if (!spec) { unknown('pad ' + p); return; }
     if (!pad) { forceFb = true; return; }
-    if (spec.bool) {
-      model.setPadParam(pad.id, spec.field, toBool(v));
+    value = spec.bool ? toBool(v) : num(v, 0) * (spec.scale || 1);
+    if (model.globals().morphEdit) {
+      // Morph edit: the control writes the B value.
+      model.setPadMorphParam(pad.id, spec.field, value);
+      lastEditedMorph = spec.field;
+      if (model.globals().morph > 0) { sendCommands(engine.refreshMorph()); }
     } else {
-      model.setPadParam(pad.id, spec.field, num(v, 0) * (spec.scale || 1));
+      model.setPadParam(pad.id, spec.field, value);
+      lastEdited = spec.field;
     }
-    lastEdited = spec.field;
   }
 
   function onKit(a) {
     var p = String(a[0]);
     var v = a[1];
     var g = model.globals();
-    var res, src, seed;
+    var res, src, seed, n;
 
-    if (has({ slot: 1, chaos: 1, repeat: 1, rate: 1, swing: 1, alt: 1 }, p)) {
+    if (AUTO_PARAMS.indexOf(p) >= 0) {
       autoParams[p] = v;
       applyKitParam(p, v);
       return;
@@ -1411,7 +1980,7 @@ function create(host) {
         model.setGlobal('modZoneOn', toBool(v));
         break;
       case 'modstart':
-        model.setGlobal('modZoneStart', clampInt(v, 0, 116));
+        model.setGlobal('modZoneStart', clampInt(v, 0, 112));
         break;
       case 'velsens':
         model.setGlobal('velSens', clamp(num(v, 50), 0, 100));
@@ -1421,10 +1990,70 @@ function create(host) {
         break;
       case 'panic':
         sendCommands(engine.panic());
+        updateTicker();
+        break;
+      case 'morphedit':
+        model.setGlobal('morphEdit', toBool(v));
+        forceFb = true;   // the pad controls now show the other set of values
+        break;
+      case 'morphcopyall':
+        n = model.copyAllToMorph();
+        sendCommands(engine.refreshMorph());
+        forceFb = true;
+        setStatus('Copied A to B on ' + n + ' pads');
+        break;
+      case 'morphclearall':
+        n = model.clearAllMorph();
+        sendCommands(engine.refreshMorph());
+        forceFb = true;
+        setStatus('Cleared B on ' + n + ' pads');
+        break;
+      case 'capture':
+        doCapture();
+        break;
+      case 'capturebars':
+        model.setGlobal('captureBars', CONST.CAPTURE_BARS[clampInt(v, 0, CONST.CAPTURE_BARS.length - 1)]);
+        break;
+      case 'capturefolder':
+        model.setGlobal('captureFolder', stripSlash(a.slice(1).join(' ')));
+        if (model.globals().captureFolder) { setStatus('Capture folder: ' + model.globals().captureFolder); }
+        break;
+      case 'keepclip':
+        model.setGlobal('keepClip', toBool(v));
+        setStatus(toBool(v) ? 'Keep clip on: map changes rewrite the clip' : 'Keep clip off');
+        break;
+      case 'remapclip':
+        remapClip(true);
         break;
       default:
         unknown('kit ' + p);
     }
+  }
+
+  // gest sel <0..3> | gest <param> <value> (edits the selected gesture)
+  function onGest(a) {
+    var p = String(a[0]);
+    var v = a[1];
+    var g = model.globals();
+    var spec, value, idx;
+
+    if (p === 'sel') {
+      model.setGlobal('gestureSel', clampInt(v, 0, 3));
+      forceFb = true;   // all gest_* controls now show the newly selected gesture
+      return;
+    }
+    spec = has(GEST_PARAMS, p) ? GEST_PARAMS[p] : null;
+    if (!spec) { unknown('gest ' + p); return; }
+    if (spec.kind === 'beats') {
+      idx = clampInt(v, 0, CONST.GEST_BEATS.length - 1);
+      value = CONST.GEST_BEATS[idx];   // the value, never the index: 1 and 2 are valid beat counts
+    } else if (spec.kind === 'rate') {
+      value = CONST.GEST_RATES[clampInt(v, 0, CONST.GEST_RATES.length - 1)];
+    } else {
+      value = num(v, 0) * (spec.scale || 1);
+    }
+    model.setGestureParam(g.gestureSel, spec.field, value);
+    forceFb = true;   // snap the control back if the model clamped the value
   }
 
   // Slice-edit units: the jsui sends frames. A value strictly between 0 and 1
@@ -1483,17 +2112,11 @@ function create(host) {
         return;
       case 'audition':
         k = toInt(a[1], -1);
-        if (k >= 0 && k <= 127) {
-          sendCommands(engine.noteOn(k, clampInt(a[2], 1, 127)));
-          viewDeb.trigger();
-        }
+        if (k >= 0 && k <= 127) { playKey(k, clampInt(a[2], 1, 127)); }
         return;
       case 'auditionoff':
         k = toInt(a[1], -1);
-        if (k >= 0 && k <= 127) {
-          sendCommands(engine.noteOff(k));
-          viewDeb.trigger();
-        }
+        if (k >= 0 && k <= 127) { playKey(k, 0); }
         return;
       case 'selectslice':
         if (!src) { return; }
@@ -1565,6 +2188,7 @@ function create(host) {
     source: onSource,
     pad: onPad,
     kit: onKit,
+    gest: onGest,
     ui: onUi,
     loadbang: function () { /* the patch sends `init` from live.thisdevice */ },
     bang: function () { if (viewDeb && model) { viewDeb.cancel(); writeView(); } },

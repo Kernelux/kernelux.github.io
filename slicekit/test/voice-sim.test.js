@@ -784,6 +784,247 @@ test('filter: no click when the voice restarts on a hot filter state', () => {
   assert.ok(maxStep(r.left, 0, 300) < 0.05);
 });
 
+// ---------------------------------------------------------------------------
+// cutoff smoothing (gesture sweeps update `cutoff` every ~15 ms)
+// ---------------------------------------------------------------------------
+
+const CS_KEEP = Math.exp(-1 / (0.01 * SR));       // one-pole memory per sample (tau 10 ms)
+const CS_COEF = 1 - CS_KEEP;
+
+/** Play a script of {at, set} events on a sim; collects left and the effective cutoff (Hz). */
+function playScript(sim, script, total, phaseFn) {
+  const out = { left: new Float32Array(total), cut: new Float64Array(total), active: new Float32Array(total) };
+  const ev = script.slice().sort((a, b) => a.at - b.at);
+  let t = 0, ei = 0;
+  while (t < total) {
+    while (ei < ev.length && ev[ei].at <= t) {
+      Object.keys(ev[ei].set).forEach(k => sim.set(k, ev[ei].set[k]));
+      ei++;
+    }
+    const until = Math.min(total, ei < ev.length ? ev[ei].at : total);
+    const len = Math.max(1, until - t);
+    const r = sim.process(len, phaseFn);
+    out.left.set(r.left, t); out.cut.set(r.cut, t); out.active.set(r.active, t);
+    t += len;
+  }
+  return out;
+}
+
+/** largest |log2| change of the cutoff between neighbouring rendered samples */
+function maxOctaveStep(cut, from, to) {
+  let m = 0;
+  for (let i = from + 1; i < to; i++) {
+    if (cut[i] > 0 && cut[i - 1] > 0) { m = Math.max(m, Math.abs(Math.log2(cut[i] / cut[i - 1]))); }
+  }
+  return m;
+}
+
+/** peak of |d| over a sliding window of w samples (envelope of an oscillating difference) */
+function windowPeak(d, w) {
+  const e = new Float64Array(d.length);
+  for (let i = 0; i < d.length; i++) {
+    let m = 0;
+    for (let j = Math.max(0, i - w + 1); j <= i; j++) { m = Math.max(m, Math.abs(d[j])); }
+    e[i] = m;
+  }
+  return e;
+}
+
+test('cutoff smoothing: a step mid-note glides as a one-pole in log2(Hz), tau 10 ms (no jump in the coefficient)', () => {
+  const sim = make(sineBuffer(60000, 220, 0.6), { pstart: 0, pend: 50000, held: 1 });
+  const r = playScript(sim, [
+    { at: 0, set: { cutoff: 4000, trig: 1 } },
+    { at: 3000, set: { cutoff: 500 } }
+  ], 8000);
+  // before the step: exactly the requested cutoff
+  close(r.cut[1], 4000, 1e-6, 'cutoff before the step');
+  close(r.cut[2999], 4000, 1e-6, 'unchanged until the step');
+  // after the step: cs_n = target + (start - target) * keep^(n+1), in log2(Hz)
+  const l0 = Math.log2(4000), l1 = Math.log2(500);
+  for (const n of [0, 1, 10, 100, 441, 1000, 2000]) {
+    const expected = Math.pow(2, l1 + (l0 - l1) * Math.pow(CS_KEEP, n + 1));
+    close(r.cut[3000 + n] / expected, 1, 1e-9, 'cutoff ' + n + ' samples after the step');
+  }
+  // no jump: the very first sample moves by (distance * coefficient) only, never more
+  const maxOct = (l0 - l1) * CS_COEF;
+  assert.ok(r.cut[3000] < r.cut[2999] && r.cut[3000] > 3900, 'first sample barely moves: ' + r.cut[3000]);
+  assert.ok(maxOctaveStep(r.cut, 2990, 8000) <= maxOct * (1 + 1e-9), 'per-sample change <= distance * coefficient');
+  for (let n = 3001; n < 8000; n++) { assert.ok(r.cut[n] <= r.cut[n - 1], 'monotonic glide at ' + n); }
+  // one time constant (441 samples): 63 % of the way in log2, 500 * 2^(3 * e^-1) ~ 1075 Hz
+  close(r.cut[3000 + 440] / Math.pow(2, l1 + (l0 - l1) * Math.exp(-1)), 1, 1e-9, 'one tau after the step');
+  close(r.cut[3000 + 440] / 1075, 1, 0.005, 'one tau after the step (absolute)');
+  close(r.cut[7999] / 500, 1, 1e-3, 'settles on the target');
+  // and the audio follows without a step
+  assert.ok(maxStep(r.left, 2000, 8000) < 2 * Math.PI * 220 / SR * 0.6 * 1.05, 'no click in the audio');
+});
+
+test('cutoff smoothing: the old (unsmoothed) behaviour is gone - a 500 -> 20000 step is not an instant switch', () => {
+  const buf = sineBuffer(60000, 1000, 0.5);
+  const sim = make(buf, { pstart: 0, pend: 50000, held: 1 });
+  const r = playScript(sim, [
+    { at: 0, set: { cutoff: 500, trig: 1 } },
+    { at: 5000, set: { cutoff: 20000 } }
+  ], 12000);
+  // an instant switch from the 500 Hz filter (-6 dB, ~-90 deg at 1 kHz) to dry would step by ~0.36
+  const natural = 2 * Math.PI * 1000 / SR * 0.5;
+  assert.ok(maxStep(r.left, 2000, 12000) < natural * 1.05, 'max step ' + maxStep(r.left, 2000, 12000));
+});
+
+test('cutoff smoothing: every (re)start snaps to the target - trig, retrigger, kill then trig, repeat line', () => {
+  const buf = sineBuffer(60000, 220, 0.6);
+  const SNAP = 1e-6;
+
+  // idle voice: a new hit starts exactly at its cutoff, whatever the previous hit did
+  let sim = make(buf, { pstart: 0, pend: 3000, held: 1 });
+  let r = playScript(sim, [
+    { at: 0, set: { cutoff: 500, trig: 1 } },
+    { at: 5000, set: { cutoff: 8000, trig: 2 } }
+  ], 7000);
+  assert.equal(r.active[4000], 0, 'first hit is over');
+  close(r.cut[5000], 8000, SNAP, 'first sample of the new hit');
+  close(r.cut[0], 500, SNAP, 'first sample of the first hit');
+
+  // retrigger of a sounding voice: it glides during the 1 ms fade-out, then snaps at the restart
+  sim = make(buf, { pstart: 0, pend: 50000, held: 1 });
+  r = playScript(sim, [
+    { at: 0, set: { cutoff: 500, trig: 1 } },
+    { at: 4000, set: { cutoff: 8000, trig: 2 } }
+  ], 6000);
+  const restart = eventsOf(sim, 'start')[1].n;
+  assert.ok(restart > 4000 && restart < 4050, 'restart after the fade: ' + restart);
+  assert.ok(r.cut[restart - 1] < 1000, 'still gliding during the fade-out: ' + r.cut[restart - 1]);
+  close(r.cut[restart], 8000, SNAP, 'snapped at the restart');
+
+  // kill, then trig during the kill fade: the new note wins and starts at its cutoff
+  sim = make(buf, { pstart: 0, pend: 50000, held: 1 });
+  r = playScript(sim, [
+    { at: 0, set: { cutoff: 500, trig: 1 } },
+    { at: 4000, set: { kill: 1 } },
+    { at: 4020, set: { cutoff: 6000, trig: 2 } }
+  ], 6000);
+  const restart2 = eventsOf(sim, 'start')[1].n;
+  assert.ok(restart2 > 4020 && restart2 < 4100, 'restart after kill + trig: ' + restart2);
+  close(r.cut[restart2], 6000, SNAP, 'snapped after kill -> trig');
+  assert.ok(r.cut[restart2 - 1] < 800, 'was gliding before: ' + r.cut[restart2 - 1]);
+
+  // repeat: a waiting voice restarts on the line at the cutoff set in between; so does a sounding one
+  const spb = 22050;
+  for (const pend of [2000, 15000]) {
+    sim = make(buf, { pstart: 1000, pend: pend, rptdiv: 4, held: 1, playing: 1 });
+    r = playScript(sim, [
+      { at: 0, set: { cutoff: 20000, trig: 1 } },
+      { at: 3000, set: { cutoff: 300 } },
+      { at: 8000, set: { cutoff: 5000 } }
+    ], spb, hostPhase(spb, 0));
+    const st = eventsOf(sim, 'start').map(e => e.n);
+    assert.equal(st.length, 4, 'four hits (pend ' + pend + ')');
+    close(r.cut[st[1]], 300, SNAP, 'repeat 1 at 300 Hz (pend ' + pend + ')');
+    close(r.cut[st[2]], 5000, SNAP, 'repeat 2 at 5000 Hz (pend ' + pend + ')');
+    close(r.cut[st[3]], 5000, SNAP, 'repeat 3 at 5000 Hz (pend ' + pend + ')');
+    if (pend === 15000) { assert.ok(r.cut[st[2] - 1] < 4990 && r.cut[st[2] - 1] > 300, 'sounding repeat glided before snapping'); }
+  }
+});
+
+test('cutoff bypass (>= 19000) is decided on the smoothed value and cross-faded: no switching click', () => {
+  const N = 60000, TOTAL = 9000, STEP = 3000;
+  for (const f of [3000, 8000]) {
+    const buf = sineBuffer(N, f, 0.5);
+    const base = { pstart: 0, pend: 50000, held: 1 };
+    const dry = playScript(make(buf, base), [{ at: 0, set: { cutoff: 20000, trig: 1 } }], TOTAL);
+
+    // 20000 -> 18000: stays dry until the smoothed cutoff crosses 19000, then fades to the filter in 2 ms
+    const down = playScript(make(buf, base), [
+      { at: 0, set: { cutoff: 20000, trig: 1 } }, { at: STEP, set: { cutoff: 18000 } }
+    ], TOTAL);
+    const d1 = new Float64Array(TOTAL);
+    for (let i = 0; i < TOTAL; i++) { d1[i] = down.left[i] - dry.left[i]; }
+    const first = firstIndex(d1, 0, v => v !== 0);
+    // smoothed value: log2(18000) + (log2(24000) - log2(18000)) * keep^(n+1) reaches 19000
+    const nCross = Math.log((Math.log2(24000) - Math.log2(18000)) / (Math.log2(19000) - Math.log2(18000))) / -Math.log(CS_KEEP);
+    assert.ok(Math.abs((first - STEP) - nCross) <= 3, f + ' Hz: bypass leaves at ' + (first - STEP) + ' vs ' + nCross.toFixed(1));
+    assert.ok(down.cut[first - 1] >= 19000 && down.cut[first] < 19000, 'switch happens when the smoothed cutoff crosses 19000');
+    const e1 = windowPeak(d1, 16);
+    let maxE1 = 0, stepE1 = 0;
+    for (let i = STEP; i < TOTAL; i++) { maxE1 = Math.max(maxE1, e1[i]); stepE1 = Math.max(stepE1, Math.abs(e1[i] - e1[i - 1])); }
+    assert.ok(maxE1 > 0.03, 'the filter really engages: ' + maxE1);
+    assert.ok(stepE1 < 0.15 * maxE1, f + ' Hz: filter fades in, no step (' + stepE1 + ' of ' + maxE1 + ')');
+    // settles on the plain 18000 Hz filter
+    const ref = playScript(make(buf, base), [{ at: 0, set: { cutoff: 18000, trig: 1 } }], TOTAL);
+    assert.ok(maxAbsDiff(down.left.subarray(8000), ref.left.subarray(8000)) < 1e-5, 'same as a hit that started at 18000');
+
+    // 500 -> 20000: filtered until the smoothed value crosses 19000, then 2 ms fade to the exact dry signal
+    const up = playScript(make(buf, base), [
+      { at: 0, set: { cutoff: 500, trig: 1 } }, { at: STEP, set: { cutoff: 20000 } }
+    ], TOTAL);
+    const d2 = new Float64Array(TOTAL);
+    for (let i = 0; i < TOTAL; i++) { d2[i] = up.left[i] - dry.left[i]; }
+    let last = -1;
+    for (let i = 0; i < TOTAL; i++) { if (d2[i] !== 0) { last = i; } }
+    const nUp = Math.log((Math.log2(24000) - Math.log2(500)) / (Math.log2(24000) - Math.log2(19000))) / -Math.log(CS_KEEP);
+    const cross = firstIndex(up.cut, STEP, v => v >= 19000);
+    assert.ok(Math.abs((cross - STEP) - nUp) <= 3, f + ' Hz: crossing at ' + (cross - STEP) + ' vs ' + nUp.toFixed(1));
+    assert.ok(last - cross >= 80 && last - cross <= 95, f + ' Hz: 2 ms cross-fade after the crossing: ' + (last - cross));
+    assert.equal(maxAbsDiff(up.left.subarray(last + 1), dry.left.subarray(last + 1)), 0, 'exactly dry afterwards');
+    const e2 = windowPeak(d2, 16);
+    let maxE2 = 0, stepE2 = 0;
+    for (let i = STEP; i < TOTAL; i++) { maxE2 = Math.max(maxE2, e2[i]); stepE2 = Math.max(stepE2, Math.abs(e2[i] - e2[i - 1])); }
+    assert.ok(stepE2 < 0.15 * maxE2, f + ' Hz: filter fades out, no step (' + stepE2 + ' of ' + maxE2 + ')');
+  }
+  // a hit that starts at >= 19000 is dry from its first sample, also after a filtered hit
+  const buf2 = sineBuffer(N, 3000, 0.5);
+  const dry2 = playScript(make(buf2, { pstart: 0, pend: 3000, held: 1 }), [{ at: 0, set: { cutoff: 20000, trig: 1 } }], 3000);
+  const two = playScript(make(buf2, { pstart: 0, pend: 3000, held: 1 }), [
+    { at: 0, set: { cutoff: 400, trig: 1 } }, { at: 4000, set: { cutoff: 19000, trig: 2 } }
+  ], 7000);
+  assert.equal(maxAbsDiff(two.left.subarray(4000, 7000), dry2.left), 0, 'second hit is exactly dry');
+  // ... and a hit that starts below 19000 is filtered from its first sample, whatever the previous hit was
+  const afterDry = playScript(make(buf2, { pstart: 0, pend: 3000, held: 1 }), [
+    { at: 0, set: { cutoff: 20000, trig: 1 } }, { at: 4000, set: { cutoff: 400, trig: 2 } }
+  ], 7000);
+  const afterFiltered = playScript(make(buf2, { pstart: 0, pend: 3000, held: 1 }), [
+    { at: 0, set: { cutoff: 5000, trig: 1 } }, { at: 4000, set: { cutoff: 400, trig: 2 } }
+  ], 7000);
+  assert.equal(maxAbsDiff(afterDry.left.subarray(4000, 7000), afterFiltered.left.subarray(4000, 7000)), 0, 'hit start does not depend on the previous hit');
+  assert.ok(rms(afterDry.left, 4100, 7000) < 0.05 * rms(dry2.left, 100, 3000), 'the 400 Hz filter is on from the start (3 kHz tone is cut)');
+});
+
+test('cutoff sweeps 20000 -> 500 and 500 -> 20000 over 1 s in 15 ms parameter steps: no click, no zipper', () => {
+  const STEPS = 66;
+  const every = Math.round(0.015 * SR);      // 662 samples
+  const total = Math.round(1.0 * SR) + 6000;
+  for (const f of [200, 3000]) {
+    for (const dirUp of [false, true]) {
+      const from = dirUp ? 500 : 20000, to = dirUp ? 20000 : 500;
+      const script = [{ at: 0, set: { cutoff: from, trig: 1 } }];
+      for (let k = 1; k <= STEPS; k++) {
+        script.push({ at: k * every, set: { cutoff: from * Math.pow(to / from, k / STEPS) } });
+      }
+      const amp = 0.5;
+      const sim = make(sineBuffer(80000, f, amp), { pstart: 0, pend: 70000, held: 1 });
+      const r = playScript(sim, script, total);
+      const label = f + ' Hz ' + from + '->' + to;
+      for (let i = 0; i < total; i++) { assert.ok(Number.isFinite(r.left[i]), 'finite ' + label); }
+      // the output never steps more than the plain sine does
+      const natural = 2 * Math.PI * f / SR * amp;
+      assert.ok(maxStep(r.left, 100, total) <= natural * 1.02, label + ' max step ' + maxStep(r.left, 100, total) + ' vs ' + natural);
+      // the cutoff glides: no per-sample change beyond 0.001 octave (a raw 15 ms step is 0.08 octave)
+      assert.ok(maxOctaveStep(r.cut, 0, total) < 0.001, label + ' cutoff step ' + maxOctaveStep(r.cut, 0, total));
+      // and it ends on the final value (clamped to 0.45 * fs where the bypass takes over)
+      close(r.cut[total - 1] / Math.min(to, 0.45 * SR), 1, 0.002, label + ' final cutoff');
+      for (let n = 2; n < total; n++) {
+        assert.ok(dirUp ? r.cut[n] >= r.cut[n - 1] - 1e-9 : r.cut[n] <= r.cut[n - 1] + 1e-9, label + ' monotonic sweep at ' + n);
+      }
+    }
+  }
+  // a swept-up voice ends up exactly dry
+  const buf3 = sineBuffer(80000, 3000, 0.5);
+  const script3 = [{ at: 0, set: { cutoff: 500, trig: 1 } }];
+  for (let k = 1; k <= STEPS; k++) { script3.push({ at: k * every, set: { cutoff: 500 * Math.pow(40, k / STEPS) } }); }
+  const swept = playScript(make(buf3, { pstart: 0, pend: 70000, held: 1 }), script3, total);
+  const dry3 = playScript(make(buf3, { pstart: 0, pend: 70000, held: 1 }), [{ at: 0, set: { cutoff: 20000, trig: 1 } }], total);
+  assert.equal(maxAbsDiff(swept.left.subarray(total - 2000), dry3.left.subarray(total - 2000)), 0, 'exactly dry once the sweep is over');
+});
+
 test('drive: bounded tanh saturation, level-independent normalisation, off at 0', () => {
   const N = 40000;
   for (const d of [0.1, 0.5, 1]) {
