@@ -47,6 +47,7 @@
 //   cutoff    Hz       2-pole low-pass (Simper TPT SVF, Q = 0.7071);
 //                      >= 19000 = bypass
 //   drive     0..1     y = tanh(x*(1+9*drive))/tanh(1+9*drive) when > 0
+//                      (signal chain: filter -> drive -> envelope/fades -> amp)
 //   tape      0/1      1: rate factor falls linearly to 0 in `tapems`;
 //                      0: back to 1 within 10 ms
 //   tapems    ms       tape stop time
@@ -345,12 +346,11 @@ if (dorestart > 0.5) {
       alt = 0;
     }
   }
-  if (st != 1) {
-    ic1l = 0;
-    ic2l = 0;
-    ic1r = 0;
-    ic2r = 0;
-  }
+  // every hit starts with a cold filter (the gain stage is after the filter)
+  ic1l = 0;
+  ic2l = 0;
+  ic1r = 0;
+  ic2r = 0;
   dd = 1;
   if (dir < 0) {
     dd = -1;
@@ -561,13 +561,8 @@ if (st == 1) {
       xr = xr * (1 - lw) + (a1 + (b1 - a1) * f1) * lw;
     }
 
-    // amplitude: declick * end fade * envelope * tape (amplitude ~ sqrt)
-    vg = g * ge * envv * sqrt(tf);
-    xl = xl * vg;
-    xr = xr * vg;
-
-    // 2-pole TPT low-pass (Simper SVF). It always runs so its state is warm;
-    // cutoff >= 19000 bypasses its output.
+    // 2-pole TPT low-pass (Simper SVF) on the raw signal. It always runs so
+    // its state is warm; cutoff >= 19000 bypasses its output.
     fc = min(max(cutoff, 10), 0.45 * sr);
     gf = tan(3.141592653589793 * fc / sr);
     a1f = 1 / (1 + gf * (gf + 1.4142135623730951));
@@ -598,10 +593,13 @@ if (st == 1) {
       yr = tanh(yr * da) / dn;
     }
 
-    // amp, smoothed (~5 ms)
+    // gain stage after filter and drive, so every fade ends in exact silence
+    // (no filter ring-out is ever chopped): declick * end fade * envelope *
+    // tape (amplitude ~ sqrt of the rate factor), then amp smoothed (~5 ms)
+    vg = g * ge * envv * sqrt(tf);
     ampsm = ampsm + (amp - ampsm) * ampcoef;
-    outl = yl * ampsm;
-    outr = yr * ampsm;
+    outl = yl * vg * ampsm;
+    outr = yr * vg * ampsm;
 
     // advance the playhead, wrap inside the micro-loop
     pos = pos + incr;

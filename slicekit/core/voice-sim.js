@@ -307,12 +307,10 @@ function create(opts) {
           alt = 0;
         }
       }
-      if (st !== 1) {
-        ic1l = 0;
-        ic2l = 0;
-        ic1r = 0;
-        ic2r = 0;
-      }
+      ic1l = 0;
+      ic2l = 0;
+      ic1r = 0;
+      ic2r = 0;
       dd = 1;
       if (dir < 0) {
         dd = -1;
@@ -518,12 +516,7 @@ function create(opts) {
           xr = xr * (1 - lw) + (a1 + (b1 - a1) * f1) * lw;
         }
 
-        // amplitude: declick * end fade * envelope * tape (amplitude ~ sqrt)
-        vg = g * ge * envv * sqrt(tf);
-        xl = xl * vg;
-        xr = xr * vg;
-
-        // 2-pole TPT low-pass (Simper SVF), always running
+        // 2-pole TPT low-pass (Simper SVF) on the raw signal, always running
         fc = min(max(cutoff, 10), 0.45 * sr);
         gf = tan(3.141592653589793 * fc / sr);
         a1f = 1 / (1 + gf * (gf + 1.4142135623730951));
@@ -554,10 +547,13 @@ function create(opts) {
           yr = tanh(yr * da) / dn;
         }
 
-        // amp, smoothed (~5 ms)
+        // gain stage after filter and drive, so every fade ends in exact silence:
+        // declick * end fade * envelope * tape (~ sqrt of the rate factor),
+        // then amp smoothed (~5 ms)
+        vg = g * ge * envv * sqrt(tf);
         ampsm = ampsm + (amp - ampsm) * ampcoef;
-        outl = yl * ampsm;
-        outr = yr * ampsm;
+        outl = yl * vg * ampsm;
+        outr = yr * vg * ampsm;
 
         dbgPos = pos;
 
