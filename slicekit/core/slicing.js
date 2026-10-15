@@ -15,6 +15,11 @@ var DEFAULT_MIN_SLICE_MS = 30;
 // silence by the transient detector (the log-compressed flux is so sensitive
 // that dither / noise floor would otherwise produce random onsets).
 var SILENCE_PEAK = 5e-4;
+// Raw (un-normalised) spectral flux below this (in log-magnitude units summed
+// over bins; a -70 dBFS click is about 10) is rounding noise or the phase ripple
+// of a stationary tone, not an onset. The normalised ODF is never scaled up
+// from it and no onset candidate may be weaker.
+var MIN_ODF_PEAK = 10;
 
 // ---------------------------------------------------------------- helpers
 
@@ -73,6 +78,8 @@ function toMono(channels) {
 // Returns { odf: Float32Array (normalised to max 1), hop, frameSize, peak }
 // where `peak` is the raw (un-normalised) maximum flux. odf[i] describes the
 // change from frame i-1 to frame i; frame i covers samples [i*hop, i*hop+frameSize).
+// Only complete frames are analysed (a file shorter than one frame yields a
+// single zero-padded frame, i.e. odf = [0]).
 function onsetFunction(mono, sr, opts) {
   opts = opts || {};
   var big = sr > 60000;
@@ -81,7 +88,9 @@ function onsetFunction(mono, sr, opts) {
   var n = mono.length;
   if (n === 0) return { odf: new Float32Array(0), hop: hop, frameSize: N, peak: 0 };
 
-  var numFrames = n <= N ? 1 : Math.ceil((n - N) / hop) + 1;
+  // only complete frames: a zero-padded last frame would show up as a bogus
+  // spectral change at the very end of the file
+  var numFrames = n < N ? 1 : Math.floor((n - N) / hop) + 1;
   var odf = new Float32Array(numFrames);
   var win = FFT.hann(N);
   var re = new Float64Array(N);
@@ -299,7 +308,7 @@ function detectTransients(mono, sr, opts) {
   if (pk < SILENCE_PEAK) return [0];
 
   var o = onsetFunction(mono, sr);
-  if (!(o.peak > 0)) return [0];
+  if (!(o.peak >= MIN_ODF_PEAK)) return [0];
   var odf = o.odf;
   var hop = o.hop;
   var N = o.frameSize;
@@ -319,6 +328,7 @@ function detectTransients(mono, sr, opts) {
   for (i = 1; i < m; i++) {
     v = odf[i];
     if (v <= med[i] * tp.factor + tp.delta) continue;
+    if (v * o.peak < MIN_ODF_PEAK) continue;
     if (i * hop + N < minFrames) continue;
     ok = true;
     for (j = i - w < 0 ? 0 : i - w; j < i; j++) {
@@ -418,7 +428,7 @@ function estimateBpm(mono, sr, opts) {
   if (!mono || mono.length === 0 || !(sr > 0)) return null;
 
   var o = onsetFunction(mono, sr);
-  if (!(o.peak > 0)) return null;
+  if (!(o.peak >= MIN_ODF_PEAK)) return null;
   var odf = o.odf;
   var hop = o.hop;
   var m = odf.length;
@@ -427,13 +437,21 @@ function estimateBpm(mono, sr, opts) {
   var lagMax = Math.ceil(fps * 60 / minBpm);
   if (m < 2 * lagMax + 2) return null;
 
+  // light smoothing ([1 2 3 2 1]/9) so that a beat period that is not a whole
+  // number of frames still correlates (otherwise short lags are penalised)
   var i, lag;
+  var sm = new Float64Array(m);
+  for (i = 0; i < m; i++) {
+    sm[i] = (3 * odf[i]
+      + 2 * ((i > 0 ? odf[i - 1] : 0) + (i + 1 < m ? odf[i + 1] : 0))
+      + (i > 1 ? odf[i - 2] : 0) + (i + 2 < m ? odf[i + 2] : 0)) / 9;
+  }
   var mean = 0;
-  for (i = 0; i < m; i++) mean += odf[i];
+  for (i = 0; i < m; i++) mean += sm[i];
   mean /= m;
   var x = new Float64Array(m);
   var e0 = 0;
-  for (i = 0; i < m; i++) { x[i] = odf[i] - mean; e0 += x[i] * x[i]; }
+  for (i = 0; i < m; i++) { x[i] = sm[i] - mean; e0 += x[i] * x[i]; }
   if (!(e0 > 1e-12)) return null;
 
   // unbiased normalised autocorrelation at one lag (cached)
