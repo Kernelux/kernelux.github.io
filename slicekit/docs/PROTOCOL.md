@@ -330,13 +330,16 @@ no slice points, slice normally. Unverifiable here: property names `slices`,
 
 ### Keep clip (glue + core/remap.js, LiveAPI)
 Before each map change on the current slot (shuffle, relayout/layout globals, swap,
-clear, findBest, spread, assign, undo/redo) the glue keeps a copy of the slot keys;
+clear, findBest, spread, duplicate, assign, undo/redo, and adding / removing /
+re-slicing a sample when that moves pads; never slot switching or a restore) the
+glue keeps a copy of the slot keys;
 after it, `remap.keyMapping(before, after)`. If `keepClip` is on, rewrite the clip:
 `live_set view detail_clip` if it is a MIDI clip on this device's track
 (`this_device canonical_parent`), else the track's playing clip.
 `get_notes_extended(0, 128, 0, length)` → JSON → `remap.remapNotes(notes, mapping, isModKey)`
 → `apply_note_modifications({notes: changed})`. Status "Clip remapped: N notes".
-The last mapping is kept for `kit remapclip`.
+The last mapping is kept for `kit remapclip`, which refuses to apply the same mapping
+twice to the same clip ("Clip already remapped").
 
 ### Voice additions
 The voice smooths `cutoff` (one-pole in the log domain, ≈10 ms; snapped to the

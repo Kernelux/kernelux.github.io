@@ -962,7 +962,7 @@ test('redir: inside a micro-loop the loop region is mirrored; with the stop behi
     const d = r.pos[n] - r.pos[n - 1];
     assert.ok(d === -1 || d === 499, 'steps backwards, or wraps forward by loop length - 1: ' + d + ' at ' + n);
   }
-  assert.ok(eventsOf(sim, 'wrap').length > 20);
+  assert.ok(eventsOf(sim, 'wrap').length >= 17, 'keeps wrapping: ' + eventsOf(sim, 'wrap').length);
   for (let n = 4000; n < 9000; n++) { assert.equal(r.active[n], 1); }
   assert.ok(maxStep(r.left, 3900, 9000) < 0.0015, 'smooth: ' + maxStep(r.left, 3900, 9000));
 

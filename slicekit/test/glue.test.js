@@ -2680,7 +2680,8 @@ test('dropping a file named like a sample that failed to load re-links that samp
   w1.settle();
   const saved = w1.state();
 
-  const w2 = createWorld({ dicts: w1.dicts, autoload: false });
+  const copy = () => JSON.parse(JSON.stringify(w1.dicts));   // each world gets its own dict store
+  const w2 = createWorld({ dicts: copy(), autoload: false });
   w2.send('init');
   w2.advance(31000);
   assert.equal(w2.glue().status, 'Missing file: drums.wav');
@@ -2719,7 +2720,7 @@ test('dropping a file named like a sample that failed to load re-links that samp
   assert.equal(w2.model().listSources().length, 2);
 
   // a sample that is still loading is not a relink target
-  const w3 = createWorld({ dicts: w1.dicts, autoload: false });
+  const w3 = createWorld({ dicts: copy(), autoload: false });
   w3.send('init');
   w3.send('drop', '/moved/drums.wav');
   assert.equal(w3.model().listSources().length, 2);
@@ -2771,9 +2772,9 @@ test('slices that did not fit on the keys are reported after loads, reslices, la
 test('real layout overflow is reported when the model supports lastLayout()', (t) => {
   const w = loadedWorld(['/audio/a.wav', '/audio/b.wav']);
   if (typeof w.model().lastLayout !== 'function') { t.skip('model.lastLayout() not available yet'); return; }
-  w.send('kit', 'root', 100);
+  w.send('kit', 'root', 124);
   const ll = w.plain(w.model().lastLayout());
-  assert.ok(ll.dropped > 0, 'two samples do not fit above key 100');
+  assert.ok(ll.dropped > 0, 'two samples do not fit above key 124');
   assert.match(w.glue().status, new RegExp(' — ' + ll.dropped + ' slices? '));
   w.send('kit', 'root', 36);
   assert.ok(!/fit on the keys/.test(w.glue().status));
@@ -2787,7 +2788,8 @@ test('the 128-slice cap is reported: reslice, manual add, Simpler import', () =>
   w.settle();
   const s = w.state().sources[0];
   assert.equal(s.slices.length, 128);
-  assert.equal(w.glue().status, 'drums.wav: 128 slices — Limited to 128 slices');
+  assert.ok(w.glue().status.startsWith('drums.wav: 128 slices — Limited to 128 slices'), w.glue().status);
+  assert.match(w.glue().status, / — \d+ slices didn't fit on the keys/, '128 slices cannot all fit above key 36');
 
   // a manual add beyond the cap is refused with a status
   w.send('ui', 'addslice', 35000);
@@ -2822,5 +2824,11 @@ test('the 128-slice cap is reported: reslice, manual add, Simpler import', () =>
   assert.equal(imp.slices[127].start, 127 * 300);
   assert.equal(imp.slices[127].end, imp.frames, 'the last slice takes the rest');
   assert.equal(imp.slicing.mode, 'manual');
-  assert.equal(w2.glue().status, 'Loaded many.wav: 128 slices — Limited to 128 slices');
+  assert.ok(w2.glue().status.startsWith('Loaded many.wav: 128 slices — Limited to 128 slices'), w2.glue().status);
+
+  // the model's own truncation report counts too
+  const w3 = loadedWorld(['/audio/drums.wav']);
+  w3.glue().model.lastSliceTruncation = () => 5;
+  w3.send('source', 'reslice');
+  assert.match(w3.glue().status, /^drums\.wav: \d+ slices — Limited to 128 slices$/);
 });
