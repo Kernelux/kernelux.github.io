@@ -1,0 +1,1089 @@
+'use strict';
+// Engine tests. Uses a stub model (the real core/model.js is written concurrently),
+// implementing only the methods the engine is allowed to use.
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const Engine = require('../core/engine');
+
+// ---------------------------------------------------------------------------
+// Stub model
+// ---------------------------------------------------------------------------
+
+// Mod zone starts at MOD_START; offsets follow MOD_ACTIONS.
+const MOD_START = 96;
+const MOD = {
+  RPT_4: 96, RPT_8: 97, RPT_8T: 98, RPT_16: 99, RPT_16T: 100, RPT_32: 101, RPT_64: 102,
+  REVERSE: 103, OCTDOWN: 104, OCTUP: 105, TAPE: 106, CHAOS: 107
+};
+
+const START_ORDER = [
+  'src', 'bufsr', 'pstart', 'pend', 'dir', 'pitch', 'amp', 'att', 'dec', 'sus', 'rel',
+  'gatemode', 'loopon', 'loopsize', 'looppos', 'rptdiv', 'rptswing', 'rptalt',
+  'cutoff', 'drive', 'tape', 'tapems', 'held', 'trig'
+];
+
+function stubModel() {
+  let nextId = 1;
+  const sources = {};
+  const slices = {};
+  const pads = {};
+  const keys = {};
+  const g = {
+    chokeScope: 'source', chaos: 0, repeatOn: false, repeatDiv: '1/16', swing: 0,
+    repeatAlt: false, velSens: 50, pressureToLevel: false
+  };
+  const model = {
+    modZoneOn: true,
+    getPadOnKey(k) { const id = keys[k]; return id === undefined ? null : (pads[id] || null); },
+    getPad(id) { return pads[id] || null; },
+    getSlice(id) { return slices[id] || null; },
+    getSource(id) { return sources[id] || null; },
+    isModKey(k) { return model.modZoneOn && k >= MOD_START && k < MOD_START + 12; },
+    modOffset(k) { return model.isModKey(k) ? k - MOD_START : -1; },
+    occupiedKeys() {
+      return Object.keys(keys).map(Number).filter((k) => !model.isModKey(k)).sort((a, b) => a - b);
+    },
+    globals() { return g; },
+
+    // ---- test builders (not part of the engine contract) ----
+    addSource(o = {}) {
+      const src = {
+        id: nextId++, slot: 0, frames: 44100, sr: 44100, playMode: 'poly', trigMode: 'trigger',
+        slices: [], ...o
+      };
+      const ranges = o.slices || [[0, 1000], [1000, 2000], [2000, 3000], [3000, 4000]];
+      src.slices = ranges.map(([start, end]) => {
+        const sl = { id: nextId++, start, end, sourceId: src.id };
+        slices[sl.id] = sl;
+        return sl;
+      });
+      sources[src.id] = src;
+      return src;
+    },
+    // key === null creates an unmapped pad (e.g. a layer target)
+    addPad(key, src, sliceIndex = 0, o = {}) {
+      const pad = {
+        id: nextId++, sourceId: src.id, sliceId: src.slices[sliceIndex].id, base: true,
+        reverse: false, pitch: 0, fine: 0, gainDb: 0,
+        attackMs: 0, decayMs: 300, sustain: 1, releaseMs: 30,
+        startOffsetMs: 0, loopOn: false, loopSizeMs: 30, loopPos: 0,
+        cutoffHz: 20000, drive: 0, layers: [], ...o
+      };
+      pads[pad.id] = pad;
+      if (key !== null) keys[key] = pad.id;
+      return pad;
+    }
+  };
+  return model;
+}
+
+function mk(engineOpts = {}) {
+  const model = stubModel();
+  const engine = Engine.create({ model, ...engineOpts });
+  return { model, engine, g: model.globals() };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const dbtoa = (db) => Math.pow(10, db / 20);
+const velCurve = (v, sens) => { const s = sens / 100; return (1 - s) + s * Math.pow(v / 127, 1.5); };
+const near = (a, b, msg) => assert.ok(Math.abs(a - b) < 1e-9, (msg || 'near') + ': ' + a + ' vs ' + b);
+
+function pmap(cmd) {
+  const o = {};
+  for (const [k, v] of cmd.params) o[k] = v;
+  return o;
+}
+const names = (cmd) => cmd.params.map((p) => p[0]);
+const isStart = (c) => c.params.some((p) => p[0] === 'trig');
+const isKill = (c) => c.params.length === 1 && c.params[0][0] === 'kill';
+const starts = (cmds) => cmds.filter(isStart);
+const kills = (cmds) => cmds.filter(isKill);
+const startVoices = (cmds) => starts(cmds).map((c) => c.voice);
+const killVoices = (cmds) => kills(cmds).map((c) => c.voice);
+
+// rng returning the given values in order (then repeating the last one)
+function seqRng(...vals) {
+  let i = 0;
+  const f = () => { const v = vals[Math.min(i, vals.length - 1)]; i++; return v; };
+  f.calls = () => i;
+  return f;
+}
+
+// ---------------------------------------------------------------------------
+// Note on: parameter list
+// ---------------------------------------------------------------------------
+
+test('note on emits the full ordered parameter list ending with held and trig', () => {
+  const { model, engine, g } = mk({ bufferName: (slot) => 'buf' + slot });
+  g.velSens = 50;
+  const src = model.addSource({ slot: 2, frames: 96000, sr: 48000, slices: [[1000, 5000]] });
+  model.addPad(60, src, 0, {
+    pitch: 3, fine: 50, gainDb: -6, attackMs: 5, decayMs: 200, sustain: 0.5, releaseMs: 40,
+    loopOn: true, loopSizeMs: 10, loopPos: 0.25, cutoffHz: 8000, drive: 0.3
+  });
+  const cmds = engine.noteOn(60, 100);
+  assert.equal(cmds.length, 1);
+  const c = cmds[0];
+  assert.equal(c.voice, 0);
+  assert.deepEqual(names(c), START_ORDER);
+  const p = pmap(c);
+  assert.equal(p.src, 'buf2');
+  assert.equal(p.bufsr, 48000);
+  assert.equal(p.pstart, 1000);
+  assert.equal(p.pend, 5000);
+  assert.equal(p.dir, 1);
+  near(p.pitch, 3.5);
+  near(p.amp, dbtoa(-6) * velCurve(100, 50));
+  assert.equal(p.att, 5);
+  assert.equal(p.dec, 200);
+  assert.equal(p.sus, 0.5);
+  assert.equal(p.rel, 40);
+  assert.equal(p.gatemode, 0);
+  assert.equal(p.loopon, 1);
+  near(p.loopsize, 480);
+  assert.equal(p.looppos, 0.25);
+  assert.equal(p.rptdiv, 0);
+  assert.equal(p.rptswing, 0);
+  assert.equal(p.rptalt, 0);
+  assert.equal(p.cutoff, 8000);
+  assert.equal(p.drive, 0.3);
+  assert.equal(p.tape, 0);
+  assert.equal(p.tapems, 500);
+  assert.equal(p.held, 1);
+  assert.equal(p.trig, 1);
+  // held then trig are the very last two entries
+  assert.deepEqual(c.params.slice(-2), [['held', 1], ['trig', 1]]);
+});
+
+test('default bufferName is src<slot>; default voice count is 16', () => {
+  const { model, engine } = mk();
+  const src = model.addSource({ slot: 7 });
+  for (let k = 0; k < 17; k++) model.addPad(k, src, 0);
+  const first = engine.noteOn(0, 100);
+  assert.equal(pmap(first[0]).src, 'src7');
+  const used = new Set([first[0].voice]);
+  for (let k = 1; k < 16; k++) used.add(engine.noteOn(k, 100)[0].voice);
+  assert.equal(used.size, 16);
+  assert.deepEqual([...used].sort((a, b) => a - b), Array.from({ length: 16 }, (_, i) => i));
+  // 17th note must steal (oldest voice, all held) => voice 0
+  assert.equal(engine.noteOn(16, 100)[0].voice, 0);
+});
+
+test('velocity 0 is a note off; unmapped key and unknown key off do nothing', () => {
+  const { model, engine } = mk();
+  const src = model.addSource();
+  model.addPad(60, src, 0);
+  assert.deepEqual(engine.noteOn(61, 100), []);          // no pad
+  engine.noteOn(60, 100);
+  assert.deepEqual(engine.noteOn(60, 0), [{ voice: 0, params: [['held', 0]] }]);
+  assert.deepEqual(engine.noteOff(60), []);              // already released
+  assert.deepEqual(engine.noteOff(99), []);
+});
+
+test('velocity curve and velSens', () => {
+  const { model, engine, g } = mk();
+  const src = model.addSource();
+  model.addPad(60, src, 0, { gainDb: -3 });
+  g.velSens = 0;
+  near(pmap(engine.noteOn(60, 1)[0]).amp, dbtoa(-3));
+  near(pmap(engine.noteOn(60, 127)[0]).amp, dbtoa(-3));
+  g.velSens = 100;
+  near(pmap(engine.noteOn(60, 127)[0]).amp, dbtoa(-3));
+  near(pmap(engine.noteOn(60, 64)[0]).amp, dbtoa(-3) * Math.pow(64 / 127, 1.5));
+  g.velSens = 50;
+  near(pmap(engine.noteOn(60, 32)[0]).amp, dbtoa(-3) * (0.5 + 0.5 * Math.pow(32 / 127, 1.5)));
+  // exported helper agrees
+  near(Engine.velCurve(32, 50), 0.5 + 0.5 * Math.pow(32 / 127, 1.5));
+  near(Engine.dbtoa(-6), Math.pow(10, -0.3));
+});
+
+// ---------------------------------------------------------------------------
+// Positions
+// ---------------------------------------------------------------------------
+
+function posSetup(srcOpts, padOpts) {
+  const ctx = mk();
+  // sr 1000 => 1 ms == 1 frame
+  const src = ctx.model.addSource({ frames: 10000, sr: 1000, slices: [[2000, 4000]], ...srcOpts });
+  ctx.model.addPad(60, src, 0, padOpts);
+  return ctx;
+}
+
+test('positions: forward', () => {
+  const { engine } = posSetup({}, {});
+  const p = pmap(engine.noteOn(60, 100)[0]);
+  assert.deepEqual([p.pstart, p.pend, p.dir], [2000, 4000, 1]);
+});
+
+test('positions: forward with start offset', () => {
+  const { engine } = posSetup({}, { startOffsetMs: 100 });
+  const p = pmap(engine.noteOn(60, 100)[0]);
+  assert.deepEqual([p.pstart, p.pend, p.dir], [2100, 4000, 1]);
+});
+
+test('positions: reverse (pad.reverse)', () => {
+  const { engine } = posSetup({}, { reverse: true });
+  const p = pmap(engine.noteOn(60, 100)[0]);
+  assert.deepEqual([p.pstart, p.pend, p.dir], [4000, 2000, -1]);
+});
+
+test('positions: reverse with start offset moves start inward from the end', () => {
+  const { engine } = posSetup({}, { reverse: true, startOffsetMs: 250 });
+  const p = pmap(engine.noteOn(60, 100)[0]);
+  assert.deepEqual([p.pstart, p.pend, p.dir], [3750, 2000, -1]);
+});
+
+test('positions: thru forward runs to the end of the source', () => {
+  const { engine } = posSetup({ playMode: 'thru' }, {});
+  const p = pmap(engine.noteOn(60, 100)[0]);
+  assert.deepEqual([p.pstart, p.pend, p.dir], [2000, 10000, 1]);
+});
+
+test('positions: thru reversed runs to frame 0', () => {
+  const { engine } = posSetup({ playMode: 'thru' }, { reverse: true });
+  const p = pmap(engine.noteOn(60, 100)[0]);
+  assert.deepEqual([p.pstart, p.pend, p.dir], [4000, 0, -1]);
+});
+
+test('positions: start offset is rounded using the source sample rate', () => {
+  const { model, engine } = mk();
+  const src = model.addSource({ frames: 100000, sr: 44100, slices: [[1000, 20000]] });
+  model.addPad(60, src, 0, { startOffsetMs: 1 });          // 44.1 frames => 44
+  assert.equal(pmap(engine.noteOn(60, 100)[0]).pstart, 1044);
+  model.addPad(61, src, 0, { startOffsetMs: 2 });          // 88.2 => 88
+  assert.equal(pmap(engine.noteOn(61, 100)[0]).pstart, 1088);
+});
+
+test('positions: start offset is clamped to slice length - 1', () => {
+  const fwd = posSetup({}, { startOffsetMs: 5000 });
+  assert.equal(pmap(fwd.engine.noteOn(60, 100)[0]).pstart, 2000 + 1999);
+  const rev = posSetup({}, { startOffsetMs: 5000, reverse: true });
+  assert.equal(pmap(rev.engine.noteOn(60, 100)[0]).pstart, 4000 - 1999);
+});
+
+test('loopsize is clamped to [1, slice length]', () => {
+  const big = posSetup({}, { loopOn: true, loopSizeMs: 99999 });
+  assert.equal(pmap(big.engine.noteOn(60, 100)[0]).loopsize, 2000);
+  const tiny = posSetup({}, { loopOn: true, loopSizeMs: 0 });
+  assert.equal(pmap(tiny.engine.noteOn(60, 100)[0]).loopsize, 1);
+  const mid = posSetup({}, { loopOn: true, loopSizeMs: 30 });
+  assert.equal(pmap(mid.engine.noteOn(60, 100)[0]).loopsize, 30);
+});
+
+test('pitch combines semitones and cents', () => {
+  const { engine } = posSetup({}, { pitch: -5, fine: -25 });
+  near(pmap(engine.noteOn(60, 100)[0]).pitch, -5.25);
+});
+
+test('gatemode follows the source trigMode', () => {
+  const { model, engine } = mk();
+  const t = model.addSource({ trigMode: 'trigger' });
+  const gt = model.addSource({ trigMode: 'gate' });
+  model.addPad(60, t, 0);
+  model.addPad(61, gt, 0);
+  assert.equal(pmap(engine.noteOn(60, 100)[0]).gatemode, 0);
+  assert.equal(pmap(engine.noteOn(61, 100)[0]).gatemode, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Choke
+// ---------------------------------------------------------------------------
+
+function chokeSetup(chokeScope) {
+  const ctx = mk();
+  ctx.g.chokeScope = chokeScope;
+  ctx.A = ctx.model.addSource({ slot: 0, playMode: 'mono' });
+  ctx.B = ctx.model.addSource({ slot: 1, playMode: 'poly' });
+  ctx.T = ctx.model.addSource({ slot: 2, playMode: 'thru' });
+  ctx.model.addPad(60, ctx.A, 0);
+  ctx.model.addPad(61, ctx.A, 1);
+  ctx.model.addPad(62, ctx.B, 0);
+  ctx.model.addPad(63, ctx.B, 1);
+  ctx.model.addPad(64, ctx.T, 0);
+  return ctx;
+}
+
+test('mono choke (scope source): kills only voices of the same source', () => {
+  const { engine } = chokeSetup('source');
+  engine.noteOn(60, 100);                      // v0, A
+  engine.noteOn(62, 100);                      // v1, B
+  engine.noteOn(63, 100);                      // v2, B
+  const cmds = engine.noteOn(61, 100);         // A again: chokes v0 only
+  assert.deepEqual(cmds[0], { voice: 0, params: [['kill', 1]] });
+  assert.deepEqual(killVoices(cmds), [0]);
+  assert.deepEqual(startVoices(cmds), [0]);    // killed voice is free immediately
+  assert.ok(cmds.indexOf(kills(cmds)[0]) < cmds.indexOf(starts(cmds)[0]), 'kill before start');
+  assert.deepEqual(engine.activeKeys(), [61, 62, 63]);
+});
+
+test('mono choke does not touch other sources, even other mono ones', () => {
+  const { model, engine } = chokeSetup('source');
+  const M = model.addSource({ slot: 3, playMode: 'mono' });
+  model.addPad(70, M, 0);
+  engine.noteOn(60, 100);                      // v0, A
+  const cmds = engine.noteOn(70, 100);         // M: nothing to choke
+  assert.deepEqual(kills(cmds), []);
+  assert.deepEqual(engine.activeKeys(), [60, 70]);
+});
+
+test('thru sources choke like mono', () => {
+  const { model, engine } = chokeSetup('source');
+  const T2 = model.addSource({ slot: 4, playMode: 'thru' });
+  model.addPad(65, T2, 0);
+  engine.noteOn(64, 100);                      // v0, T
+  engine.noteOn(62, 100);                      // v1, B
+  const cmds = engine.noteOn(64, 100);         // T again
+  assert.deepEqual(killVoices(cmds), [0]);
+  assert.deepEqual(engine.noteOn(65, 100).filter(isKill), []);   // other thru source survives
+});
+
+test('global choke (scope global): a mono note kills every sounding voice', () => {
+  const { engine } = chokeSetup('global');
+  engine.noteOn(62, 100);                      // v0, B
+  engine.noteOn(63, 100);                      // v1, B
+  engine.noteOn(64, 100);                      // thru T: kills v0, v1
+  const cmds = engine.noteOn(60, 100);         // A mono: kills T's voice too
+  assert.deepEqual(killVoices(cmds), [0]);     // only the thru voice is left to kill
+  assert.deepEqual(engine.activeKeys(), [60]);
+});
+
+test('global choke kills voices of other sources, including released tails', () => {
+  const { engine } = chokeSetup('global');
+  engine.noteOn(62, 100);                      // v0, B
+  engine.noteOn(63, 100);                      // v1, B
+  engine.noteOff(63);                          // v1 tail still sounding
+  const cmds = engine.noteOn(60, 100);         // A mono
+  assert.deepEqual(killVoices(cmds), [0, 1]);
+  assert.deepEqual(startVoices(cmds), [0]);
+  assert.deepEqual(engine.activeKeys(), [60]);
+});
+
+test('poly notes never choke, in either scope', () => {
+  for (const scope of ['source', 'global']) {
+    const { engine } = chokeSetup(scope);
+    engine.noteOn(60, 100);                    // mono voice
+    engine.noteOn(62, 100);                    // poly
+    const cmds = engine.noteOn(63, 100);       // poly again
+    assert.deepEqual(kills(cmds), [], scope);
+    assert.deepEqual(engine.activeKeys(), [60, 62, 63], scope);
+  }
+});
+
+test('killed voices are not addressed by the old key anymore', () => {
+  const { engine } = chokeSetup('source');
+  engine.noteOn(60, 100);                      // v0
+  engine.noteOn(61, 100);                      // chokes v0, new note re-uses v0 on key 61
+  // key 60 released: the voice now belongs to key 61, so nothing is sent
+  assert.deepEqual(engine.noteOff(60), []);
+  assert.deepEqual(engine.noteOff(61), [{ voice: 0, params: [['held', 0]] }]);
+});
+
+test('kill and trig counters increment per voice', () => {
+  const { engine } = chokeSetup('source');
+  const a = engine.noteOn(60, 100);            // v0 trig 1
+  const b = engine.noteOn(61, 100);            // kill 1, v0 trig 2
+  const c = engine.noteOn(60, 100);            // kill 2, v0 trig 3
+  assert.equal(pmap(a[0]).trig, 1);
+  assert.deepEqual(b[0], { voice: 0, params: [['kill', 1]] });
+  assert.equal(pmap(b[1]).trig, 2);
+  assert.deepEqual(c[0], { voice: 0, params: [['kill', 2]] });
+  assert.equal(pmap(c[1]).trig, 3);
+  // another voice has its own counters
+  const d = engine.noteOn(62, 100);            // v1 trig 1
+  assert.equal(d[0].voice, 1);
+  assert.equal(pmap(d[0]).trig, 1);
+});
+
+// ---------------------------------------------------------------------------
+// Layers
+// ---------------------------------------------------------------------------
+
+test('layers trigger several voices and never choke each other', () => {
+  const { model, engine } = mk();
+  const A = model.addSource({ slot: 0, playMode: 'mono' });
+  const B = model.addSource({ slot: 1, playMode: 'mono' });
+  const l1 = model.addPad(null, B, 0, { pitch: 7 });
+  const l2 = model.addPad(null, A, 1, { pitch: 12 });
+  model.addPad(60, A, 0, { layers: [l1.id, 99999, l2.id] });   // 99999 does not exist
+  let cmds = engine.noteOn(60, 100);
+  assert.deepEqual(kills(cmds), []);
+  assert.equal(starts(cmds).length, 3);
+  assert.deepEqual(startVoices(cmds), [0, 1, 2]);
+  assert.deepEqual(starts(cmds).map((c) => pmap(c).pitch), [0, 7, 12]);
+  assert.deepEqual(starts(cmds).map((c) => pmap(c).src), ['src0', 'src1', 'src0']);
+  assert.deepEqual(engine.activeKeys(), [60]);
+
+  // Playing it again chokes all three old voices (both sources are mono)
+  // once, then re-uses them for the new voices.
+  cmds = engine.noteOn(60, 100);
+  assert.deepEqual(killVoices(cmds), [0, 1, 2]);
+  assert.deepEqual(startVoices(cmds), [0, 1, 2]);
+  const lastKill = Math.max(...kills(cmds).map((c) => cmds.indexOf(c)));
+  const firstStart = Math.min(...starts(cmds).map((c) => cmds.indexOf(c)));
+  assert.ok(lastKill < firstStart, 'all kills precede all starts');
+});
+
+test('layers: note off releases every layer voice', () => {
+  const { model, engine } = mk();
+  const A = model.addSource();
+  const l1 = model.addPad(null, A, 1);
+  const l2 = model.addPad(null, A, 2);
+  model.addPad(60, A, 0, { layers: [l1.id, l2.id] });
+  engine.noteOn(60, 100);
+  assert.deepEqual(engine.noteOff(60), [
+    { voice: 0, params: [['held', 0]] },
+    { voice: 1, params: [['held', 0]] },
+    { voice: 2, params: [['held', 0]] }
+  ]);
+});
+
+test('layers: a mono layer chokes older voices of its source but a poly main pad does not', () => {
+  const { model, engine } = mk();
+  const P = model.addSource({ slot: 0, playMode: 'poly' });
+  const M = model.addSource({ slot: 1, playMode: 'mono' });
+  const layer = model.addPad(null, M, 0);
+  model.addPad(60, P, 0, { layers: [layer.id] });
+  model.addPad(61, M, 1);
+  model.addPad(62, P, 1);
+  engine.noteOn(61, 100);                      // v0, M
+  engine.noteOn(62, 100);                      // v1, P
+  const cmds = engine.noteOn(60, 100);         // P + M layer
+  assert.deepEqual(killVoices(cmds), [0]);     // only M's older voice
+  assert.deepEqual(engine.activeKeys(), [60, 62]);
+});
+
+test('layers pointing at unloaded sources are skipped, main pad still plays', () => {
+  const { model, engine } = mk();
+  const A = model.addSource();
+  const U = model.addSource({ frames: 0, sr: 0 });
+  const layer = model.addPad(null, U, 0);
+  model.addPad(60, A, 0, { layers: [layer.id] });
+  assert.deepEqual(startVoices(engine.noteOn(60, 100)), [0]);
+});
+
+// ---------------------------------------------------------------------------
+// Chaos
+// ---------------------------------------------------------------------------
+
+function chaosSetup(rng) {
+  const ctx = mk({ rng });
+  const src = ctx.model.addSource({ slices: [[0, 100], [100, 200], [200, 300]] });
+  ctx.model.addPad(60, src, 0);
+  ctx.model.addPad(61, src, 1);
+  ctx.model.addPad(62, src, 2);
+  return ctx;
+}
+
+test('chaos 0 never replaces the pad and never consults rng', () => {
+  const rng = () => { throw new Error('rng must not be called'); };
+  const { engine } = chaosSetup(rng);
+  assert.equal(pmap(engine.noteOn(61, 100)[0]).pstart, 100);
+});
+
+test('chaos 100 always replaces the pad with the one on a random occupied key', () => {
+  // roll: 0.5*100 < 100 => chaos; index = floor(0.9 * 3) = 2 => key 62
+  const { engine, g } = chaosSetup(seqRng(0.5, 0.9));
+  g.chaos = 100;
+  assert.equal(pmap(engine.noteOn(60, 100)[0]).pstart, 200);
+  // second note: index floor(0.0 * 3) = 0 => key 60
+  const ctx2 = chaosSetup(seqRng(0.99, 0.0));
+  ctx2.g.chaos = 100;
+  assert.equal(pmap(ctx2.engine.noteOn(62, 100)[0]).pstart, 0);
+});
+
+test('chaos percentage is compared against rng()*100', () => {
+  const hit = chaosSetup(seqRng(0.49, 0.5));   // 49 < 50 => chaos, index 1 => key 61
+  hit.g.chaos = 50;
+  assert.equal(pmap(hit.engine.noteOn(60, 100)[0]).pstart, 100);
+
+  const miss = chaosSetup(seqRng(0.5, 0.5));   // 50 < 50 is false => original pad
+  miss.g.chaos = 50;
+  assert.equal(pmap(miss.engine.noteOn(60, 100)[0]).pstart, 0);
+  assert.equal(miss.engine.activeKeys()[0], 60);
+});
+
+test('chaos modifier forces 100 while held, and releasing reverts to the global value', () => {
+  const rng = seqRng(0.99, 0.5);               // 99 < 100 => chaos; index 1 => key 61
+  const { engine, g } = chaosSetup(rng);
+  g.chaos = 0;
+  assert.deepEqual(engine.noteOn(MOD.CHAOS, 100), []);   // no voice, nothing to update
+  assert.equal(pmap(engine.noteOn(62, 100)[0]).pstart, 100);
+  assert.equal(rng.calls(), 2);
+  engine.noteOff(MOD.CHAOS);
+  const before = rng.calls();
+  assert.equal(pmap(engine.noteOn(62, 100)[0]).pstart, 200);   // global chaos 0 again
+  assert.equal(rng.calls(), before);
+});
+
+test('chaos: note off uses the physical key; substituted pad layers play', () => {
+  const { model, engine, g } = chaosSetup(seqRng(0.0, 0.99));   // => key 62
+  const src = model.getSource(model.getPadOnKey(62).sourceId);
+  const layer = model.addPad(null, src, 0);
+  model.getPadOnKey(62).layers = [layer.id];
+  g.chaos = 100;
+  const on = engine.noteOn(60, 100);
+  assert.equal(starts(on).length, 2);
+  assert.deepEqual(engine.activeKeys(), [60]);
+  assert.deepEqual(engine.noteOff(60).map((c) => c.voice), [0, 1]);
+});
+
+// ---------------------------------------------------------------------------
+// Allocation and stealing
+// ---------------------------------------------------------------------------
+
+function polySetup(numVoices, keys) {
+  const ctx = mk({ numVoices });
+  const src = ctx.model.addSource({
+    slices: keys.map((k, i) => [i * 100, i * 100 + 100])
+  });
+  keys.forEach((k, i) => ctx.model.addPad(k, src, i));
+  return ctx;
+}
+
+test('allocation: lowest free voice first, then oldest non-held, then oldest voice', () => {
+  const { engine } = polySetup(3, [60, 61, 62, 63, 64, 65, 66]);
+  assert.equal(engine.noteOn(60, 100)[0].voice, 0);   // seq1
+  assert.equal(engine.noteOn(61, 100)[0].voice, 1);   // seq2
+  assert.equal(engine.noteOn(62, 100)[0].voice, 2);   // seq3
+  engine.noteOff(61);                                  // v1 non-held (still busy)
+  // no free voice: steal the oldest NON-HELD one => v1 (not v0, which is older but held)
+  const steal1 = engine.noteOn(63, 100);
+  assert.equal(steal1[0].voice, 1);
+  assert.deepEqual(kills(steal1), []);                 // stealing uses trig, no kill
+  // now v0=k60(seq1) v1=k63(seq4) v2=k62(seq3); release 60 and 62
+  engine.noteOff(60);
+  engine.noteOff(62);
+  // both non-held; oldest is v0 (seq1) before v2 (seq3)
+  assert.equal(engine.noteOn(64, 100)[0].voice, 0);   // seq5
+  // only v2 non-held
+  assert.equal(engine.noteOn(65, 100)[0].voice, 2);   // seq6
+  // everything held: v0 seq5, v1 seq4, v2 seq6 => oldest is v1
+  assert.equal(engine.noteOn(66, 100)[0].voice, 1);   // seq7
+  // v1 was re-owned by key 66; its previous owner (63) no longer controls it
+  assert.deepEqual(engine.noteOff(63), []);
+  assert.deepEqual(engine.noteOff(66), [{ voice: 1, params: [['held', 0]] }]);
+});
+
+test('allocation: a free voice is preferred over stealing a non-held one', () => {
+  const { engine } = polySetup(3, [60, 61, 62, 63]);
+  engine.noteOn(60, 100);                              // v0
+  engine.noteOff(60);                                  // v0 non-held but busy
+  assert.equal(engine.noteOn(61, 100)[0].voice, 1);    // free v1, not v0
+  assert.equal(engine.noteOn(62, 100)[0].voice, 2);
+  engine.voiceEnded(0);                                // v0 free again
+  assert.equal(engine.noteOn(63, 100)[0].voice, 0);
+});
+
+test('allocation: stolen voice gets a complete parameter list', () => {
+  const { engine } = polySetup(1, [60, 61]);
+  engine.noteOn(60, 100);
+  const c = engine.noteOn(61, 100);
+  assert.equal(c.length, 1);
+  assert.deepEqual(names(c[0]), START_ORDER);
+  assert.equal(pmap(c[0]).trig, 2);
+});
+
+// ---------------------------------------------------------------------------
+// Note off
+// ---------------------------------------------------------------------------
+
+test('note off sends held 0 only to the voices of that key', () => {
+  const { engine } = polySetup(4, [60, 61]);
+  engine.noteOn(60, 100);                              // v0
+  engine.noteOn(61, 100);                              // v1
+  engine.noteOn(60, 100);                              // v2 (same key again)
+  assert.deepEqual(engine.noteOff(60), [
+    { voice: 0, params: [['held', 0]] },
+    { voice: 2, params: [['held', 0]] }
+  ]);
+  assert.deepEqual(engine.noteOff(60), []);            // already released
+  // released voices keep sounding until voiceEnded
+  assert.deepEqual(engine.activeKeys(), [60, 61]);
+  engine.voiceEnded(0);
+  engine.voiceEnded(2);
+  assert.deepEqual(engine.activeKeys(), [61]);
+  assert.deepEqual(engine.noteOff(61), [{ voice: 1, params: [['held', 0]] }]);
+});
+
+// ---------------------------------------------------------------------------
+// Repeat
+// ---------------------------------------------------------------------------
+
+function repeatSetup() {
+  const ctx = mk();
+  const src = ctx.model.addSource();
+  ctx.model.addPad(60, src, 0);
+  ctx.model.addPad(61, src, 1);
+  ctx.model.addPad(62, src, 2);
+  return ctx;
+}
+const rptOf = (cmds) => pmap(cmds[0]).rptdiv;
+
+test('repeat: off by default; global repeat maps repeatDiv to repeats per beat', () => {
+  const { engine, g } = repeatSetup();
+  assert.equal(rptOf(engine.noteOn(60, 100)), 0);
+  g.repeatOn = true;
+  const expected = { '1/4': 1, '1/8': 2, '1/8T': 3, '1/16': 4, '1/16T': 6, '1/32': 8, '1/32T': 12, '1/64': 16 };
+  for (const div of Object.keys(expected)) {
+    g.repeatDiv = div;
+    assert.equal(rptOf(engine.noteOn(60, 100)), expected[div], div);
+  }
+  g.repeatOn = false;
+  assert.equal(rptOf(engine.noteOn(60, 100)), 0);
+});
+
+test('repeat: swing and alt are passed to new voices', () => {
+  const { engine, g } = repeatSetup();
+  g.repeatOn = true; g.repeatDiv = '1/8'; g.swing = 50; g.repeatAlt = true;
+  const p = pmap(engine.noteOn(60, 100)[0]);
+  assert.equal(p.rptdiv, 2);
+  assert.equal(p.rptswing, 0.5);
+  assert.equal(p.rptalt, 1);
+});
+
+test('repeat modifiers: most recently pressed wins, release reverts, then global', () => {
+  const { engine, g } = repeatSetup();
+  g.repeatOn = true; g.repeatDiv = '1/8';
+  assert.equal(rptOf(engine.noteOn(60, 100)), 2);          // global
+  engine.noteOn(MOD.RPT_16, 100);
+  assert.equal(rptOf(engine.noteOn(60, 100)), 4);          // modifier beats global
+  engine.noteOn(MOD.RPT_4, 100);
+  assert.equal(rptOf(engine.noteOn(60, 100)), 1);          // latest pressed
+  engine.noteOn(MOD.RPT_64, 100);
+  assert.equal(rptOf(engine.noteOn(60, 100)), 16);
+  engine.noteOff(MOD.RPT_64);
+  assert.equal(rptOf(engine.noteOn(60, 100)), 1);          // back to the previous latest
+  engine.noteOff(MOD.RPT_4);
+  assert.equal(rptOf(engine.noteOn(60, 100)), 4);
+  engine.noteOff(MOD.RPT_16);
+  assert.equal(rptOf(engine.noteOn(60, 100)), 2);          // global again
+  g.repeatOn = false;
+  assert.equal(rptOf(engine.noteOn(60, 100)), 0);
+});
+
+test('repeat modifier releasing an older key keeps the newer one active', () => {
+  const { engine } = repeatSetup();
+  engine.noteOn(MOD.RPT_8, 100);
+  engine.noteOn(MOD.RPT_16T, 100);
+  engine.noteOff(MOD.RPT_8);
+  assert.equal(rptOf(engine.noteOn(60, 100)), 6);
+});
+
+test('repeat modifier works with global repeat off, all seven keys', () => {
+  const { engine } = repeatSetup();
+  const table = [[MOD.RPT_4, 1], [MOD.RPT_8, 2], [MOD.RPT_8T, 3], [MOD.RPT_16, 4],
+    [MOD.RPT_16T, 6], [MOD.RPT_32, 8], [MOD.RPT_64, 16]];
+  for (const [key, div] of table) {
+    engine.noteOn(key, 100);
+    assert.equal(rptOf(engine.noteOn(60, 100)), div, 'key ' + key);
+    engine.noteOff(key);
+  }
+});
+
+test('repeat modifier updates all sounding voices (including released tails), not free ones', () => {
+  const { engine, g } = repeatSetup();
+  g.swing = 25; g.repeatAlt = true;
+  engine.noteOn(60, 100);                                   // v0 held
+  engine.noteOn(61, 100);                                   // v1
+  engine.noteOff(61);                                       // v1 tail, still sounding
+  engine.noteOn(62, 100);                                   // v2
+  engine.voiceEnded(1);                                     // v1 ended (non-held) => free
+  const press = engine.noteOn(MOD.RPT_8T, 100);
+  assert.deepEqual(press, [
+    { voice: 0, params: [['rptdiv', 3], ['rptswing', 0.25], ['rptalt', 1]] },
+    { voice: 2, params: [['rptdiv', 3], ['rptswing', 0.25], ['rptalt', 1]] }
+  ]);
+  const rel = engine.noteOff(MOD.RPT_8T);
+  assert.deepEqual(rel.map((c) => c.voice), [0, 2]);
+  assert.equal(pmap(rel[0]).rptdiv, 0);
+});
+
+test('refreshHeld re-sends repeat params to held voices only', () => {
+  const { engine, g } = repeatSetup();
+  engine.noteOn(60, 100);                                   // v0 held
+  engine.noteOn(61, 100);                                   // v1
+  engine.noteOff(61);                                       // v1 released
+  g.repeatOn = true; g.repeatDiv = '1/16'; g.swing = 40;
+  assert.deepEqual(engine.refreshHeld(), [
+    { voice: 0, params: [['rptdiv', 4], ['rptswing', 0.4], ['rptalt', 0]] }
+  ]);
+  engine.noteOn(MOD.RPT_4, 100);
+  assert.equal(engine.refreshHeld()[0].params[0][1], 1);    // modifier still has priority
+  engine.panic();
+  assert.deepEqual(engine.refreshHeld(), []);
+});
+
+// ---------------------------------------------------------------------------
+// Reverse modifier
+// ---------------------------------------------------------------------------
+
+test('reverse modifier flips sounding voices with the right pend, and back on release', () => {
+  const { engine } = posSetup({}, {});
+  engine.noteOn(60, 100);
+  assert.deepEqual(engine.noteOn(MOD.REVERSE, 100), [
+    { voice: 0, params: [['dir', -1], ['pend', 2000]] }
+  ]);
+  assert.deepEqual(engine.noteOff(MOD.REVERSE), [
+    { voice: 0, params: [['dir', 1], ['pend', 4000]] }
+  ]);
+});
+
+test('reverse modifier with thru: pend is 0 reversed and source end forward', () => {
+  const { engine } = posSetup({ playMode: 'thru' }, {});
+  engine.noteOn(60, 100);
+  assert.deepEqual(engine.noteOn(MOD.REVERSE, 100), [
+    { voice: 0, params: [['dir', -1], ['pend', 0]] }
+  ]);
+  assert.deepEqual(engine.noteOff(MOD.REVERSE), [
+    { voice: 0, params: [['dir', 1], ['pend', 10000]] }
+  ]);
+});
+
+test('reverse modifier on a reversed pad plays it forward (XOR)', () => {
+  const { engine } = posSetup({}, { reverse: true });
+  engine.noteOn(60, 100);
+  assert.deepEqual(engine.noteOn(MOD.REVERSE, 100), [
+    { voice: 0, params: [['dir', 1], ['pend', 4000]] }
+  ]);
+  assert.deepEqual(engine.noteOff(MOD.REVERSE), [
+    { voice: 0, params: [['dir', -1], ['pend', 2000]] }
+  ]);
+  // new note while held: forward
+  engine.noteOn(MOD.REVERSE, 100);
+  const p = pmap(engine.noteOn(60, 100)[0]);
+  assert.deepEqual([p.pstart, p.pend, p.dir], [2000, 4000, 1]);
+});
+
+test('notes started while reverse is held are reversed, and flip on release', () => {
+  const { engine } = posSetup({}, { startOffsetMs: 100 });
+  engine.noteOn(MOD.REVERSE, 100);
+  const p = pmap(engine.noteOn(60, 100)[0]);
+  assert.deepEqual([p.pstart, p.pend, p.dir], [3900, 2000, -1]);
+  assert.deepEqual(engine.noteOff(MOD.REVERSE), [
+    { voice: 0, params: [['dir', 1], ['pend', 4000]] }
+  ]);
+});
+
+test('reverse modifier only touches sounding voices', () => {
+  const { engine } = polySetup(3, [60, 61]);
+  engine.noteOn(60, 100);
+  engine.noteOn(61, 100);
+  engine.noteOff(61);
+  engine.voiceEnded(1);                                     // v1 free
+  const cmds = engine.noteOn(MOD.REVERSE, 100);
+  assert.deepEqual(cmds.map((c) => c.voice), [0]);
+});
+
+// ---------------------------------------------------------------------------
+// Octave and tape modifiers
+// ---------------------------------------------------------------------------
+
+test('octave modifiers shift pitch by 12 semitones each, on new and sounding voices', () => {
+  const { engine } = posSetup({}, { pitch: 2, fine: 25 });
+  engine.noteOn(60, 100);                                   // base 2.25
+  let c = engine.noteOn(MOD.OCTUP, 100);
+  assert.equal(c.length, 1);
+  near(pmap(c[0]).pitch, 14.25);
+  assert.deepEqual(names(c[0]), ['pitch']);
+  c = engine.noteOn(MOD.OCTDOWN, 100);                      // both held => cancel
+  near(pmap(c[0]).pitch, 2.25);
+  c = engine.noteOff(MOD.OCTUP);                            // only octdown
+  near(pmap(c[0]).pitch, -9.75);
+  near(pmap(engine.noteOn(60, 100)[0]).pitch, -9.75);       // new note too
+  c = engine.noteOff(MOD.OCTDOWN);
+  near(pmap(c[0]).pitch, 2.25);
+  engine.noteOn(MOD.OCTUP, 100);
+  near(pmap(engine.noteOn(60, 100)[0]).pitch, 14.25);
+});
+
+test('tape modifier toggles tape/tapems on sounding voices and new notes', () => {
+  const { engine } = posSetup({}, {});
+  engine.noteOn(60, 100);
+  assert.deepEqual(engine.noteOn(MOD.TAPE, 100), [
+    { voice: 0, params: [['tape', 1], ['tapems', 500]] }
+  ]);
+  engine.setTransport({ bpm: 150, playing: true });
+  const p = pmap(engine.noteOn(60, 100)[0]);
+  assert.equal(p.tape, 1);
+  assert.equal(p.tapems, 400);
+  assert.deepEqual(engine.noteOff(MOD.TAPE).map((c) => pmap(c)), [
+    { tape: 0, tapems: 400 }, { tape: 0, tapems: 400 }
+  ]);
+  assert.equal(pmap(engine.noteOn(60, 100)[0]).tape, 0);
+});
+
+test('chaos modifier produces no voice commands by itself', () => {
+  const { engine } = posSetup({}, {});
+  engine.noteOn(60, 100);
+  assert.deepEqual(engine.noteOn(MOD.CHAOS, 100), []);
+  assert.deepEqual(engine.noteOff(MOD.CHAOS), []);
+});
+
+// ---------------------------------------------------------------------------
+// Modifier keys never allocate voices
+// ---------------------------------------------------------------------------
+
+test('modifier keys never allocate voices, even when a pad sits on them', () => {
+  const { model, engine } = mk();
+  const src = model.addSource();
+  model.addPad(60, src, 0);
+  for (let k = MOD_START; k < MOD_START + 12; k++) model.addPad(k, src, 1);   // stray pads
+  for (let k = MOD_START; k < MOD_START + 12; k++) {
+    assert.deepEqual(starts(engine.noteOn(k, 100)), [], 'key ' + k);
+  }
+  assert.deepEqual(engine.activeKeys(), []);
+  assert.equal(engine.noteOn(60, 100)[0].voice, 0);          // voice 0 still free
+  for (let k = MOD_START; k < MOD_START + 12; k++) engine.noteOff(k);
+});
+
+test('with the mod zone off those keys play normal pads', () => {
+  const { model, engine } = mk();
+  const src = model.addSource();
+  model.addPad(100, src, 0);
+  model.modZoneOn = false;
+  assert.equal(starts(engine.noteOn(100, 100)).length, 1);
+});
+
+test('a modifier released after the mod zone was turned off is still released', () => {
+  const { model, engine } = repeatSetup();
+  engine.noteOn(MOD.RPT_4, 100);
+  assert.equal(rptOf(engine.noteOn(60, 100)), 1);
+  model.modZoneOn = false;
+  engine.noteOff(MOD.RPT_4);
+  model.modZoneOn = true;
+  assert.equal(rptOf(engine.noteOn(60, 100)), 0);
+});
+
+test('pressing the same modifier twice does not double-count it', () => {
+  const { engine } = posSetup({}, {});
+  engine.noteOn(60, 100);
+  engine.noteOn(MOD.OCTUP, 100);
+  assert.deepEqual(engine.noteOn(MOD.OCTUP, 100), []);
+  const c = engine.noteOff(MOD.OCTUP);
+  near(pmap(c[0]).pitch, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Pressure
+// ---------------------------------------------------------------------------
+
+test('pressure does nothing unless pressureToLevel is on', () => {
+  const { model, engine, g } = mk();
+  const src = model.addSource();
+  model.addPad(60, src, 0);
+  engine.noteOn(60, 100);
+  g.pressureToLevel = false;
+  assert.deepEqual(engine.pressure(100), []);
+  assert.deepEqual(engine.polyPressure(60, 100), []);
+});
+
+test('pressure sets amp on every held voice (not on released ones)', () => {
+  const { model, engine, g } = mk();
+  const src = model.addSource();
+  model.addPad(60, src, 0, { gainDb: -3 });
+  model.addPad(61, src, 1, { gainDb: -12 });
+  model.addPad(62, src, 2);
+  g.pressureToLevel = true; g.velSens = 50;
+  engine.noteOn(60, 100);                                   // v0
+  engine.noteOn(61, 100);                                   // v1
+  engine.noteOn(62, 100);                                   // v2
+  engine.noteOff(62);                                       // released
+  const cmds = engine.pressure(64);
+  assert.deepEqual(cmds.map((c) => c.voice), [0, 1]);
+  assert.deepEqual(names(cmds[0]), ['amp']);
+  near(pmap(cmds[0]).amp, dbtoa(-3) * velCurve(64, 50));
+  near(pmap(cmds[1]).amp, dbtoa(-12) * velCurve(64, 50));
+  g.velSens = 100;
+  near(pmap(engine.pressure(127)[0]).amp, dbtoa(-3));
+});
+
+test('polyPressure only addresses the voices of that key', () => {
+  const { model, engine, g } = mk();
+  const src = model.addSource();
+  const layer = model.addPad(null, src, 3, { gainDb: -6 });
+  model.addPad(60, src, 0, { gainDb: -3, layers: [layer.id] });
+  model.addPad(61, src, 1);
+  g.pressureToLevel = true;
+  engine.noteOn(60, 100);                                   // v0 + v1 (layer)
+  engine.noteOn(61, 100);                                   // v2
+  const cmds = engine.polyPressure(60, 90);
+  assert.deepEqual(cmds.map((c) => c.voice), [0, 1]);
+  near(pmap(cmds[0]).amp, dbtoa(-3) * velCurve(90, 50));
+  near(pmap(cmds[1]).amp, dbtoa(-6) * velCurve(90, 50));
+  assert.deepEqual(engine.polyPressure(61, 10).map((c) => c.voice), [2]);
+  assert.deepEqual(engine.polyPressure(70, 10), []);
+  engine.noteOff(61);
+  assert.deepEqual(engine.polyPressure(61, 10), []);
+});
+
+// ---------------------------------------------------------------------------
+// voiceEnded bookkeeping
+// ---------------------------------------------------------------------------
+
+test('voiceEnded frees a non-held voice immediately', () => {
+  const { engine } = polySetup(2, [60, 61, 62]);
+  engine.noteOn(60, 100);                                   // v0
+  engine.noteOn(61, 100);                                   // v1
+  engine.noteOff(60);
+  assert.deepEqual(engine.activeKeys(), [60, 61]);
+  engine.voiceEnded(0);
+  assert.deepEqual(engine.activeKeys(), [61]);
+  assert.equal(engine.noteOn(62, 100)[0].voice, 0);         // free voice used, v1 untouched
+});
+
+test('voiceEnded on a held voice only marks it; the voice is freed at note off', () => {
+  const { engine } = polySetup(2, [60, 61, 62, 63]);
+  engine.noteOn(60, 100);                                   // v0
+  engine.noteOn(61, 100);                                   // v1
+  engine.noteOff(61);                                       // v1 non-held
+  engine.voiceEnded(0);                                     // v0 held => ended, NOT free
+  assert.deepEqual(engine.activeKeys(), [61]);              // ended voices are silent
+  // v0 is not free: the non-held v1 gets stolen instead
+  const steal = engine.noteOn(62, 100);
+  assert.equal(steal[0].voice, 1);
+  // key 60 up: v0 is released and freed (held 0 is still sent)
+  assert.deepEqual(engine.noteOff(60), [{ voice: 0, params: [['held', 0]] }]);
+  assert.equal(engine.noteOn(63, 100)[0].voice, 0);         // free now
+});
+
+test('voiceEnded ignores unknown / free voices and repeated reports', () => {
+  const { engine } = polySetup(2, [60, 61]);
+  assert.doesNotThrow(() => {
+    engine.voiceEnded(5);
+    engine.voiceEnded(-1);
+    engine.voiceEnded(0);
+  });
+  engine.noteOn(60, 100);
+  engine.noteOff(60);
+  engine.voiceEnded(0);
+  engine.voiceEnded(0);
+  assert.deepEqual(engine.activeKeys(), []);
+  assert.equal(engine.noteOn(61, 100)[0].voice, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Transport, panic, activeKeys
+// ---------------------------------------------------------------------------
+
+test('setTransport broadcasts bpm and playing and remembers the bpm', () => {
+  const { engine } = posSetup({}, {});
+  assert.deepEqual(engine.setTransport({ bpm: 140, playing: true }), [
+    { voice: -1, params: [['bpm', 140], ['playing', 1]] }
+  ]);
+  near(pmap(engine.noteOn(60, 100)[0]).tapems, 60000 / 140);
+  assert.deepEqual(engine.setTransport({ bpm: 90, playing: false }), [
+    { voice: -1, params: [['bpm', 90], ['playing', 0]] }
+  ]);
+  near(pmap(engine.noteOn(60, 100)[0]).tapems, 60000 / 90);
+});
+
+test('panic kills every voice and clears held and modifier state', () => {
+  const { model, engine, g } = mk({ numVoices: 4 });
+  const src = model.addSource();
+  model.addPad(60, src, 0);
+  model.addPad(61, src, 1);
+  g.pressureToLevel = true;
+  engine.noteOn(60, 100);
+  engine.noteOn(61, 100);
+  engine.noteOn(MOD.RPT_4, 100);
+  engine.noteOn(MOD.REVERSE, 100);
+  const cmds = engine.panic();
+  assert.equal(cmds.length, 4);
+  assert.deepEqual(cmds.map((c) => c.voice), [0, 1, 2, 3]);
+  assert.ok(cmds.every(isKill));
+  assert.deepEqual(engine.activeKeys(), []);
+  assert.deepEqual(engine.noteOff(60), []);
+  assert.deepEqual(engine.pressure(100), []);               // nothing held
+  assert.deepEqual(engine.refreshHeld(), []);
+  const p = pmap(engine.noteOn(60, 100)[0]);                // modifiers forgotten
+  assert.equal(p.rptdiv, 0);
+  assert.equal(p.dir, 1);
+  assert.equal(p.trig, 2);                                  // counters keep increasing
+  assert.deepEqual(engine.panic()[0], { voice: 0, params: [['kill', 2]] });
+});
+
+test('activeKeys is sorted and unique and uses the physical key', () => {
+  const { model, engine } = mk();
+  const src = model.addSource();
+  const l = model.addPad(null, src, 1);
+  model.addPad(70, src, 0, { layers: [l.id] });
+  model.addPad(65, src, 2);
+  engine.noteOn(70, 100);                                   // 2 voices, 1 key
+  engine.noteOn(65, 100);
+  assert.deepEqual(engine.activeKeys(), [65, 70]);
+});
+
+// ---------------------------------------------------------------------------
+// Unloaded sources
+// ---------------------------------------------------------------------------
+
+test('unloaded sources (frames 0 or sr 0) are skipped and choke nothing', () => {
+  const { model, engine } = mk();
+  const poly = model.addSource({ slot: 0 });
+  const noFrames = model.addSource({ slot: 1, frames: 0, playMode: 'mono' });
+  const noSr = model.addSource({ slot: 2, sr: 0, playMode: 'mono' });
+  model.addPad(60, poly, 0);
+  model.addPad(61, noFrames, 0);
+  model.addPad(62, noSr, 0);
+  engine.noteOn(60, 100);
+  assert.deepEqual(engine.noteOn(61, 100), []);
+  assert.deepEqual(engine.noteOn(62, 100), []);
+  assert.deepEqual(engine.activeKeys(), [60]);
+});
+
+test('pads whose slice or source is missing are skipped', () => {
+  const { model, engine } = mk();
+  const src = model.addSource();
+  const pad = model.addPad(60, src, 0);
+  pad.sliceId = 987654;
+  assert.deepEqual(engine.noteOn(60, 100), []);
+});
+
+// ---------------------------------------------------------------------------
+// API shape and ES5 discipline
+// ---------------------------------------------------------------------------
+
+test('Engine.create requires a model; constants are exported', () => {
+  assert.throws(() => Engine.create({}), /model/);
+  assert.deepEqual(Engine.REPEAT_PER_BEAT, [1, 2, 3, 4, 6, 8, 12, 16]);
+  assert.equal(Engine.REPEAT_DIVS.length, 8);
+  assert.equal(Engine.MOD_ACTIONS.length, 12);
+  assert.equal(Engine.MOD_ACTIONS[7], 'reverse');
+});
+
+test('core/engine.js sticks to ES5 and does not require the model', () => {
+  const file = path.join(__dirname, '..', 'core', 'engine.js');
+  const raw = fs.readFileSync(file, 'utf8');
+  // strip comments and string literals before scanning
+  const code = raw
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/gm, '')
+    .replace(/'(?:[^'\\\n]|\\.)*'/g, "''");
+  const forbidden = [
+    [/=>/, 'arrow function'],
+    [/\blet\b/, 'let'],
+    [/\bconst\b/, 'const'],
+    [/`/, 'template literal'],
+    [/\bclass\b/, 'class'],
+    [/\bnew\s+(Map|Set|WeakMap|WeakSet|Promise)\b/, 'Map/Set/Promise'],
+    [/\bSymbol\b/, 'Symbol'],
+    [/\.\s*(includes|find|findIndex|fill|startsWith|endsWith|repeat|padStart|padEnd)\s*\(/, 'ES6 method'],
+    [/Object\s*\.\s*(assign|entries|values)\b/, 'Object.assign/entries/values'],
+    [/\.\.\./, 'spread / rest'],
+    [/\bfor\s*\([^)]*\bof\b/, 'for...of'],
+    [/Math\s*\.\s*(sign|trunc|log2|log10|hypot|cbrt)\b/, 'ES6 Math'],
+    [/Number\s*\.\s*(isFinite|isInteger|isNaN)\b/, 'ES6 Number'],
+    [/\b(outlet|post|Buffer|Dict|LiveAPI|Task|messagename|jsarguments)\s*\(/, 'Max/Node global']
+  ];
+  for (const [re, label] of forbidden) {
+    assert.ok(!re.test(code), 'engine.js must not use ' + label);
+  }
+  const noComments = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
+  assert.ok(!/require\s*\(\s*['"]\.\/model['"]\s*\)/.test(noComments), 'must not require ./model');
+});
