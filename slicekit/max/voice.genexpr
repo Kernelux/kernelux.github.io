@@ -153,7 +153,6 @@ endfade_len = 0.002 * sr;
 tape_back_step = 1 / (0.01 * sr);
 loopexit_step = 1 / (0.001 * sr);
 ampcoef = 1 - exp(-1 / (0.005 * sr));
-cscoef = 1 - exp(-1 / (0.01 * sr));
 bypstep = 1 / (0.002 * sr);
 
 // ---- load state ------------------------------------------------------
@@ -230,6 +229,7 @@ b1 = 0;
 xl = 0;
 xr = 0;
 ctgt = 0;
+cscoef = 0;
 lcut = 0;
 fh = 0;
 bt = 0;
@@ -611,6 +611,7 @@ if (st == 1) {
 
     // cutoff smoothing: one-pole (~10 ms) on log2(Hz), so gesture sweeps that
     // update `cutoff` every ~15 ms do not zipper
+    cscoef = 1 - exp(-1 / (0.01 * sr));
     lcut = log(ctgt) * 1.4426950408889634;
     cs = cs + (lcut - cs) * cscoef;
     fh = exp(cs * 0.6931471805599453);

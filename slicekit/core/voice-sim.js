@@ -145,7 +145,7 @@ function create(opts) {
     var nsrc = dim();
     var chr = 0;
     var fadein_step, rtfade_step, killfade_step, endfade_len, tape_back_step, loopexit_step, ampcoef;
-    var cscoef, bypstep;
+    var bypstep;
     var st, mode, pkind, g, pos, sdir, sstart, sstop, alt, stage, envv, ampsm, tf, lw;
     var looping, lstart, lend, llen, lcprev, lastk, fr, plprev, lastph, rdprev, swprev, seentrig, seenkill;
     var ic1l, ic2l, ic1r, ic2r, cs, byp;
@@ -154,7 +154,7 @@ function create(opts) {
     var ended = 0, finish = 0, incr = 0, aincr = 0, ge = 1, xf = 1, stg = 0;
     var attn = 0, decn = 0, reln = 0, over = 0, vg = 0, p1 = 0, p2 = 0, i0 = 0, f1 = 0;
     var a0 = 0, b0 = 0, a1 = 0, b1 = 0, xl = 0, xr = 0;
-    var ctgt = 0, lcut = 0, fh = 0, bt = 0;
+    var ctgt = 0, cscoef = 0, lcut = 0, fh = 0, bt = 0;
     var fc = 0, gf = 0, a1f = 0, a2f = 0, a3f = 0, v1 = 0, v2 = 0, v3 = 0;
     var yl = 0, yr = 0, da = 1, dn = 1, dw = 0, outl = 0, outr = 0, outa = 0;
 
@@ -170,7 +170,6 @@ function create(opts) {
     tape_back_step = 1 / (0.01 * sr);
     loopexit_step = 1 / (0.001 * sr);
     ampcoef = 1 - exp(-1 / (0.005 * sr));
-    cscoef = 1 - exp(-1 / (0.01 * sr));
     bypstep = 1 / (0.002 * sr);
 
     // ---- load state ----
@@ -558,6 +557,7 @@ function create(opts) {
 
         // cutoff smoothing: one-pole (~10 ms) on log2(Hz), so gesture sweeps that
         // update `cutoff` every ~15 ms do not zipper
+        cscoef = 1 - exp(-1 / (0.01 * sr));
         lcut = log(ctgt) * 1.4426950408889634;
         cs = cs + (lcut - cs) * cscoef;
         fh = exp(cs * 0.6931471805599453);
