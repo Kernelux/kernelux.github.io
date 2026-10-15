@@ -546,7 +546,8 @@ the clip so the same pads keep playing.
 - **Keep clip** (toggle). When it is on, each map change on the current slot rewrites
   the current clip. The map changes are: shuffle; changing the layout, the root key or
   zone align, and the Layout button; swapping two keys; clearing a key; Find best;
-  Spread; placing a pad on a key; and undo and redo.
+  Spread; duplicating or placing a pad on a key; undo and redo; and removing, adding or
+  re-slicing a sample (when that moves pads).
 - **Which clip.** The clip open in Live's detail view, if it is a MIDI clip on this
   device's track. Otherwise, the clip playing on this device's track.
 - **Which notes move.** A note on a key whose pad moved goes to the nearest key where
@@ -558,8 +559,9 @@ the clip so the same pads keep playing.
   moved.
 - Switching slots never rewrites the clip. The notes stay on their keys, so the clip
   plays whatever the new slot holds on those keys.
-- Only the map changes listed above are followed. Adding, removing or re-slicing a
-  source is not one of them.
+- **Remap clip** refuses to apply the same change twice to the same clip ("Clip already
+  remapped"), because a second pass would scramble the notes.
+- Restoring a saved Set never rewrites clips.
 
 ## 18. Inspirations
 

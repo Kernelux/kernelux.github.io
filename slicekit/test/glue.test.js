@@ -1746,7 +1746,8 @@ test('kit scan rotates the kit: new notes play the rotated pad, held voices swit
   w.send('note', 36, 0);
   w.commands(true);
   w.send('note', 36, 100);
-  assert.equal(played(w.commands(true)[0]), where(target), 'a new note plays the rotated pad');
+  const start = w.commands(true).find((x) => x.params.some((p) => p[0] === 'trig'));   // (a choke kill may come first)
+  assert.equal(played(start), where(target), 'a new note plays the rotated pad');
   w.send('kit', 'scan', 0);
   assert.equal(w.model().globals().scan, 0);
 });

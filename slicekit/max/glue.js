@@ -65,7 +65,7 @@ var GEST_PARAMS = {
 };
 
 // Messages after which the current slot's key map may have changed (see mapTracked).
-var MAP_MESSAGES = { source: 1, pad: 1, kit: 1, ui: 1, loaded: 1 };
+var MAP_MESSAGES = { source: 1, pad: 1, kit: 1, ui: 1 };
 
 // pad <param> -> Pad field. scale: UI value * scale = model value.
 var PAD_PARAMS = {
@@ -1182,8 +1182,8 @@ function create(host) {
     if (!engine.needsTick()) {
       stopTicker();
       gestHeld = [];
+      viewDeb.trigger();
     }
-    viewDeb.trigger();
   }
 
   function updateTicker() {
@@ -1708,7 +1708,7 @@ function create(host) {
   function onLoaded(a) {
     var slot = toInt(a[0], -1);
     if (slot < 0 || !pending[slot]) { return; }
-    finishLoad(slot);
+    finishLoadTracked(slot);
   }
 
   function onNote(a) {
