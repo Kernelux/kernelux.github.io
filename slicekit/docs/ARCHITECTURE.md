@@ -132,7 +132,8 @@ BEAT_DIV_BEATS = [0.25, 1/6, 0.5, 1/3, 1, 2/3, 2, 4/3, 4, 8, 16]   // beats per 
 REPEAT_DIVS = ['1/4','1/8','1/8T','1/16','1/16T','1/32','1/32T','1/64']
 REPEAT_PER_BEAT = [1, 2, 3, 4, 6, 8, 12, 16]                       // repeats per beat
 MOD_ACTIONS = ['rpt:1/4','rpt:1/8','rpt:1/8T','rpt:1/16','rpt:1/16T','rpt:1/32',
-               'rpt:1/64','reverse','octdown','octup','tape','chaos']  // offset 0..11
+               'rpt:1/64','reverse','octdown','octup','tape','chaos',
+               'gest:0','gest:1','gest:2','gest:3']                    // offset 0..15 (v2: 16 keys)
 MAX_SOURCES = 16, NUM_SLOTS = 8, NUM_KEYS = 128, MAX_LAYERS = 3
 ```
 
@@ -314,4 +315,93 @@ JS mirror of `max/voice.genexpr` for tests:
 VoiceSim.create({ sampleRate, buffer: { channels: [Float32Array...], sr } })
 sim.set(name, value)          // same param names as the gen~ voice
 sim.process(n, beatPhase /*function(i)->0..1 | null*/) -> { left: Float32Array, right: Float32Array, active: Float32Array }
+```
+
+## v2 additions (binding)
+
+These sections extend the v1 contract above and override it where they differ
+(e.g. the mod zone is now 16 keys).
+
+### Constants (add to `Model.CONST`; engine keeps local copies)
+```js
+MOD_ZONE_SIZE = 16                       // mod zone = modZoneStart .. modZoneStart+15, modZoneStart 0..112
+GEST_BEATS        = [0.25, 0.5, 1, 2, 4, 8, 16]
+GEST_BEATS_LABELS = ['1/16 bar','1/8 bar','1 beat','2 beats','1 bar','2 bars','4 bars']
+GEST_RATES        = ['off','1/4','1/8','1/8T','1/16','1/16T','1/32','1/32T','1/64']   // 'off' + REPEAT_DIVS
+CAPTURE_BARS      = ['1/2 Bar','1 Bar','2 Bars','4 Bars','8 Bars']
+CAPTURE_BEATS     = [2, 4, 8, 16, 32]
+MORPH_PARAMS      = ['pitch','fine','gainDb','attackMs','decayMs','sustain','releaseMs',
+                     'startOffsetMs','loopSizeMs','loopPos','cutoffHz','drive','reverse','loopOn']
+```
+
+### Data model additions
+```js
+Pad.morph = {}            // B values: { <MORPH_PARAMS name>: value }, only the params that were set
+Globals += {
+  morph: 0, morphEdit: false,          // morph 0..100
+  scan: 0,                             // 0..100
+  keepClip: false,
+  captureBars: '2 Bars', captureFolder: '',
+  gestureSel: 0,
+  gestures: [Gesture x4]
+}
+Gesture = { name, beats, rateFrom, rateTo, cutFrom, cutTo, pitchFrom, pitchTo, ampFrom, ampTo, curve }
+// defaults
+// 0 'Build' beats 4  rate '1/8'->'1/64'  cut 20000->1200  pitch 0->0    amp 1->1    curve 0.3
+// 1 'Rise'  beats 4  rate '1/16'->'1/16' cut 20000->20000 pitch 0->12   amp 1->1    curve 0
+// 2 'Drop'  beats 2  rate 'off'->'off'   cut 20000->600   pitch 0->-24  amp 1->0.6  curve 0.5
+// 3 'Fade'  beats 4  rate '1/32'->'1/32' cut 20000->20000 pitch 0->0    amp 1->0    curve 0
+```
+`fromJSON` fills all of these with defaults for v1 states (old saved sets must still load).
+Copies (duplicate, flip, spread, similar-swap copies) keep `morph`.
+
+### Model API additions (core/model.js)
+```js
+model.setPadMorphParam(padId, name, value)   // MORPH_PARAMS only; same clamps as setPadParam; undoable, coalesced like setPadParam
+model.copyPadToMorph(padId) / model.clearPadMorph(padId)
+model.copyAllToMorph() / model.clearAllMorph()
+model.applyMorphParamToSource(padId, name)   // copy this pad's B value of `name` to all pads of the same source
+model.effectivePad(padId, m /*0..1*/) -> plain object with every Pad field, morph applied:
+    numbers: A + (B - A) * m; cutoffHz geometric: A * (B/A)^m; booleans (reverse, loopOn): m >= 0.5 ? B : A;
+    params without a B value stay A. Returns null for an unknown pad.
+model.setGestureParam(index 0..3, name, value) // names: name, beats (number in GEST_BEATS or index), rateFrom/rateTo
+                                               // ('off'/REPEAT_DIVS string or index into GEST_RATES), cutFrom/cutTo 20..20000,
+                                               // pitchFrom/pitchTo -48..48, ampFrom/ampTo 0..1, curve 0..1
+model.getGesture(index) -> Gesture
+model.setGlobal(...) accepts: morph, morphEdit, scan, keepClip, captureBars (string or index), captureFolder (string), gestureSel 0..3
+model.isModKey / modOffset use the 16-key zone; modZoneStart clamps to 0..112.
+```
+
+### Engine API additions (core/engine.js)
+```js
+Engine.create({ ..., now: function () { return Date.now(); } })   // ms clock, injectable for tests
+e.tick() -> Command[]          // advance active gesture ramps; send changed params to sounding voices
+e.needsTick() -> bool          // true while a gesture modifier is held
+e.refreshMorph() -> Command[]  // morph changed: sounding voices get pitch/amp/cutoff/drive from effectivePad
+e.refreshScan() -> Command[]   // scan changed: held main voices switch to the rotated pad's slice (src, bufsr,
+                               // pstart, pend, dir, loopsize, looppos, pitch, amp, cutoff, drive) without trig
+```
+Semantics:
+- **Morph**: every place the engine reads pad params it uses `model.effectivePad(pad.id, globals().morph/100)`
+  (fall back to the pad itself if the model has no `effectivePad`).
+- **Scan**: for a non-mod key k, occ = `occupiedKeys()` (ascending); if scan > 0 and occ has ≥ 2 keys and k is in occ,
+  play the pad on `occ[(idx + round(scan/100*(occ.length-1))) % occ.length]`. Applied before chaos.
+- **Gestures** (`gest:i` mod keys): most recently pressed held gesture is active; progress
+  t = clamp((now - start) / (beats*60000/bpm), 0, 1), shaped u = t^(1 + 4*curve).
+  - rate: if both from/to are 'off' the gesture does not touch repeat; if one is 'off' the other is used
+    for the whole gesture; else interpolate log2(REPEAT_PER_BEAT) and snap to the nearest REPEAT_PER_BEAT value.
+    Gesture rate has priority over repeat modifiers, which have priority over the global repeat.
+  - cutoff: g = cutFrom * (cutTo/cutFrom)^u; voice cutoff = clamp(padCutoff * g / 20000, 20, 20000).
+  - pitch: + (pitchFrom + (pitchTo - pitchFrom) * u) semitones (on top of octave mods).
+  - amp: × (ampFrom + (ampTo - ampFrom) * u).
+  - Applies to sounding voices and to notes started while it is held; on release everything reverts.
+  - `tick()` only emits params whose value changed (rptdiv) or moved by more than a small epsilon.
+
+### core/remap.js (new, pure ES5)
+```js
+keyMapping(oldKeys /*128 padId|null*/, newKeys) -> int[128]
+    // for each key k whose pad p moved: the key in newKeys holding p nearest to k; else k (unchanged / pad gone)
+changedCount(mapping) -> int
+remapNotes(notesDict /*{notes:[{note_id,pitch,start_time,duration,velocity,mute,...}]}*/, mapping, isProtected /*fn(key)->bool*/)
+    -> { notes: [...changed notes with new pitch, all other fields kept] }   // protected (mod-zone) and unmapped notes untouched
 ```

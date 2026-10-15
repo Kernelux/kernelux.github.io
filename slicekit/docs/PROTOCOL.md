@@ -137,7 +137,7 @@ Shuffle: uses `globals.seed`, then increments the seed and sends `kit_seed` feed
 | sk_best | live.text (button) "Find best" | — | `kit findbest` | — | H |
 | sk_chokescope | live.tab | Sample, All | `kit chokescope` | kit_chokescope | H |
 | sk_modzone | live.text (toggle) "Mods" | 0/1 | `kit modzone` | kit_modzone | H |
-| sk_modstart | live.numbox (MIDI note) | 0–116 | `kit modstart` | kit_modstart | H |
+| sk_modstart | live.numbox (MIDI note) | 0–112 | `kit modstart` | kit_modstart | H |
 | sk_velsens | live.dial | 0–100 % | `kit velsens` | kit_velsens | H |
 | sk_pressure | live.text (toggle) "Press" | 0/1 | `kit pressure2level` | kit_pressure2level | H |
 | sk_chaos | live.dial | 0–100 % | `kit chaos` | — | A |
@@ -145,6 +145,31 @@ Shuffle: uses `globals.seed`, then increments the seed and sends `kit_seed` feed
 | sk_rate | live.menu | REPEAT_DIVS | `kit rate` | — | A |
 | sk_swing | live.dial | 0–100 % | `kit swing` | — | A |
 | sk_alt | live.text (toggle) "Alt" | 0/1 | `kit alt` | — | A |
+| sk_morph | live.dial | 0–100 % | `kit morph` | — | A |
+| sk_scan | live.dial | 0–100 % | `kit scan` | — | A |
+| sk_morphedit | live.text (toggle) "Edit B" | 0/1 | `kit morphedit` | kit_morphedit | H |
+| sk_morphcopy | live.text (button) "A→B" | — | `pad morphcopy` | — | H |
+| sk_morphclear | live.text (button) "Clr B" | — | `pad morphclear` | — | H |
+| sk_morphcopyall | live.text (button) "All A→B" | — | `kit morphcopyall` | — | H |
+| sk_morphclearall | live.text (button) "All Clr B" | — | `kit morphclearall` | — | H |
+| sk_capture | live.text (button) "Capture" | — | `kit capture` | — | H |
+| sk_capturebars | live.menu | CAPTURE_BARS | `kit capturebars` | kit_capturebars | H |
+| sk_capfolder | live.text (button) "Folder…" | → opendialog fold | `kit capturefolder <path>` | — | H |
+| sk_keepclip | live.text (toggle) "Keep clip" | 0/1 | `kit keepclip` | kit_keepclip | H |
+| sk_remapclip | live.text (button) "Remap clip" | — | `kit remapclip` | — | H |
+| sk_simplerscan | live.text (button) "Find Simplers" | — | `source simplerscan` | — | H |
+| sk_simplers | umenu | (filled by glue) | `source fromsimpler <index>` | src_simplers (raw: clear / append) | — |
+| sk_gest_sel | live.tab | 1, 2, 3, 4 | `gest sel` | gest_sel | H |
+| sk_gest_beats | live.menu | GEST_BEATS_LABELS | `gest beats` | gest_beats | H |
+| sk_gest_ratefrom | live.menu | GEST_RATES | `gest ratefrom` | gest_ratefrom | H |
+| sk_gest_rateto | live.menu | GEST_RATES | `gest rateto` | gest_rateto | H |
+| sk_gest_cutfrom | live.dial | 20–20000 Hz (exp) | `gest cutfrom` | gest_cutfrom | H |
+| sk_gest_cutto | live.dial | 20–20000 Hz (exp) | `gest cutto` | gest_cutto | H |
+| sk_gest_pitchfrom | live.dial | -48–48 st | `gest pitchfrom` | gest_pitchfrom | H |
+| sk_gest_pitchto | live.dial | -48–48 st | `gest pitchto` | gest_pitchto | H |
+| sk_gest_ampfrom | live.dial | 0–100 % | `gest ampfrom` | gest_ampfrom | H |
+| sk_gest_ampto | live.dial | 0–100 % | `gest ampto` | gest_ampto | H |
+| sk_gest_curve | live.dial | 0–100 % | `gest curve` | gest_curve | H |
 | sk_out | live.gain~ "Output" | -70–6 dB | audio | — | A |
 | sk_ui | jsui (slicekit-ui.js) | — | `ui ...` | — | — |
 
@@ -228,3 +253,96 @@ inward (forward: slice.start+offset, reverse: slice.end-offset).
 0 #FF5A5A  1 #FFA54A  2 #FFD84A  3 #9BE35A  4 #3FCF8E  5 #3FD1D1  6 #4AA8FF  7 #7A7CFF
 8 #B57CFF  9 #FF7CE0 10 #FF8C8C 11 #C9A27A 12 #A0A0A0 13 #6FD0FF 14 #E0FF7C 15 #FFB3D1
 ```
+
+## v2 additions
+
+These sections extend the v1 protocol above and override it where they differ.
+
+### Topology additions
+
+```
+[poly~] outlets 0/1 (L/R, before live.gain~) -> [gen~ recorder] inlets 0/1   (codebox from max/recorder.genexpr)
+[buffer~ ---cap 40000 2]     ring buffer, 40 s stereo, written by the recorder
+[buffer~ ---capwp 10 1]      frame 0 holds the recorder's current write position
+[buffer~ ---capout 1000 2]   staging buffer for exporting a capture to a .wav file
+glue out4 -> [gen~ recorder] inlet 0   (`cap <name>`, `wpb <name>` buffer bindings, sent on init)
+[live.text Folder…] -> [route bang 1] -> [opendialog fold] -> [prepend kit capturefolder] -> glue
+glue out2 -> [route ... src_simplers ...] -> [umenu sk_simplers]  (raw messages `clear`, `append <item>`, NOT via prepend set)
+[umenu sk_simplers] left outlet (index) -> [prepend source fromsimpler] -> glue
+```
+
+The glue object becomes `v8 slicekit.js ---src ---skstate ---skview ---cap`
+(`jsarguments[4]` = ring buffer name; `+ 'wp'` and `+ 'out'` give the other two)
+and has **5 outlets** (outlet 4 = recorder).
+
+### New glue messages
+
+| message | meaning |
+|---|---|
+| `kit morph 0..100` | morph amount A→B (automatable). Sounding voices get updated pitch/amp/cutoff/drive. |
+| `kit morphedit 0/1` | when on, `pad <param>` edits write the pad's **B** values and pad feedback shows B (A where no B is set). |
+| `pad morphcopy` / `pad morphclear` | copy the selected pad's A values into B / remove its B values. |
+| `kit morphcopyall` / `kit morphclearall` | same for every pad. |
+| `kit scan 0..100` | rotate the kit under the keys (automatable). Held voices switch slice (no retrigger; a repeat picks it up at its next hit). |
+| `kit capture` | capture the last `captureBars` of the device output into a new sample. |
+| `kit capturebars <index into CAPTURE_BARS>` | capture length. |
+| `kit capturefolder <path>` | folder where capture .wav files are written (default: the device's folder, else the first sample's folder). |
+| `kit keepclip 0/1` | when on, every map change on the current slot rewrites the notes of the current clip so the same pads still play. |
+| `kit remapclip` | apply the mapping of the last map change to the current clip now. |
+| `source simplerscan` | list the Simplers in the Live Set into the `sk_simplers` menu. |
+| `source fromsimpler <index>` | import that Simpler's sample and slice points (manual slices) as a new source. |
+| `gest sel 0..3` | select the gesture being edited. |
+| `gest <param> <value>` | edit the selected gesture: `beats <index into GEST_BEATS>`, `ratefrom`/`rateto <index into GEST_RATES>`, `cutfrom`/`cutto Hz`, `pitchfrom`/`pitchto st`, `ampfrom`/`ampto 0..100`, `curve 0..100`. |
+
+Automatable parameters now also include `kit morph` and `kit scan` (cached before `init` like the others).
+
+### Feedback additions
+`kit_morphedit`, `kit_capturebars`, `kit_keepclip`, `gest_sel`, `gest_beats`,
+`gest_ratefrom`, `gest_rateto`, `gest_cutfrom`, `gest_cutto`, `gest_pitchfrom`,
+`gest_pitchto`, `gest_ampfrom` (0..100), `gest_ampto` (0..100), `gest_curve` (0..100),
+and `src_simplers` (raw `clear` / `append <item>` messages for the umenu).
+When morph edit is on, `pad_*` feedback shows the B values.
+
+### Capture flow (glue)
+1. frames N = round(CAPTURE_BEATS[i] × 60 / bpm × sr), sr of the ring buffer
+   (framecount / (length ms / 1000)), clamped to ring size − 1.
+2. wp = `new Buffer(capName + 'wp').peek(1, 0, 1)`; copy frames [wp−N, wp) (wrapping)
+   of both channels from the ring into `capName + 'out'` after
+   `send('sizeinsamps', N)`, in chunks (`peek` / `poke(channel, frame, array)`).
+3. `send('writewave', path)` with path = folder + `/SliceKit Capture <YYYYMMDD-HHMMSS>.wav`.
+4. ~300 ms later, load the file like a dropped sample (normal slicing). Status
+   "Captured N bars → <name>".
+
+### Recorder (gen~ codebox `max/recorder.genexpr`)
+`Buffer cap; Buffer wpb;` in1/in2 = L/R. Each sample: if `dim(cap)` > 0, poke L/R
+at `wp` (channels 0/1), poke `wp` into `wpb` frame 0, advance and wrap `wp`.
+`out1` = wp. Buffers are bound by the glue: `cap <capName>`, `wpb <capName>wp`.
+
+### Simpler import (glue, LiveAPI)
+Scan `live_set tracks N devices M` and one level of rack chains
+(`... devices M chains C devices K`) for `class_name` = `OriginalSimpler`. Item text
+`<track name> / <device name>`. Import: `<simpler path> sample` → `file_path`,
+`slices` (sample frames); simpler `slicing_playback_mode` (0 mono, 1 poly, 2 thru) →
+playMode. After the buffer loads: points = [0] + slices inside (0, frames) → manual
+slices (`slicing.pointsToRanges(points, frames, 1)`, `mode: 'manual'`). If there are
+no slice points, slice normally. Unverifiable here: property names `slices`,
+`file_path`, `slicing_playback_mode` (LOM, Live 11+).
+
+### Keep clip (glue + core/remap.js, LiveAPI)
+Before each map change on the current slot (shuffle, relayout/layout globals, swap,
+clear, findBest, spread, assign, undo/redo) the glue keeps a copy of the slot keys;
+after it, `remap.keyMapping(before, after)`. If `keepClip` is on, rewrite the clip:
+`live_set view detail_clip` if it is a MIDI clip on this device's track
+(`this_device canonical_parent`), else the track's playing clip.
+`get_notes_extended(0, 128, 0, length)` → JSON → `remap.remapNotes(notes, mapping, isModKey)`
+→ `apply_note_modifications({notes: changed})`. Status "Clip remapped: N notes".
+The last mapping is kept for `kit remapclip`.
+
+### Voice additions
+The voice smooths `cutoff` (one-pole in the log domain, ≈10 ms; snapped to the
+target at each (re)start) so gesture sweeps don't zipper. No new params.
+
+### View dict additions
+`morph` (0..100), `morphEdit` (0/1), `scan` (0..100), `gesture` (index of the active
+gesture or -1), `gestureNames` (4 strings). keyFlags bit 64 = pad has B (morph) values.
+Mod zone is now 16 keys: labels `4 8 8T 16 16T 32 64 Rv O- O+ Tp Ch G1 G2 G3 G4`.
