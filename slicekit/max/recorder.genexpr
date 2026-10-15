@@ -15,14 +15,15 @@
 //   cap <buffer~ name>   the ring buffer, 2 channels ([buffer~ ---cap 40000 2]).
 //                        Channel 0 = left, channel 1 = right.
 //   wpb <buffer~ name>   position buffer ([buffer~ ---capwp 10 1]). Frame 0,
-//                        channel 0 receives, every sample, the index of the
-//                        frame that was written in that sample (the most
-//                        recent frame). The glue reads it with peek() when a
-//                        capture is requested.
+//                        channel 0 receives, every sample, the NEXT write
+//                        position (the same value as out1, after the advance
+//                        and wrap). So the newest frame is wp-1 (wrapped) and
+//                        the last N frames are [wp-N, wp), which is what the
+//                        glue copies when a capture is requested.
 //
 // Each sample, when the ring buffer has frames (dim(cap) > 0):
-//   poke(cap, in1, wp, 0); poke(cap, in2, wp, 1); poke(wpb, wp, 0, 0);
-//   then wp advances by one and wraps to 0 at dim(cap).
+//   poke(cap, in1, wp, 0); poke(cap, in2, wp, 1);
+//   wp advances by one and wraps to 0 at dim(cap); poke(wpb, wp, 0, 0).
 // With an empty or unbound ring buffer nothing is written and wp stays put.
 //
 // GenExpr notes (the test checks these, see docs/VOICE.md):
@@ -47,11 +48,11 @@ if (nfr > 0) {
   }
   poke(cap, in1, wpos, 0);
   poke(cap, in2, wpos, 1);
-  poke(wpb, wpos, 0, 0);
   wpos = wpos + 1;
   if (wpos >= nfr) {
     wpos = 0;
   }
+  poke(wpb, wpos, 0, 0);
 }
 wp = wpos;
 

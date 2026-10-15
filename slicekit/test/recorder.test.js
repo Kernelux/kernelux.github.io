@@ -273,10 +273,11 @@ test('recorder.genexpr: Buffer cap, Buffer wpb, History wp, in1/in2, out1 as doc
   }
 });
 
-test('recorder.genexpr: poke argument order is (buffer, value, index, channel) in all three calls', () => {
+test('recorder.genexpr: poke argument order is (buffer, value, index, channel) in all three calls; wpb is poked after the advance', () => {
   const code = RAW.replace(/\/\/[^\n]*/g, '');
   const calls = code.match(/poke\s*\([^)]*\)/g).map(c => c.replace(/\s+/g, ''));
   assert.deepEqual(calls, ['poke(cap,in1,wpos,0)', 'poke(cap,in2,wpos,1)', 'poke(wpb,wpos,0,0)']);
+  assert.ok(code.indexOf('poke(wpb') > code.lastIndexOf('wpos = wpos + 1'), 'the position is poked after the advance and wrap');
   // the mock above takes (buffer, value, index, channel): record what the translated code passes
   const cap = makeBuffer(4, 2), wpb = makeBuffer(2, 1);
   const rec = createRecorder(COMPILED, { cap: cap, wpb: wpb });
@@ -285,7 +286,7 @@ test('recorder.genexpr: poke argument order is (buffer, value, index, channel) i
   rec.tick(0.25, -0.5);
   recordPokes = false;
   assert.deepEqual(pokeCalls.map(c => [c.buffer === cap ? 'cap' : c.buffer === wpb ? 'wpb' : '?', c.value, c.index, c.channel]),
-    [['cap', 0.25, 0, 0], ['cap', -0.5, 0, 1], ['wpb', 0, 0, 0]]);
+    [['cap', 0.25, 0, 0], ['cap', -0.5, 0, 1], ['wpb', 1, 0, 0]]);
 });
 
 test('lint self-check: the checker really catches block-scope, History and operator mistakes', () => {
@@ -323,16 +324,18 @@ test('recorder: writes L and R into channels 0 and 1 at the write position; out1
   assert.equal(rec.H.wp, 600);
 });
 
-test('recorder: writes the position into frame 0 of wpb every sample (index of the frame just written)', () => {
+test('recorder: wpb frame 0 holds the NEXT write position every sample (= out1), so the newest frame is wp - 1', () => {
   const cap = makeBuffer(100, 2), wpb = makeBuffer(10, 1);
   wpb.channels[0].fill(-1);
   const rec = createRecorder(COMPILED, { cap: cap, wpb: wpb });
   for (let i = 0; i < 250; i++) {
-    rec.tick(i + 1, -(i + 1));
-    assert.equal(wpb.channels[0][0], i % 100, 'wpb frame 0 after sample ' + i);
-    // the frame it points to holds the newest sample
-    assert.equal(cap.channels[0][wpb.channels[0][0]], i + 1);
-    assert.equal(cap.channels[1][wpb.channels[0][0]], -(i + 1));
+    const out = rec.tick(i + 1, -(i + 1));
+    const wp = wpb.channels[0][0];
+    assert.equal(wp, (i + 1) % 100, 'wpb frame 0 after sample ' + i);
+    assert.equal(wp, out, 'same value as out1');
+    // the frame just before it (wrapped) holds the newest sample
+    assert.equal(cap.channels[0][(wp - 1 + 100) % 100], i + 1);
+    assert.equal(cap.channels[1][(wp - 1 + 100) % 100], -(i + 1));
   }
   for (let i = 1; i < 10; i++) { assert.equal(wpb.channels[0][i], -1, 'other wpb frames untouched'); }
   // the ring is never written into wpb, nor wpb into the ring
@@ -356,6 +359,30 @@ test('recorder: the write position wraps at the buffer length and old frames are
   assert.deepEqual(last5, [16, 17, 18, 19, 20]);
 });
 
+test('recorder: the glue window [wp - N, wp) read from wpb ends at the newest frame, also across the wrap', () => {
+  const cap = makeBuffer(50, 2), wpb = makeBuffer(10, 1);
+  const rec = createRecorder(COMPILED, { cap: cap, wpb: wpb });
+  const frames = 50;
+  // same copy as the glue's capture flow: wp from wpb, frames [wp - N, wp) with wrap, oldest first
+  function lastN(n) {
+    const wp = wpb.channels[0][0];
+    const out = [];
+    for (let k = n; k >= 1; k--) { out.push(cap.channels[0][((wp - k) % frames + frames) % frames]); }
+    return out;
+  }
+  rec.run(30, i => i + 1, null);                       // not wrapped yet: wp = 30
+  assert.equal(wpb.channels[0][0], 30);
+  assert.deepEqual(lastN(5), [26, 27, 28, 29, 30], 'ends at the newest sample (30)');
+  rec.run(40, i => 31 + i, null);                      // 70 samples in total: wrapped once, wp = 20
+  assert.equal(wpb.channels[0][0], 20);
+  assert.deepEqual(lastN(5), [66, 67, 68, 69, 70]);
+  assert.deepEqual(lastN(25).slice(0, 3), [46, 47, 48], 'a window that crosses the wrap point');
+  assert.equal(lastN(50)[0], 21, 'the whole ring: oldest = newest - 49');
+  rec.run(30, i => 71 + i, null);                      // wp lands exactly on 0
+  assert.equal(wpb.channels[0][0], 0);
+  assert.deepEqual(lastN(3), [98, 99, 100], 'window ending at the wrap point (wp = 0)');
+});
+
 test('recorder: a 40 s stereo ring at 48 kHz wraps correctly and its positions are exact in a float32 buffer~', () => {
   const frames = 40 * 48000;
   const cap = makeBuffer(frames, 2), wpb = makeBuffer(10, 1);
@@ -366,7 +393,7 @@ test('recorder: a 40 s stereo ring at 48 kHz wraps correctly and its positions a
   assert.equal(out[frames + 6], 7);
   assert.equal(cap.channels[0][3], frames + 3, 'oldest frames were overwritten after one lap');
   assert.equal(cap.channels[0][frames - 1], frames - 1);
-  assert.equal(wpb.channels[0][0], 6);
+  assert.equal(wpb.channels[0][0], 7, 'next write position');
   // positions up to 40 s at 96 kHz are exactly representable in float32
   assert.equal(Math.fround(40 * 96000 - 1), 40 * 96000 - 1);
 });
@@ -399,7 +426,7 @@ test('recorder: does nothing while the ring buffer is empty or not bound; starts
   assert.deepEqual(Array.from(out), [1, 2, 3]);
   assert.deepEqual(Array.from(cap.channels[0].slice(0, 4)), [10, 11, 12, 0]);
   assert.deepEqual(Array.from(cap.channels[1].slice(0, 4)), [20, 21, 22, 0]);
-  assert.equal(wpb.channels[0][0], 2);
+  assert.equal(wpb.channels[0][0], 3, 'next write position');
 });
 
 test('recorder: an unbound / empty position buffer does not stop the ring from recording', () => {

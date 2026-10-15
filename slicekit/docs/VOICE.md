@@ -35,8 +35,9 @@ and the cutoff smoother is snapped to its target (see `cutoff` below).
 
 `st`: 0 idle, 1 sounding, 2 waiting (hit finished, key held, repeat on: silent
 but `active` stays 1). `mode` (only while `st` = 1): 0 normal, 1 restart pending
-(1 ms fade-out running), 2 kill (2 ms fade-out running). Envelope `stage`:
-1 attack, 2 decay, 3 sustain, 4 release.
+(1 ms fade-out running), 2 kill (2 ms fade-out running). `pkind` says what the
+pending restart (mode 1) is: 1 new note, 2 repeat, 3 jump, 4 turn inside a
+micro-loop. Envelope `stage`: 1 attack, 2 decay, 3 sustain, 4 release.
 
 | from | event | to |
 |---|---|---|
@@ -51,14 +52,20 @@ but `active` stays 1). `mode` (only while `st` = 1): 0 normal, 1 restart pending
 | sounding | tape factor 0 and `held` = 0 | mode 2 → idle |
 | waiting | `held` = 0 or `rptdiv` = 0 | idle |
 | sounding, mode 1 | end of slice / end of release reached before the fade finishes | the pending restart still happens (never lost) |
+| sounding (mode 0) | `jump` | mode 1 with `pkind` 3; at the end of the fade-out the playhead moves to the new start, the envelope goes on (see Jump / redir) |
+| sounding (mode 0) | `redir` | not looping: turn around at once (no state change); looping: mode 1 with `pkind` 4, the turn happens at the end of the fade-out |
+| idle, waiting | `jump`, `redir` | nothing (the counter is remembered) |
+| sounding, mode 1 | repeat line while `pkind` is 3 or 4 | the pending jump/turn becomes a full repeat restart (`pkind` 2) |
+| sounding, mode 1, `pkind` 4 | `jump` | becomes the jump (which re-latches the direction as well) |
 
 A restart sets: position = start (or loop start), envelope = attack from 0,
 `g` = 0 (1 ms fade-in), amp snapped, tape factor 1, filter cleared, cutoff
 smoother and bypass snapped to the current `cutoff`, loop region latched, and for a new note (`trig`) the direction flip and the free-running
 repeat clock are reset.
 
-Per sample, in this order: (1) `kill`/`trig` change detection; (2) repeat-grid
-phase and line detection; (3) restart decisions; (4) restart; (5) render
+Per sample, in this order: (1) `kill`/`jump`/`redir`/`trig` change detection; (2) repeat-grid
+phase and line detection; (3) restart decisions; (4a) immediate turn (`redir`);
+(4) restart; (5) render
 (loop enter/leave, end check, tape, declick gain, envelope, read, filter, drive,
 gain stage, advance + loop wrap). `out3` (`active`) is `st != 0` at the end of
 the sample, so it rises on the first sample of a hit and falls on the first
@@ -76,6 +83,8 @@ constant 10 ms, bypass cross-fade 2 ms.
 |---|---|
 | `trig` | Any change starts the hit. Idle/waiting: immediate. Sounding: 1 ms fade-out, then jump. **The first value must differ from 0** (Param default is 0; the engine counters start at 1). Several changes inside one signal vector count once. |
 | `kill` | Any change: 2 ms fade-out, then idle. No-op on an idle voice; ends a waiting voice at once. A `trig` arriving during the fade takes over. |
+| `jump` | Counter. Any change while sounding: Scan's "switch the slice of a held note". Details in *Jump / redir* below. Idle or waiting: only remembered. **The first value must differ from 0**, like `trig`. |
+| `redir` | Counter. Any change while sounding: Reverse's "turn the hit around where it is". Details below. Same counter rules. |
 | `pstart` / `pend` / `dir` | Latched at (re)start. `dir` < 0 is reverse. The hit ends when the playhead reaches `pend` in the play direction (`remain <= 0`), after a linear 2 ms fade-out lookahead (not while micro-looping). Reads outside `[0, frames)` are silent; the hit still runs to `pend`. |
 | `pitch`, `bufsr`, `tape` | Increment per sample = `dir * 2^(pitch/12) * bufsr/samplerate * tapeFactor`; read live every sample. |
 | `amp` | Snaps to the value at every (re)start, then follows changes with a 5 ms one-pole (polyphonic pressure). |
@@ -88,6 +97,38 @@ constant 10 ms, bypass cross-fade 2 ms.
 | `cutoff` | Simper TPT SVF, Q = 1/sqrt(2), cutoff clamped to [10 Hz, 0.45·fs]; `>= 19000` bypasses the filter output (state still runs). **Smoothed**, see below. |
 | `drive` | Applied when > 0 (no cross-fade: the small-signal gain jumps by +2.4 dB between 0 and tiny values — see limitations). |
 | `tape`, `tapems` | `tape` = 1: factor falls by `1/tapems` per ms (a full stop from 1 takes exactly `tapems`; from a lower value proportionally less) and the output is scaled by `sqrt(factor)`. `tape` = 0: back to 1 in 10 ms. Factor 0 = playhead frozen, silent, voice stays active while `held` = 1. A stopped voice whose key is released (`held` = 0) dies with the 2 ms kill fade (otherwise it could never end in trigger mode). Reset to 1 at every (re)start. |
+
+### Jump / redir
+
+Both only act on a *sounding* hit (`st` = 1, no fade running); a voice that is idle
+or waiting between repeats just remembers the counter, because a repeat restart
+reads `pstart`/`pend`/`dir` itself. The engine sends the new params first and the
+counter last. A change seen while a fade is running (`trig`/`kill`/repeat/jump
+pending) is ignored, except as listed in the state table.
+
+**`jump`** re-latches `sstart`/`sstop`/`sdir` from `pstart`/`pend`/`dir` (respecting
+the current direction toggle of `rptalt`, so a mirrored hit stays mirrored), and
+the loop region exactly like a restart (loop engaged when `loopon` and `held`:
+playhead goes to the loop start of the new slice, else to the slice start). The
+move uses the restart machinery: 1 ms fade-out (the old slice plays on), the
+playhead jumps while the output is 0, 1 ms fade-in. What is **not** touched:
+envelope (stage and level), `alt`, the repeat grid (`fr`, `lastk`), amp smoothing,
+tape factor, cutoff smoothing/bypass. The filter state is cleared (the output is
+silent at that moment, the new material starts cold). A repeat line that falls
+into the 1 ms window turns the jump into a normal repeat restart. Logged by the
+sim as `jumpreq` (request) and `jump` (the move; not `start`).
+
+**`redir`** re-latches `sdir` from `dir` and `sstop` from `pend` and nothing else;
+the playhead stays where it is, no fade (the output is continuous: the same
+sample position is read, only the direction changes). `rptalt` is ignored
+(the base `dir`/`pend` are used), and `sstart` is left alone (so a loop armed
+*later* in the same hit uses the old start). If the new stop is already behind or at
+the playhead in the new direction, `sstop` is set 2 ms of playback ahead, so the
+hit finishes with the normal 2 ms end fade instead of a cut (then waiting or idle
+as usual). Inside a micro-loop the crossfade partner (`pos - sdir*llen`) would
+flip and step, so there the turn waits for the 1 ms fade-out like a jump (`pkind`
+4) and then mirrors the loop region, keeping the playhead; positions keep running
+in the old direction for that millisecond.
 
 ### Cutoff smoothing
 
@@ -161,6 +202,9 @@ every 15 ms would zipper, so the voice smooths it:
 * `voiceend` (falling edge of `active`) means: one-shot finished, release done,
   killed, or key released while waiting. Retriggering a sounding voice is
   seamless (no falling edge).
+* `jump`/`redir` are counters like `trig`: send a changed value after the params
+  they apply to (`refreshScan`: slice params then `jump <n>`; Reverse modifier:
+  `dir`, `pend`, then `redir <n>`), and make the first value non-zero.
 * Messages that arrive in the same signal vector are seen together; order inside
   a vector is lost (only the final values matter), except `kill` before `trig`.
 
@@ -202,20 +246,17 @@ Capture flow, Recorder). Behaviour:
 ```
 Buffer cap;  Buffer wpb;  History wp(0);        in1 = L, in2 = R, out1 = wp
 each sample, if dim(cap) > 0:
-  poke(cap, in1, wp, 0);  poke(cap, in2, wp, 1);  poke(wpb, wp, 0, 0);
-  wp = wp + 1, wrapped to 0 at dim(cap)
+  poke(cap, in1, wp, 0);  poke(cap, in2, wp, 1);
+  wp = wp + 1, wrapped to 0 at dim(cap);  poke(wpb, wp, 0, 0)
 ```
 
 * `cap <name>` / `wpb <name>` (messages to gen~ inlet 0, sent by the glue at init)
   bind the two buffers, like `src` does for the voice. Until `cap` is bound and has
   frames nothing is written and `wp` stays 0.
-* `out1` is the position of the next frame to write (after the advance). Frame 0 of
-  `wpb` receives the index of the frame written in the *same* sample, i.e. the
-  newest frame (the order of the three pokes follows PROTOCOL.md). A reader that
-  treats `wpb[0]` as "next write position" and copies `[wp - N, wp)` gets a window
-  that is one frame (23 µs) older than the very newest N frames; if that matters,
-  copy `[wp + 1 - N, wp + 1)`, or move the `wpb` poke below the advance (then
-  `wpb[0]` equals `out1`).
+* `out1` is the position of the next frame to write (after the advance), and frame 0
+  of `wpb` receives the **same value** (poked after the advance and wrap), so the
+  newest frame is `wp - 1` (wrapped) and the glue's copy window `[wp - N, wp)` is
+  exactly the last N frames.
 * If the ring is resized below the current `wp`, `wp` wraps to 0 before the write.
 * Positions are doubles inside gen~ and floats in `wpb`: exact up to 2^24 frames
   (40 s at 96 kHz is 3.84 M).

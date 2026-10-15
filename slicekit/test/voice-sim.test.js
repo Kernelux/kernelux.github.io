@@ -971,8 +971,24 @@ test('redir: inside a micro-loop the loop region is mirrored; with the stop behi
   assert.equal(eventsOf(sim, 'start').length, 1, 'not a restart');
   assert.ok(eventsOf(sim, 'wrap').length >= 17, 'keeps wrapping: ' + eventsOf(sim, 'wrap').length);
   for (let n = 4000; n < 9000; n++) { assert.equal(r.active[n], 1); }
-  assert.ok(maxStep(r.left, 3900, 9000) < 0.0015, 'smooth: ' + maxStep(r.left, 3900, 9000));
+  assert.ok(maxStep(r.left, 3900, turn.n - 50) < 0.0015 && maxStep(r.left, turn.n + 60, 9000) < 0.0015, 'smooth loop either side');
+  assert.ok(maxStep(r.left, turn.n - 50, turn.n + 60) < 0.008, 'the fade itself is gentle: ' + maxStep(r.left, turn.n - 50, turn.n + 60));
   assert.ok(r.left[turn.n + 80] > 0.18 && r.left[turn.n + 80] < 0.27, 'back at full level after the fade-in');
+
+  // a jump arriving while the looped turn waits for its fade-out takes it over (and turns as well)
+  sim = make(rampBuffer(20000), {
+    pstart: 1000, pend: 9000, loopon: 1, loopsize: 500, looppos: 0.5, held: 1, trig: 1
+  });
+  r = playFull(sim, [
+    { at: 4000, set: { dir: -1, pend: 1000, redir: 1 } },
+    { at: 4010, set: { pstart: 12000, pend: 6000, jump: 1 } }
+  ], 6000);
+  assert.equal(eventsOf(sim, 'redir').length, 0);
+  const jt = eventsOf(sim, 'jump');
+  assert.equal(jt.length, 1);
+  assert.equal(jt[0].sdir, -1);
+  assert.equal(r.pos[jt[0].n], 12000 - 0.5 * (6000 - 500), 'new loop start of the reversed slice');
+  for (let n = jt[0].n; n < 6000; n++) { assert.ok(r.pos[n] > 8750 && r.pos[n] <= 9250, 'inside the new region at ' + n); }
 
   // stop behind: constant buffer so the fade is visible; trigger mode, no repeat -> idle after ~2 ms
   sim = make(constBuffer(60000, 1), { pstart: 1000, pend: 9000, held: 1, trig: 1 });
@@ -991,8 +1007,9 @@ test('redir: inside a micro-loop the loop region is mirrored; with the stop behi
   r = playFull(sim, [{ at: 3000, set: { pend: 2500, redir: 1 } }], 8000, hostPhase(spb, 0));
   assert.equal(r.left[3200], 0);
   for (let n = 3000; n < 5500; n++) { assert.equal(r.active[n], 1, 'waiting, still active ' + n); }
-  assert.equal(eventsOf(sim, 'wait').length, 1);
-  assert.equal(eventsOf(sim, 'start').length, 2, 'the next repeat restarts it');
+  const w0 = eventsOf(sim, 'wait')[0].n;
+  assert.ok(w0 >= 3086 && w0 <= 3092, 'waits after the end fade: ' + w0);
+  assert.equal(eventsOf(sim, 'start')[1].n, 5513, 'the next repeat restarts it on the grid');
 });
 
 // ---------------------------------------------------------------------------
@@ -1798,6 +1815,58 @@ test('parity: cutoff steps and sweeps mid-note (smoothing, bypass crossings both
   assert.ok(rms(out.left, 0, 3000) > 0.05 && rms(out.right, 80000, 90000) > 0.001, 'non-trivial audio');
 });
 
+test('parity: jump and redir (scan / reverse) in plain, looping, repeating, mirrored, tape and releasing hits', () => {
+  const buf = { channels: [sineBuffer(60000, 260, 0.6).channels[0], sineBuffer(60000, 410, 0.5).channels[0]], sr: SR };
+  const script = [
+    { at: 0, set: { pstart: 1000, pend: 20000, att: 5, dec: 40, sus: 0.6, rel: 60, gatemode: 1, held: 1, cutoff: 5000, trig: 1 } },
+    { at: 3000, set: { pstart: 30000, pend: 45000, jump: 1 } },              // plain jump
+    { at: 6000, set: { dir: -1, pend: 33000, redir: 1 } },                    // turn around
+    { at: 9000, set: { pstart: 12000, pend: 6000, dir: -1, loopon: 1, loopsize: 300, looppos: 0.4, trig: 2 } },
+    { at: 11000, set: { dir: 1, pend: 20000, redir: 2 } },                    // turn inside the loop (declicked)
+    { at: 13000, set: { pstart: 40000, pend: 52000, dir: 1, jump: 2 } },     // jump with a loop
+    { at: 13010, set: { jump: 3, pstart: 3000, pend: 9000 } },               // jump while the jump fades
+    { at: 16000, set: { loopon: 0, pend: 3500, redir: 3 } },                  // stop behind: end fade
+    { at: 18000, set: { jump: 4 } },                                          // jump when idle: remembered
+    { at: 19000, set: { pstart: 5000, pend: 15000, trig: 3, rptdiv: 4, rptalt: 1, playing: 1, gatemode: 0 } },
+    { at: 26000, set: { pstart: 20000, pend: 26000, jump: 5 } },             // inside a mirrored repeat hit
+    { at: 31000, set: { jump: 6 } },
+    { at: 31010, set: { redir: 4, dir: -1, pend: 4000 } },                   // redir during the jump fade (ignored)
+    { at: 36000, set: { tape: 1, tapems: 120 } },
+    { at: 37000, set: { pstart: 1000, pend: 9000, jump: 7 } },               // jump on a tape-stopping voice
+    { at: 42000, set: { tape: 0, held: 0 } },
+    { at: 43000, set: { pstart: 22000, pend: 24000, jump: 8, redir: 5 } },    // while waiting / released
+    { at: 46000, set: { held: 1, trig: 4, rptdiv: 8, pstart: 2000, pend: 40000 } },
+    { at: 48000, set: { kill: 1, jump: 9 } },                                 // kill wins
+    { at: 50000, set: { trig: 5 } },
+    { at: 50500, set: { trig: 6, jump: 10 } },                                // trig + jump in one vector
+    { at: 52000, set: { pstart: 4000, pend: 41000, jump: 11, redir: 6 } }     // jump wins over a redir
+  ];
+  const out = parity(buf, script, 60000, hostPhase(SPB, 555));
+  assert.ok(rms(out.left, 0, 3000) > 0.05);
+  const names = out.events.map(e => e.type);
+  ['jump', 'redir'].forEach(k => assert.ok(names.indexOf(k) >= 0, 'scenario exercises ' + k));
+});
+
+test('parity: a repeat line arriving while a jump or a looped turn is waiting for its fade-out', () => {
+  const buf = { channels: [sineBuffer(60000, 330, 0.6).channels[0]], sr: SR };
+  const script = [
+    { at: 0, set: { pstart: 1000, pend: 15000, loopon: 1, loopsize: 400, looppos: 0.5, rptdiv: 4, playing: 1, held: 1, att: 8, dec: 30, sus: 0.5, trig: 1 } },
+    { at: 5500, set: { dir: -1, pend: 1000, redir: 1 } },                     // looped turn pending at the line (5513)
+    { at: 11010, set: { pstart: 30000, pend: 40000, dir: 1, jump: 1 } },     // jump pending at the line (11025)
+    { at: 16520, set: { jump: 2 } },                                          // jump, then redir, then the line (16538)
+    { at: 16525, set: { redir: 2, dir: -1, pend: 2000 } },
+    { at: 19000, set: { redir: 3, dir: 1, pend: 14000 } },                    // looped turn pending ...
+    { at: 19010, set: { jump: 3, pstart: 20000, pend: 26000 } },              // ... the jump takes it over
+    { at: 22000, set: { loopon: 0, pstart: 1000, pend: 15000, dir: 1 } },
+    { at: 27500, set: { jump: 4 } },                                          // not looping now
+    { at: 33040, set: { redir: 4, dir: -1, pend: 5000 } }
+  ];
+  const out = parity(buf, script, 45000, hostPhase(SPB, 0));
+  const kinds = out.events.filter(e => e.type === 'start').map(e => e.kind);
+  assert.ok(kinds.filter(k => k === 2).length >= 4, 'repeat restarts happened: ' + kinds.join(','));
+  assert.ok(out.events.filter(e => e.type === 'jump').length <= 2, 'the jumps that met a line became repeat restarts');
+});
+
 test('parity: micro-loop (forward, reverse, live enable / exit) scenarios', () => {
   const buf = { channels: [sineBuffer(60000, 180, 0.7).channels[0]], sr: SR };
   const script = [
@@ -1852,7 +1921,7 @@ test('parity: random scenarios (seeded fuzz of every parameter and event)', () =
     ch.forEach(c => { for (let i = 0; i < frames; i++) { c[i] = (rnd() * 2 - 1) * 0.8; } });
     const buf = { channels: ch, sr: pick([44100, 48000, 22050]) };
     const script = [];
-    let trigN = 0, killN = 0;
+    let trigN = 0, killN = 0, jumpN = 0, redirN = 0;
     const total = 60000;
     let at = 0;
     while (at < total) {
@@ -1860,7 +1929,7 @@ test('parity: random scenarios (seeded fuzz of every parameter and event)', () =
       const n = 1 + Math.floor(rnd() * 3);
       for (let j = 0; j < n; j++) {
         const what = pick(['trig', 'trig', 'held', 'gatemode', 'loop', 'rpt', 'rpt', 'pitch', 'slice', 'slice', 'filter', 'drive',
-          'tape', 'env', 'amp', 'kill', 'bpm', 'playing', 'bufsr', 'dir']);
+          'tape', 'env', 'amp', 'kill', 'bpm', 'playing', 'bufsr', 'dir', 'jump', 'jump', 'redir', 'redir']);
         if (what === 'trig') { set.trig = ++trigN; }
         else if (what === 'held') { set.held = rnd() < 0.55 ? 1 : 0; }
         else if (what === 'gatemode') { set.gatemode = rnd() < 0.5 ? 1 : 0; }
@@ -1882,6 +1951,18 @@ test('parity: random scenarios (seeded fuzz of every parameter and event)', () =
         else if (what === 'playing') { set.playing = rnd() < 0.5 ? 1 : 0; }
         else if (what === 'bufsr') { set.bufsr = pick([22050, 44100, 48000, 96000]); }
         else if (what === 'dir') { set.dir = rnd() < 0.5 ? 1 : -1; }
+        else if (what === 'jump') {
+          set.jump = ++jumpN;
+          if (rnd() < 0.7) {
+            const a = Math.floor(rnd() * frames), len = Math.floor(rnd() * 4000) + 1;
+            set.pstart = a; set.pend = Math.min(frames + 500, a + len); set.dir = 1;
+          }
+        }
+        else if (what === 'redir') {
+          set.redir = ++redirN;
+          set.dir = rnd() < 0.5 ? 1 : -1;
+          set.pend = Math.floor(rnd() * frames);
+        }
       }
       script.push({ at: at, set: set });
       at += 1 + Math.floor(rnd() * 2500);
@@ -1898,7 +1979,8 @@ test('parity: random scenarios (seeded fuzz of every parameter and event)', () =
     }
   }
   // the random scenarios must really visit every state-machine path
-  ['trig', 'start:1', 'start:2', 'line', 'wait', 'wrap', 'kill', 'end:pend', 'end:release', 'end:kill', 'end:wait'].forEach(key => {
+  ['trig', 'start:1', 'start:2', 'line', 'wait', 'wrap', 'kill', 'end:pend', 'end:release', 'end:kill', 'end:wait',
+    'jumpreq', 'jump', 'redir'].forEach(key => {
     assert.ok((coverage[key] || 0) >= (key === 'end:wait' ? 3 : 10), 'fuzz coverage of "' + key + '": ' + (coverage[key] || 0));
   });
 });
