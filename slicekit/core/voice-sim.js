@@ -157,7 +157,7 @@ function create(opts) {
     var ended = 0, finish = 0, incr = 0, aincr = 0, ge = 1, xf = 1, stg = 0;
     var attn = 0, decn = 0, reln = 0, over = 0, vg = 0, p1 = 0, p2 = 0, i0 = 0, f1 = 0;
     var a0 = 0, b0 = 0, a1 = 0, b1 = 0, xl = 0, xr = 0;
-    var ctgt = 0, cscoef = 0, lcut = 0, fh = 0, bt = 0, sold = 0, lswap = 0;
+    var ctgt = 0, cscoef = 0, lcut = 0, fh = 0, bt = 0, sold = 0, lswap = 0, doturn = 0;
     var fc = 0, gf = 0, a1f = 0, a2f = 0, a3f = 0, v1 = 0, v2 = 0, v3 = 0;
     var yl = 0, yr = 0, da = 1, dn = 1, dw = 0, outl = 0, outr = 0, outa = 0;
 
@@ -242,34 +242,24 @@ function create(opts) {
         pkind = 3;
         if (logOn) { logEvent('jumpreq'); }
       }
+      // a turn that is waiting for its fade-out becomes a jump (which turns as well)
+      if (st === 1 && mode === 1 && pkind === 4) {
+        pkind = 3;
+      }
     }
-    // redir: turn a sounding hit around where it is (new direction and stop)
+    // redir: turn a sounding hit around where it is (new direction and stop).
+    // Inside a micro-loop the crossfade partner would flip, so there the turn
+    // waits for the 1 ms declick fade-out; otherwise it is immediate (4a).
+    doturn = 0;
     if (redir !== seenredir) {
       seenredir = redir;
       if (st === 1 && mode === 0) {
-        dd = 1;
-        if (dir < 0) {
-          dd = -1;
-        }
-        sold = sdir;
-        sdir = dd;
-        sstop = pend;
         if (looping > 0.5) {
-          if (sdir !== sold) {
-            // mirror the loop region so it is traversed in the new direction
-            lswap = lstart;
-            lstart = lend;
-            lend = lswap;
-          }
+          mode = 1;
+          pkind = 4;
         } else {
-          remain = (sstop - pos) * sdir;
-          if (remain <= 0) {
-            // the new stop is already behind the playhead: finish with the normal 2 ms end fade
-            aincr = abs(exp(pitch * 0.05776226504666211) * bufsr / sr * tf);
-            sstop = pos + sdir * aincr * endfade_len;
-          }
+          doturn = 1;
         }
-        if (logOn) { logEvent('redir', { sdir: sdir, looping: looping }); }
       }
     }
     if (trig !== seentrig) {
@@ -358,14 +348,21 @@ function create(opts) {
           pkind = 2;
           mode = 1;
         }
-        // a repeat line while a jump is pending: the repeat restart takes over
-        if (st === 1 && mode === 1 && pkind === 3) {
+        // a repeat line while a jump or turn is pending: the repeat restart takes over
+        if (st === 1 && mode === 1 && (pkind === 3 || pkind === 4)) {
           pkind = 2;
         }
       }
     }
     if (st === 1 && mode === 1 && g <= 0) {
-      dorestart = 1;
+      if (pkind === 4) {
+        // fade-out before a turn in a micro-loop finished: turn now, fade back in
+        doturn = 1;
+        mode = 0;
+        lw = 0;
+      } else {
+        dorestart = 1;
+      }
     }
     if (dorestart < 0.5) {
       if (st === 1 && mode === 2 && g <= 0) {
@@ -373,6 +370,33 @@ function create(opts) {
         mode = 0;
         if (logOn) { logEvent('end', { why: 'kill' }); }
       }
+    }
+
+    // ---- 4a. turn the hit around (redir): new direction and stop, same playhead ----
+    if (doturn > 0.5) {
+      dd = 1;
+      if (dir < 0) {
+        dd = -1;
+      }
+      sold = sdir;
+      sdir = dd;
+      sstop = pend;
+      if (looping > 0.5) {
+        if (sdir !== sold) {
+          // mirror the loop region so it is traversed in the new direction
+          lswap = lstart;
+          lstart = lend;
+          lend = lswap;
+        }
+      } else {
+        remain = (sstop - pos) * sdir;
+        if (remain <= 0) {
+          // the new stop is already behind the playhead: finish with the normal 2 ms end fade
+          aincr = abs(exp(pitch * 0.05776226504666211) * bufsr / sr * tf);
+          sstop = pos + sdir * aincr * endfade_len;
+        }
+      }
+      if (logOn) { logEvent('redir', { sdir: sdir, looping: looping }); }
     }
 
     // ---- 4. (re)start the hit ----

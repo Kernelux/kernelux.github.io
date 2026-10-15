@@ -958,13 +958,21 @@ test('redir: inside a micro-loop the loop region is mirrored; with the stop behi
   });
   let r = playFull(sim, [{ at: 4000, set: { dir: -1, pend: 1000, redir: 1 } }], 9000);
   for (let n = 100; n < 9000; n++) { assert.ok(r.pos[n] >= 4750 - 1e-9 && r.pos[n] <= 5250 + 1e-9, 'pos in the region at ' + n + ': ' + r.pos[n]); }
-  for (let n = 4001; n < 9000; n++) {
+  // inside a loop the turn waits for the 1 ms declick (the crossfade partner flips), then runs backwards
+  const turn = eventsOf(sim, 'redir')[0];
+  assert.ok(turn.n >= 4044 && turn.n <= 4047, 'turn after the ~1 ms fade-out: ' + turn.n);
+  assert.equal(turn.looping, 1);
+  for (let n = 4001; n < turn.n; n++) { assert.ok(r.pos[n] - r.pos[n - 1] === 1 || r.pos[n] - r.pos[n - 1] === -499, 'still forward before the turn'); }
+  for (let n = turn.n + 1; n < 9000; n++) {
     const d = r.pos[n] - r.pos[n - 1];
     assert.ok(d === -1 || d === 499, 'steps backwards, or wraps forward by loop length - 1: ' + d + ' at ' + n);
   }
+  assert.equal(r.left[turn.n - 1], 0, 'silent at the turn');
+  assert.equal(eventsOf(sim, 'start').length, 1, 'not a restart');
   assert.ok(eventsOf(sim, 'wrap').length >= 17, 'keeps wrapping: ' + eventsOf(sim, 'wrap').length);
   for (let n = 4000; n < 9000; n++) { assert.equal(r.active[n], 1); }
   assert.ok(maxStep(r.left, 3900, 9000) < 0.0015, 'smooth: ' + maxStep(r.left, 3900, 9000));
+  assert.ok(r.left[turn.n + 80] > 0.18 && r.left[turn.n + 80] < 0.27, 'back at full level after the fade-in');
 
   // stop behind: constant buffer so the fade is visible; trigger mode, no repeat -> idle after ~2 ms
   sim = make(constBuffer(60000, 1), { pstart: 1000, pend: 9000, held: 1, trig: 1 });
